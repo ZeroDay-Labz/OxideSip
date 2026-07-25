@@ -3,9 +3,7 @@
 //! persisted separately from `accounts.toml` the same way
 //! `audio_devices.rs`'s device selection is.
 
-use std::path::Path;
-
-const SETTINGS_PATH: &str = "./settings.toml";
+const SETTINGS_FILENAME: &str = "settings.toml";
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -45,7 +43,7 @@ pub struct AppSettings {
 }
 
 pub fn load() -> AppSettings {
-    std::fs::read_to_string(Path::new(SETTINGS_PATH))
+    std::fs::read_to_string(crate::paths::config_file(SETTINGS_FILENAME))
         .ok()
         .and_then(|text| toml::from_str(&text).ok())
         .unwrap_or_default()
@@ -53,5 +51,5 @@ pub fn load() -> AppSettings {
 
 pub fn save(settings: &AppSettings) -> std::io::Result<()> {
     let text = toml::to_string_pretty(settings).unwrap_or_default();
-    std::fs::write(Path::new(SETTINGS_PATH), text)
+    std::fs::write(crate::paths::config_file(SETTINGS_FILENAME), text)
 }

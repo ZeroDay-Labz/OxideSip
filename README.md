@@ -93,10 +93,17 @@ needs to exist beforehand.
 
 ### Configuration
 
-Accounts are stored in `./accounts.toml` (created/edited from the app's SIP Settings screen — you
-don't need to hand-edit it). If you're upgrading from a version of this app that only supported one
-account, an existing single-account `./oxidesip.toml` or `OXIDESIP_*` environment variables are
-migrated into `accounts.toml` automatically on first run.
+All persistent state — accounts, call-handling settings, audio device selection, contacts, call
+history — lives under `$XDG_CONFIG_HOME/oxidesip/` (typically `~/.config/oxidesip/`), regardless of
+where the binary is installed or what directory it's launched from. Accounts specifically are in
+`accounts.toml` there, created/edited from the app's SIP Settings screen — you don't need to
+hand-edit it. If an old CWD-relative copy of any of these files exists from a previous version of
+this app (which used to store them next to the binary), it's migrated into the XDG location
+automatically the first time it's needed.
+
+If you're upgrading from a version of this app that only supported one account, an existing
+single-account `./oxidesip.toml` (in the directory you launch from) or `OXIDESIP_*` environment
+variables are migrated into `accounts.toml` automatically on first run.
 
 To seed a first account non-interactively, copy the example config and adjust it, or set
 `OXIDESIP_*` environment variables directly:
@@ -112,10 +119,6 @@ Recognized environment variables (override the legacy single-account config; onl
 `OXIDESIP_USERNAME`, `OXIDESIP_PASSWORD`, `OXIDESIP_REGISTER_EXPIRES`, `OXIDESIP_LOCAL_PORT`,
 `OXIDESIP_SRTP`, `OXIDESIP_CA_CERT_PATH`, `OXIDESIP_CLIENT_CERT_PATH`, `OXIDESIP_CLIENT_KEY_PATH`,
 `OXIDESIP_PREFERRED_CODECS` (comma-separated, e.g. `ulaw,alaw`).
-
-All other app state — audio device selection, call-handling settings, contacts, call history — is
-plain TOML/JSON in the working directory (`audio_devices.toml`, `settings.toml`, `contacts.toml`,
-`call_history.toml`), gitignored by default so you can run straight from a checkout.
 
 ### Routing a call into Discord (or another voice app)
 
@@ -139,6 +142,12 @@ virtual sink of your own instead (also selectable from the same dropdown).
 - Some PipeWire configurations exhibit high playback-callback latency for client streams; the app
   includes buffering/catch-up logic to keep audio continuous, but very high-latency setups may
   still feel sluggish on call answer.
+- **Keyboard navigation is partial.** Tab/Shift+Tab cycles focus between text fields (in the
+  Settings/SIP/Audio windows and the dial pad), and fields wired to submit-on-Enter do. Buttons,
+  toggles, and dropdowns aren't keyboard-focusable or activatable — this is a limitation of the
+  `iced` GUI toolkit itself (only text inputs support focus in the version this app uses), not
+  something toggled off; supporting it fully would mean building a custom focus/activation system
+  for every button-like widget.
 
 ## Contributing
 

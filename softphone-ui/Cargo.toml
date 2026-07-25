@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 toml = "0.9"
 iced = { version = "0.14", features = ["tokio"] }
 rfd = "0.17.2"
+dirs = "6.0.0"
 
 # --- Phase 4 (future work) ---
 # zbus = "5.18"          # StatusNotifierItem tray service, minimize-to-tray on close

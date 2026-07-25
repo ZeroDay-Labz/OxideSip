@@ -4,7 +4,7 @@
 use std::io;
 use std::path::Path;
 
-const CONTACTS_PATH: &str = "./contacts.toml";
+const CONTACTS_FILENAME: &str = "contacts.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Contact {
@@ -76,7 +76,7 @@ struct ContactsFile {
 }
 
 pub fn load() -> Vec<Contact> {
-    std::fs::read_to_string(Path::new(CONTACTS_PATH))
+    std::fs::read_to_string(crate::paths::config_file(CONTACTS_FILENAME))
         .ok()
         .and_then(|text| toml::from_str::<ContactsFile>(&text).ok())
         .map(|f| f.contacts)
@@ -88,6 +88,6 @@ pub fn save(contacts: &[Contact]) {
     sorted.sort_by_key(|c| c.name.to_lowercase());
     let file = ContactsFile { contacts: sorted };
     if let Ok(text) = toml::to_string_pretty(&file) {
-        let _ = std::fs::write(Path::new(CONTACTS_PATH), text);
+        let _ = std::fs::write(crate::paths::config_file(CONTACTS_FILENAME), text);
     }
 }

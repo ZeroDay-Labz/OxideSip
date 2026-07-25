@@ -2,10 +2,9 @@
 //! lives here rather than in `softphone-core`, same reasoning as
 //! `audio_devices.rs`.
 
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const HISTORY_PATH: &str = "./call_history.toml";
+const HISTORY_FILENAME: &str = "call_history.toml";
 const MAX_ENTRIES: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -45,7 +44,7 @@ pub fn now_unix() -> i64 {
 }
 
 pub fn load() -> Vec<HistoryEntry> {
-    std::fs::read_to_string(Path::new(HISTORY_PATH))
+    std::fs::read_to_string(crate::paths::config_file(HISTORY_FILENAME))
         .ok()
         .and_then(|text| toml::from_str::<HistoryFile>(&text).ok())
         .map(|f| f.entries)
@@ -61,7 +60,7 @@ pub fn save(entries: &[HistoryEntry]) {
         entries: entries[start..].to_vec(),
     };
     if let Ok(text) = toml::to_string_pretty(&file) {
-        let _ = std::fs::write(Path::new(HISTORY_PATH), text);
+        let _ = std::fs::write(crate::paths::config_file(HISTORY_FILENAME), text);
     }
 }
 

@@ -1176,6 +1176,7 @@ fn contacts_tab(app: &App, scale: f32) -> Element<'_, Message> {
             } else {
                 "No matches"
             }),
+            contacts_io_row(app),
         ]
         .spacing(16)
         .into();

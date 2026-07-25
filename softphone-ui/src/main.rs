@@ -4,13 +4,19 @@ mod audio_devices;
 mod bridge;
 mod contacts;
 mod history;
+mod paths;
 mod theme;
 mod view;
 
 use app::App;
 use std::path::Path;
 
-const ACCOUNTS_PATH: &str = "./accounts.toml";
+const ACCOUNTS_FILENAME: &str = "accounts.toml";
+/// Only ever checked relative to the CWD — genuinely legacy, from before
+/// `accounts.toml` existed at all. `paths::config_file` already handles
+/// migrating an existing CWD-relative `accounts.toml` into the real XDG
+/// location; this only matters for the (now rare) case of a dev setup that
+/// predates `accounts.toml` entirely.
 const LEGACY_CONFIG_PATH: &str = "./oxidesip.toml";
 
 /// Loads every configured account. If `accounts.toml` doesn't exist yet but
@@ -18,7 +24,8 @@ const LEGACY_CONFIG_PATH: &str = "./oxidesip.toml";
 /// migrates it into a one-entry accounts file so existing single-account
 /// setups keep working without the user having to reconfigure anything.
 fn load_accounts() -> Vec<softphone_core::config::SipAccountConfig> {
-    let accounts = softphone_core::config::load_accounts(Path::new(ACCOUNTS_PATH)).unwrap_or_default();
+    let accounts_path = paths::config_file(ACCOUNTS_FILENAME);
+    let accounts = softphone_core::config::load_accounts(&accounts_path).unwrap_or_default();
     if !accounts.is_empty() {
         return accounts;
     }
@@ -33,7 +40,7 @@ fn load_accounts() -> Vec<softphone_core::config::SipAccountConfig> {
         legacy.name = "Default".to_string();
     }
     let migrated = vec![legacy];
-    if let Err(e) = softphone_core::config::save_accounts(Path::new(ACCOUNTS_PATH), &migrated) {
+    if let Err(e) = softphone_core::config::save_accounts(&accounts_path, &migrated) {
         tracing::warn!(%e, "failed to persist migrated account");
     }
     migrated

@@ -554,6 +554,12 @@ pub enum Message {
     SecondaryOutputTargetsLoaded(Vec<AudioDevice>, Vec<AudioDevice>),
     SettingsSavePressed,
     SettingsCancelPressed,
+    /// Tab/Shift+Tab pressed anywhere, not already consumed by the focused
+    /// widget — cycles keyboard focus forward/backward among this window's
+    /// text fields (the only widgets iced itself supports focusing; see
+    /// `subscription()`'s doc comment for the rest of the story).
+    FocusNext,
+    FocusPrevious,
     Tick,
     MuteToggled,
     OutputVolumeChanged(f32),
@@ -594,7 +600,7 @@ pub enum Message {
 /// Legacy single-account migration lives in `main.rs` (it needs to run once
 /// at process startup, before `App` exists) — this is just where the
 /// resulting multi-account file is persisted from then on.
-const ACCOUNTS_PATH: &str = "./accounts.toml";
+const ACCOUNTS_FILENAME: &str = "accounts.toml";
 
 const MAIN_WINDOW_SIZE: iced::Size = iced::Size::new(380.0, 640.0);
 const COMPACT_WINDOW_SIZE: iced::Size = iced::Size::new(320.0, 190.0);
@@ -711,6 +717,30 @@ impl App {
         (app, Task::batch(startup))
     }
 
+    /// Global Tab/Shift+Tab handling for `iced::widget::focus_next`/
+    /// `focus_previous`: `iced` only tracks keyboard focus for `text_input`
+    /// (and `text_editor`/`combo_box`, unused here) — buttons, togglers, and
+    /// `pick_list` have no concept of keyboard focus at all in this
+    /// version, so Tab can only ever cycle between text fields, not reach
+    /// Save/Cancel or a toggle. That's a real gap for genuinely complete
+    /// keyboard navigation, but building one from scratch (a custom focus
+    /// ring plus Enter/Space activation for every button-like widget) is a
+    /// much larger, riskier change than this — flagged rather than faked.
+    fn tab_navigation(event: iced::Event, status: iced::event::Status, _window: window::Id) -> Option<Message> {
+        if status != iced::event::Status::Ignored {
+            return None;
+        }
+        let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+            modifiers,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+        Some(if modifiers.shift() { Message::FocusPrevious } else { Message::FocusNext })
+    }
+
     pub fn subscription(&self) -> Subscription<Message> {
         let configs: Vec<SipAccountConfig> = self.accounts.iter().map(|a| a.config.clone()).collect();
         Subscription::batch([
@@ -718,6 +748,7 @@ impl App {
             iced::time::every(TICK_INTERVAL).map(|_| Message::Tick),
             window::close_events().map(Message::WindowClosed),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
+            iced::event::listen_with(Self::tab_navigation),
         ])
     }
 
@@ -1279,6 +1310,8 @@ impl App {
                 }
                 Task::none()
             }
+            Message::FocusNext => iced::widget::operation::focus_next(),
+            Message::FocusPrevious => iced::widget::operation::focus_previous(),
 
             Message::Tick => {
                 if let Some(acc) = self.selected_mut() {
@@ -1794,7 +1827,7 @@ impl App {
 
     fn persist_accounts(&self) {
         let configs: Vec<SipAccountConfig> = self.accounts.iter().map(|a| a.config.clone()).collect();
-        if let Err(e) = softphone_core::config::save_accounts(Path::new(ACCOUNTS_PATH), &configs) {
+        if let Err(e) = softphone_core::config::save_accounts(&crate::paths::config_file(ACCOUNTS_FILENAME), &configs) {
             tracing::warn!(%e, "failed to save accounts");
         }
     }
