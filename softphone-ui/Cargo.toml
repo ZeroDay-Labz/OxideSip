@@ -2,6 +2,10 @@
 name = "softphone-ui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [dependencies]
 softphone-core = { path = "../softphone-core" }
@@ -19,3 +23,14 @@ rfd = "0.17.2"
 # --- Phase 4 (future work) ---
 # zbus = "5.18"          # StatusNotifierItem tray service, minimize-to-tray on close
 # notify-rust = "4.18"   # KDE/libnotify call popups
+
+# Consumed by `cargo generate-rpm` (see .github/workflows/release.yml) to
+# build a Fedora-installable RPM from the release binary. Deliberately
+# doesn't set `auto-req`/`requires` here — leaving the tool's default
+# ldd-based dependency discovery on picks up the real shared-library
+# requirements (libpipewire, etc.) from whatever binary was actually built,
+# which is more accurate than a hand-maintained package-name list.
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/softphone-ui", dest = "/usr/bin/softphone-ui", mode = "755" },
+]

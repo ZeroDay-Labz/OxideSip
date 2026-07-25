@@ -6,6 +6,9 @@ members = ["softphone-core", "softphone-media", "softphone-ui"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "A professional-grade SIP softphone for Linux"
+homepage = "https://github.com/ZeroDay-Labz/OxideSip"
+repository = "https://github.com/ZeroDay-Labz/OxideSip"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

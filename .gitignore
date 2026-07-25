@@ -16,3 +16,4 @@ settings.toml
 
 # Rust build artifacts
 /target/
+

@@ -1,0 +1,61 @@
+name: Build and Release
+
+# Runs when you push a tag like 'v1.0.0'.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Lets softprops/action-gh-release create the release with the default
+# GITHUB_TOKEN, without needing the repo-wide "Read and write permissions"
+# setting under Settings > Actions > General.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Linux binary and Fedora RPM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      # softphone-media links against PipeWire and generates its FFI
+      # bindings at build time via bindgen, so both the library headers and
+      # libclang need to be present on the runner.
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config
+
+      - name: Build release binary
+        run: cargo build --release -p softphone-ui
+
+      # cargo-generate-rpm's README recommends stripping debug symbols
+      # before packaging; do it once so both artifacts below ship a
+      # stripped binary.
+      - name: Strip debug symbols
+        run: strip -s target/release/softphone-ui
+
+      - name: Package general Linux binary (.tar.gz)
+        run: tar -czvf softphone-ui-linux-x86_64.tar.gz -C target/release softphone-ui
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Generate Fedora RPM
+        run: cargo generate-rpm -p softphone-ui
+
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            softphone-ui-linux-x86_64.tar.gz
+            target/generate-rpm/*.rpm
