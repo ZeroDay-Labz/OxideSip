@@ -1,0 +1,13 @@
+sip_server_host = "pbx.example.internal"
+sip_server_port = 5060
+transport = "udp"          # "udp" (default), "tcp", or "tls"
+username = "1001"
+password = "changeme"
+register_expires = 3600
+# local_port = 0            # 0 = ephemeral local UDP/TCP port
+# srtp = false               # SDES-SRTP offer; stock FreePBX extensions default to no media encryption
+
+# --- opt-in, only used when transport = "tls" ---
+# ca_cert_path = "./certs/freepbx-ca.pem"
+# client_cert_path = "./certs/client.pem"
+# client_key_path = "./certs/client.key"

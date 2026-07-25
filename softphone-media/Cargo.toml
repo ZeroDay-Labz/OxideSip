@@ -1,0 +1,24 @@
+[package]
+name = "softphone-media"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+pipewire = { version = "0.10", features = ["v0_3_44"] }
+ringbuf = "0.5"
+rand = "0.10"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
+
+[[example]]
+name = "list_devices"
+path = "examples/list_devices.rs"

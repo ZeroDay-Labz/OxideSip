@@ -1,0 +1,27 @@
+[package]
+name = "softphone-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+toml = "0.9"
+rand = "0.10"
+sdp-rs = "0.2.1"
+vec1 = "1"
+base64 = "0.22"
+if-addrs = "0.15"
+
+rsipstack = "0.5.22"
+
+[dev-dependencies]
+dotenvy = "0.15"
+
+[[example]]
+name = "register_probe"
+path = "examples/register_probe.rs"

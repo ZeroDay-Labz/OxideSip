@@ -1,0 +1,18 @@
+/target
+accounts.toml
+audio_devices.toml
+call_history.toml
+contacts.toml
+oxidesip.toml
+settings.toml
+.claude
+# Local configuration and state files
+*.toml
+!Cargo.toml
+!config.example.toml
+
+# AI context
+.claude/
+
+# Rust build artifacts
+/target/
