@@ -1,10 +1,10 @@
 [Desktop Entry]
-Type=Application
 Name=OxideSip
 GenericName=SIP Softphone
-Comment=A professional-grade SIP softphone for Linux
+Comment=Native Linux SIP Softphone
 Exec=oxidesip
 Icon=io.github.zerodaylabz.OxideSip
 Terminal=false
-Categories=Network;Telephony;
-Keywords=sip;voip;phone;softphone;pbx;
+Type=Application
+Categories=Network;Telephony;Communication;
+StartupWMClass=oxidesip
