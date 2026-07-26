@@ -108,6 +108,16 @@ pub struct SipAccountConfig {
     /// ceremony here — the UI's codec list editor just always keeps at
     /// least one entry.
     pub preferred_codecs: Vec<PreferredCodec>,
+    /// Bumped on every SIP Settings Save (see `app.rs::handle_sip_settings_save`),
+    /// even when nothing else changed. Never persisted — its only purpose is
+    /// to change this struct's `Hash` so `bridge::subscription`'s
+    /// `Subscription::run_with` (keyed off `Vec<SipAccountConfig>`'s hash)
+    /// tears down and respawns a fresh `SoftphoneCore` (and thus a fresh
+    /// registration attempt) purely because the user hit Save — the
+    /// designated recovery path after the registration loop halts on
+    /// repeated auth failures (see `registration.rs`).
+    #[serde(skip)]
+    pub reg_epoch: u64,
 }
 
 impl Default for SipAccountConfig {
@@ -128,6 +138,7 @@ impl Default for SipAccountConfig {
             client_cert_path: None,
             client_key_path: None,
             preferred_codecs: vec![PreferredCodec::Ulaw, PreferredCodec::Alaw],
+            reg_epoch: 0,
         }
     }
 }
@@ -239,6 +250,7 @@ impl RawConfig {
                 .preferred_codecs
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| vec![PreferredCodec::Ulaw, PreferredCodec::Alaw]),
+            reg_epoch: 0,
         })
     }
 }

@@ -7,7 +7,7 @@ use iced::{window, Element, Subscription, Task};
 use softphone_core::config::{PreferredCodec, SipAccountConfig, SipTransport, PREFERRED_CODECS};
 use softphone_core::events::{CallId, CallState, CoreCommand, CoreEvent, RemoteMediaInfo};
 use softphone_media::{AudioDevice, DtmfTonePlayer, MediaSession, ReservedSocket};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,6 +31,12 @@ pub enum RegistrationStatus {
         rtt_ms: u32,
     },
     Failed { reason: String },
+    /// The core's registration loop has given up entirely (repeated 401/407s
+    /// or an outright 403) rather than continuing to retry — distinct from
+    /// `Failed`, which still implies "reconnecting." Re-saving SIP Settings
+    /// (see `handle_sip_settings_save`'s `reg_epoch` bump) is the only way
+    /// to trigger a fresh attempt from here.
+    Halted { reason: String },
 }
 
 pub enum CallUiState {
@@ -49,6 +55,21 @@ pub enum CallUiState {
         number: String,
         /// When we started dialing out — same purpose as `Incoming`'s
         /// `ringing_since`.
+        started_at: Instant,
+    },
+    /// A 183 Session Progress landed with an SDP body before the final 200
+    /// OK — real early media (e.g. in-band ringback/announcement) is
+    /// flowing, or at least being set up (`media` is `None` until its
+    /// `MediaSession::start` future resolves). `remote` is compared against
+    /// the eventual `Answered` event's remote info to decide whether the
+    /// final answer can just promote this in place (same target) or needs
+    /// to tear it down and rebuild (target changed) — see
+    /// `handle_call_state_changed`.
+    EarlyMedia {
+        id: CallId,
+        number: String,
+        media: Option<MediaSession>,
+        remote: RemoteMediaInfo,
         started_at: Instant,
     },
     Active {
@@ -75,6 +96,23 @@ pub enum CallUiState {
         /// by `Message::PostDialAdvance` once the call is answered.
         post_dial: VecDeque<char>,
     },
+}
+
+impl CallUiState {
+    /// The `(id, media)` slot shared by `Active` and `EarlyMedia` — the two
+    /// states that can actually hold a live/in-flight `MediaSession`. Lets
+    /// `Message::MediaReady`'s handler land a just-finished
+    /// `MediaSession::start` future into whichever of the two states the
+    /// line is in by the time it resolves, without duplicating the same
+    /// `if let` twice.
+    fn media_slot(&mut self) -> Option<(&CallId, &mut Option<MediaSession>)> {
+        match self {
+            CallUiState::Active { id, media, .. } | CallUiState::EarlyMedia { id, media, .. } => {
+                Some((id, media))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Up to 5 concurrent call slots per account, matching `softphone-core`'s
@@ -349,10 +387,11 @@ impl AccountSession {
         }
     }
 
-    fn line_index_for_call(&self, call_id: &CallId) -> Option<usize> {
+    pub(crate) fn line_index_for_call(&self, call_id: &CallId) -> Option<usize> {
         self.lines.iter().position(|line| match line {
             CallUiState::Incoming { id, .. }
             | CallUiState::Outgoing { id, .. }
+            | CallUiState::EarlyMedia { id, .. }
             | CallUiState::Active { id, .. } => id == call_id,
             _ => false,
         })
@@ -465,6 +504,15 @@ pub struct App {
     sip_settings_window: Option<window::Id>,
     audio_settings_window: Option<window::Id>,
     settings_window: Option<window::Id>,
+    /// One small popup window per currently-ringing incoming call (keyed by
+    /// call id, since — unlike the singleton settings windows above —
+    /// multiple simultaneous incoming calls across lines/accounts each get
+    /// their own), plus the reverse lookup so `Message::WindowClosed` (which
+    /// only ever gets a bare `window::Id`) can find which call a closed
+    /// popup belonged to. Both entries for a call are always inserted and
+    /// removed together — see `close_incoming_popup`.
+    incoming_call_windows: HashMap<CallId, (usize, window::Id)>,
+    incoming_call_window_ids: HashMap<window::Id, (usize, CallId)>,
     pub(crate) settings: AppSettings,
     pub(crate) settings_form: SettingsForm,
     pub(crate) call_history: Vec<history::HistoryEntry>,
@@ -505,6 +553,13 @@ pub enum Message {
     CallPressed,
     AnswerPressed,
     RejectPressed,
+    /// Answer/Decline pressed on a specific call's incoming-call popup
+    /// window (as opposed to `AnswerPressed`/`RejectPressed`, which act on
+    /// whichever line is currently selected in the main window) — carries
+    /// the account index and call id so the right line can be resolved
+    /// regardless of what's currently selected.
+    AnswerIncomingCall(usize, CallId),
+    RejectIncomingCall(usize, CallId),
     HangUpPressed,
     MediaReady(usize, CallId, Result<Arc<Mutex<Option<MediaSession>>>, String>),
     OpenSipSettings,
@@ -686,6 +741,8 @@ impl App {
             sip_settings_window: None,
             audio_settings_window: None,
             settings_window: None,
+            incoming_call_windows: HashMap::new(),
+            incoming_call_window_ids: HashMap::new(),
             settings_form: SettingsForm::from_settings(&settings),
             settings,
             call_history: history::load(),
@@ -769,7 +826,9 @@ impl App {
     }
 
     pub fn view(&self, window: window::Id) -> Element<'_, Message> {
-        if Some(window) == self.sip_settings_window {
+        if let Some((account, id)) = self.incoming_call_window_ids.get(&window) {
+            view::incoming_call_popup_view(self, *account, id)
+        } else if Some(window) == self.sip_settings_window {
             view::sip_settings_window_view(self)
         } else if Some(window) == self.audio_settings_window {
             view::audio_settings_window_view(self)
@@ -781,7 +840,9 @@ impl App {
     }
 
     pub fn title(&self, window: window::Id) -> String {
-        if Some(window) == self.sip_settings_window {
+        if self.incoming_call_window_ids.contains_key(&window) {
+            "OxideSip — Incoming Call".to_string()
+        } else if Some(window) == self.sip_settings_window {
             "OxideSip — SIP Setup".to_string()
         } else if Some(window) == self.audio_settings_window {
             "OxideSip — Audio & Codecs".to_string()
@@ -821,6 +882,12 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Core(account, CoreEvent::RegistrationHalted { reason }) => {
+                if let Some(acc) = self.accounts.get_mut(account) {
+                    acc.registration = RegistrationStatus::Halted { reason };
+                }
+                Task::none()
+            }
 
             Message::Core(account, CoreEvent::IncomingCall { id, line, remote, offer }) => {
                 let idx = line_idx(line);
@@ -851,7 +918,7 @@ impl App {
                     && matches!(acc.lines[idx], CallUiState::Idle)
                 {
                     acc.lines[idx] = CallUiState::Incoming {
-                        id,
+                        id: id.clone(),
                         caller: remote,
                         offer,
                         ringing_since: Instant::now(),
@@ -860,6 +927,25 @@ impl App {
                     if self.settings.auto_answer {
                         return self.answer_line(account, idx);
                     }
+                    if let Some(player) = &self.tone_player {
+                        player.play_incoming_ringtone();
+                    }
+                    // A small always-on-top popup with its own Answer/
+                    // Decline — the sidebar's colored LED alone was easy to
+                    // miss entirely unless the Dialer tab happened to be
+                    // showing this exact line. One per ringing call (keyed
+                    // by call id), so simultaneous incoming calls across
+                    // lines/accounts each get their own.
+                    let (win_id, open_task) = window::open(window::Settings {
+                        size: iced::Size::new(360.0, 220.0),
+                        resizable: false,
+                        position: window::Position::Centered,
+                        level: window::Level::AlwaysOnTop,
+                        ..Default::default()
+                    });
+                    self.incoming_call_windows.insert(id.clone(), (account, win_id));
+                    self.incoming_call_window_ids.insert(win_id, (account, id));
+                    return open_task.discard();
                 }
                 Task::none()
             }
@@ -935,13 +1021,36 @@ impl App {
             Message::CallPressed => self.handle_call_pressed(),
             Message::AnswerPressed => self.handle_answer_pressed(),
             Message::RejectPressed => {
-                if let Some(acc) = self.selected() {
+                let id = if let Some(acc) = self.selected() {
                     let idx = acc.selected_idx();
                     if let CallUiState::Incoming { id, .. } = &acc.lines[idx] {
+                        let id = id.clone();
                         acc.send_command(CoreCommand::RejectCall(id.clone()));
+                        Some(id)
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                id.map(|id| self.close_incoming_popup(&id)).unwrap_or(Task::none())
+            }
+            Message::AnswerIncomingCall(account, id) => {
+                let close_task = self.close_incoming_popup(&id);
+                let Some(acc) = self.accounts.get(account) else {
+                    return close_task;
+                };
+                let Some(idx) = acc.line_index_for_call(&id) else {
+                    return close_task;
+                };
+                Task::batch([close_task, self.answer_line(account, idx)])
+            }
+            Message::RejectIncomingCall(account, id) => {
+                let close_task = self.close_incoming_popup(&id);
+                if let Some(acc) = self.accounts.get(account) {
+                    acc.send_command(CoreCommand::RejectCall(id));
                 }
-                Task::none()
+                close_task
             }
             Message::HangUpPressed => self.handle_hang_up_pressed(),
 
@@ -949,9 +1058,7 @@ impl App {
                 let session = session_holder.lock().unwrap().take();
                 if let Some(acc) = self.accounts.get_mut(account)
                     && let Some(idx) = acc.line_index_for_call(&id)
-                    && let CallUiState::Active {
-                        id: current, media, ..
-                    } = &mut acc.lines[idx]
+                    && let Some((current, media)) = acc.lines[idx].media_slot()
                     && *current == id
                 {
                     if let Some(session) = &session {
@@ -1289,7 +1396,24 @@ impl App {
                 Task::none()
             }
             Message::WindowClosed(id) => {
-                if Some(id) == self.sip_settings_window {
+                if let Some((account, call_id)) = self.incoming_call_window_ids.remove(&id) {
+                    self.incoming_call_windows.remove(&call_id);
+                    // Only reached for a genuine native close-button click:
+                    // every other path that ends this call's `Incoming`
+                    // state (both popup buttons, main-window Answer/
+                    // Decline, or the call ending on its own) already calls
+                    // `close_incoming_popup`, which removes both map entries
+                    // *before* issuing `window::close` — so by the time
+                    // iced fires this event for those paths, the `remove`
+                    // above would have returned `None` and we'd never reach
+                    // here. Reaching here means the user dismissed the
+                    // popup directly, which we treat the same as pressing
+                    // Decline.
+                    if let Some(acc) = self.accounts.get(account) {
+                        acc.send_command(CoreCommand::RejectCall(call_id));
+                    }
+                    Task::none()
+                } else if Some(id) == self.sip_settings_window {
                     self.sip_settings_window = None;
                     Task::none()
                 } else if Some(id) == self.audio_settings_window {
@@ -1954,6 +2078,12 @@ impl App {
         new_config.username = self.sip_settings_form.username.trim().to_string();
         new_config.password = self.sip_settings_form.password.clone();
         new_config.transport = self.sip_settings_form.transport;
+        // Force a fresh `SoftphoneCore`/registration attempt on every Save,
+        // even when nothing else changed — `bridge::subscription` only
+        // respawns when `Vec<SipAccountConfig>`'s `Hash` changes, and this
+        // is the designated recovery path once the registration loop halts
+        // on repeated auth failures (see `RegistrationStatus::Halted`).
+        new_config.reg_epoch = new_config.reg_epoch.wrapping_add(1);
 
         match self.editing_account {
             Some(index) if index < self.accounts.len() => {
@@ -2022,12 +2152,72 @@ impl App {
             return Task::none();
         };
         match state {
-            CallState::Ringing => Task::none(),
+            CallState::Ringing => {
+                // Only ring back while the line is still plainly `Outgoing`
+                // — guards against a stray 180 arriving after a 183 already
+                // moved this call into `EarlyMedia` with real audio
+                // flowing, which must not be interrupted by ringback.
+                if let Some(idx) = acc.line_index_for_call(&id)
+                    && matches!(acc.lines[idx], CallUiState::Outgoing { .. })
+                    && let Some(player) = &self.tone_player
+                {
+                    player.play_ringback_tone();
+                }
+                Task::none()
+            }
+            CallState::EarlyMedia { remote } => {
+                if let Some(player) = &self.tone_player {
+                    player.stop_ringback();
+                }
+                let Some(idx) = acc.line_index_for_call(&id) else {
+                    return Task::none();
+                };
+                if matches!(acc.lines[idx], CallUiState::EarlyMedia { .. }) {
+                    // A second 183 for the same call — already building/
+                    // built early media, nothing new to do.
+                    return Task::none();
+                }
+                let CallUiState::Outgoing { number, started_at, .. } = &acc.lines[idx] else {
+                    return Task::none();
+                };
+                let (number, started_at) = (number.clone(), *started_at);
+                let Some(reserved) = acc.pending_sockets[idx].take() else {
+                    return Task::none();
+                };
+                acc.lines[idx] = CallUiState::EarlyMedia {
+                    id: id.clone(),
+                    number,
+                    media: None,
+                    remote: remote.clone(),
+                    started_at,
+                };
+                let capture_target = self.audio_devices.input_device.clone();
+                let playback_target = self.audio_devices.output_device.clone();
+                let label = format!("OxideSip Acct{} Line {} (early)", account + 1, idx + 1);
+                Task::future(async move {
+                    let result = MediaSession::start(
+                        reserved,
+                        remote.remote_addr,
+                        remote.payload_type,
+                        capture_target,
+                        playback_target,
+                        label,
+                    )
+                    .await
+                    .map(|session| Arc::new(Mutex::new(Some(session))))
+                    .map_err(|e| e.to_string());
+                    Message::MediaReady(account, id, result)
+                })
+            }
             CallState::Answered { remote, .. } => {
                 let Some(idx) = acc.line_index_for_call(&id) else {
                     tracing::warn!("answered event for a call we're not tracking");
                     return Task::none();
                 };
+                if let Some(player) = &self.tone_player {
+                    player.stop_ringback();
+                    player.stop_incoming_ringtone();
+                }
                 if let CallUiState::Active {
                     on_hold,
                     pre_hold_output_volume,
@@ -2047,6 +2237,69 @@ impl App {
                         session.set_output_volume(*output_volume);
                     }
                     return Task::none();
+                }
+
+                if matches!(acc.lines[idx], CallUiState::EarlyMedia { .. }) {
+                    let CallUiState::EarlyMedia {
+                        number,
+                        media,
+                        remote: early_remote,
+                        started_at,
+                        ..
+                    } = std::mem::replace(&mut acc.lines[idx], CallUiState::Idle)
+                    else {
+                        unreachable!()
+                    };
+                    if early_remote == remote {
+                        // Same target early media was already pointed at —
+                        // promote in place and reuse whatever `MediaSession`
+                        // exists (possibly still `None` if its `start`
+                        // future hasn't resolved yet — the in-flight
+                        // `MediaReady` future still lands correctly via
+                        // `media_slot`, since it targets by `CallId`, not
+                        // exact enum variant). There's no cheap "retarget"
+                        // method on `MediaSession`, so same-address reuse is
+                        // the only path that avoids a pointless rebuild of a
+                        // session that may already be carrying real audio.
+                        let post_dial: VecDeque<char> = acc.pending_post_dials[idx].drain(..).collect();
+                        acc.lines[idx] = CallUiState::Active {
+                            id: id.clone(),
+                            number,
+                            direction: history::CallDirection::Outgoing,
+                            media,
+                            dtmf_feedback: Vec::new(),
+                            answered_at: Instant::now(),
+                            input_level: 0.0,
+                            output_level: 0.0,
+                            muted: false,
+                            output_volume: 1.0,
+                            input_volume: 1.0,
+                            on_hold: false,
+                            pre_hold_output_volume: 1.0,
+                            transfer_input: None,
+                            post_dial,
+                        };
+                        return Task::none();
+                    }
+                    // Rare: the final answer's target differs from what
+                    // early media was already pointed at. Drop the
+                    // mismatched early session — `MediaSession`'s `Drop`
+                    // impl tears its PipeWire pipeline down, the same
+                    // safety net `CallState::Terminated` already relies on
+                    // elsewhere — and fall through to the generic build path
+                    // below by resetting to `Outgoing`, re-reserving a
+                    // socket since `EarlyMedia` already consumed the
+                    // original one from `pending_sockets`.
+                    drop(media);
+                    acc.lines[idx] = CallUiState::Outgoing { id: id.clone(), number, started_at };
+                    match ReservedSocket::reserve() {
+                        Ok(reserved) => acc.pending_sockets[idx] = Some(reserved),
+                        Err(e) => {
+                            tracing::warn!(%e, "failed to reserve socket rebuilding after early-media target change");
+                            acc.lines[idx] = CallUiState::Idle;
+                            return Task::none();
+                        }
+                    }
                 }
 
                 let Some(reserved) = acc.pending_sockets[idx].take() else {
@@ -2148,8 +2401,13 @@ impl App {
                     acc.pending_sockets[idx] = None;
                     acc.last_call_status[idx] = Some("declined".to_string());
                     if let Some(player) = &self.tone_player {
+                        player.stop_incoming_ringtone();
                         player.play_disconnect_tone();
                     }
+                }
+                if let Some((_, window_id)) = self.incoming_call_windows.remove(&id) {
+                    self.incoming_call_window_ids.remove(&window_id);
+                    return window::close(window_id);
                 }
                 Task::none()
             }
@@ -2170,8 +2428,13 @@ impl App {
                 // disconnect cue instead; a busy/reorder cadence there would
                 // be a strange thing to hear right after an actual
                 // conversation.
-                let was_outgoing_unanswered = matches!(acc.lines[idx], CallUiState::Outgoing { .. });
+                let was_outgoing_unanswered = matches!(
+                    acc.lines[idx],
+                    CallUiState::Outgoing { .. } | CallUiState::EarlyMedia { .. }
+                );
                 if let Some(player) = &self.tone_player {
+                    player.stop_ringback();
+                    player.stop_incoming_ringtone();
                     if was_outgoing_unanswered && reason == "busy" {
                         player.play_busy_tone();
                     } else if was_outgoing_unanswered {
@@ -2191,7 +2454,7 @@ impl App {
                             None,
                         );
                     }
-                    CallUiState::Outgoing { number, .. } => {
+                    CallUiState::Outgoing { number, .. } | CallUiState::EarlyMedia { number, .. } => {
                         Self::push_history(
                             &mut self.call_history,
                             number.clone(),
@@ -2225,11 +2488,22 @@ impl App {
                 // MediaSession::stop's docs).
                 acc.lines[idx] = CallUiState::Idle;
                 acc.pending_sockets[idx] = None;
+                // Closes an incoming-call popup if this call ended before
+                // ever being answered from it (e.g. the caller hung up
+                // while we were still ringing) — a no-op if there wasn't
+                // one (this call was never `Incoming`, or it already
+                // closed via Answer/Decline).
+                let close_task = if let Some((_, window_id)) = self.incoming_call_windows.remove(&id) {
+                    self.incoming_call_window_ids.remove(&window_id);
+                    window::close(window_id)
+                } else {
+                    Task::none()
+                };
                 if self.compact_mode && account == self.selected_account && idx == acc.selected_idx() {
                     self.compact_mode = false;
-                    return self.resize_for_compact(false);
+                    return Task::batch([close_task, self.resize_for_compact(false)]);
                 }
-                Task::none()
+                close_task
             }
         }
     }
@@ -2319,6 +2593,22 @@ impl App {
         self.answer_line(account, idx)
     }
 
+    /// Closes and forgets the incoming-call popup for `id`, if one exists —
+    /// a no-op `Task::none()` otherwise. Called from every path that ends a
+    /// call's `Incoming` state (both popup buttons, the main window's
+    /// Answer/Decline, and the `Rejected`/`Terminated` events), always
+    /// *before* the popup's `window::close` is actually issued — that
+    /// ordering is what lets `Message::WindowClosed`'s own decline-on-close
+    /// branch tell an explicit close (map entry already gone) apart from a
+    /// bare OS close-button click (entry still present).
+    fn close_incoming_popup(&mut self, id: &CallId) -> Task<Message> {
+        if let Some((_, window_id)) = self.incoming_call_windows.remove(id) {
+            self.incoming_call_window_ids.remove(&window_id);
+            return window::close(window_id);
+        }
+        Task::none()
+    }
+
     /// Reserves a socket and sends `AnswerCall` for line `idx` on `account`
     /// — factored out of `handle_answer_pressed` so auto-answer (see
     /// `Message::Core(_, CoreEvent::IncomingCall)`) can answer whichever
@@ -2362,7 +2652,9 @@ impl App {
         };
         let idx = acc.selected_idx();
         let id = match &acc.lines[idx] {
-            CallUiState::Active { id, .. } | CallUiState::Outgoing { id, .. } => Some(id.clone()),
+            CallUiState::Active { id, .. }
+            | CallUiState::Outgoing { id, .. }
+            | CallUiState::EarlyMedia { id, .. } => Some(id.clone()),
             _ => None,
         };
         let Some(id) = id else { return Task::none() };
@@ -2386,7 +2678,7 @@ impl App {
                     Some(answered_at.elapsed()),
                 );
             }
-            CallUiState::Outgoing { number, .. } => {
+            CallUiState::Outgoing { number, .. } | CallUiState::EarlyMedia { number, .. } => {
                 let number = number.clone();
                 Self::push_history(
                     &mut self.call_history,
@@ -2404,6 +2696,8 @@ impl App {
         acc.pending_sockets[idx] = None;
         acc.last_call_status[idx] = Some("hung up".to_string());
         if let Some(player) = &self.tone_player {
+            player.stop_ringback();
+            player.stop_incoming_ringtone();
             player.play_disconnect_tone();
         }
         if self.compact_mode {

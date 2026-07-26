@@ -41,10 +41,10 @@ jobs:
       # before packaging; do it once so both artifacts below ship a
       # stripped binary.
       - name: Strip debug symbols
-        run: strip -s target/release/softphone-ui
+        run: strip -s target/release/oxidesip
 
       - name: Package general Linux binary (.tar.gz)
-        run: tar -czvf softphone-ui-linux-x86_64.tar.gz -C target/release softphone-ui
+        run: tar -czvf softphone-ui-linux-x86_64.tar.gz -C target/release oxidesip
 
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm

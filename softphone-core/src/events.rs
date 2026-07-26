@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 /// stable for the whole dialog lifetime in both directions.
 pub type CallId = String;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RemoteMediaInfo {
     pub remote_addr: SocketAddr,
     pub payload_type: u8,
@@ -22,6 +22,12 @@ pub struct LocalMediaInfo {
 #[derive(Debug, Clone)]
 pub enum CallState {
     Ringing,
+    /// A 183 Session Progress arrived with an SDP body before the final 200
+    /// OK — the far end offered early media (e.g. an in-band ringback or
+    /// announcement) and we can already open an RTP stream toward it.
+    EarlyMedia {
+        remote: RemoteMediaInfo,
+    },
     Answered {
         local: LocalMediaInfo,
         remote: RemoteMediaInfo,
@@ -35,6 +41,13 @@ pub enum CallState {
 pub enum CoreEvent {
     Registered { expires: u32, rtt_ms: u32 },
     RegistrationFailed { reason: String },
+    /// The registration retry loop has given up entirely (repeated
+    /// 401/407s, or an outright 403 Forbidden) rather than continuing to
+    /// retry — see `registration.rs`'s circuit breaker. Distinct from
+    /// `RegistrationFailed`, which still implies "will keep retrying":
+    /// once this fires, no further REGISTER attempts happen until the
+    /// account's config changes (e.g. re-saving SIP Settings).
+    RegistrationHalted { reason: String },
     IncomingCall {
         id: CallId,
         /// Which line (1-5) this call was assigned to — the first free line

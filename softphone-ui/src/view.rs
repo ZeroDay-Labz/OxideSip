@@ -11,6 +11,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Length};
 use softphone_core::config::{SipTransport, SIP_TRANSPORTS};
+use softphone_core::events::CallId;
 use std::time::Instant;
 
 const DANGER_TEXT: Color = Color {
@@ -165,12 +166,13 @@ fn line_sidebar(acc: &AccountSession, scale: f32) -> Element<'_, Message> {
         let live = matches!(
             call,
             CallUiState::Active { on_hold, .. } if joined || (selected && !on_hold)
-        );
+        ) || matches!(call, CallUiState::EarlyMedia { .. } if selected);
         let armed_idle = selected && acc.line_open && matches!(call, CallUiState::Idle);
         let (fill, sub_label) = match call {
             CallUiState::Idle => (None, String::new()),
             CallUiState::Incoming { caller, .. } => (Some(theme::oxide_palette().warning), short_label(caller)),
             CallUiState::Outgoing { number, .. } => (Some(theme::oxide_palette().primary), short_label(number)),
+            CallUiState::EarlyMedia { number, .. } => (Some(theme::oxide_palette().primary), short_label(number)),
             CallUiState::Active { number, .. } => {
                 let label = if joined {
                     format!("{} J", short_label(number))
@@ -246,6 +248,7 @@ fn line_tooltip(line: u8, call: &CallUiState, joined_with: Option<u8>, armed_idl
         CallUiState::Idle => format!("Line {line} — idle"),
         CallUiState::Incoming { caller, .. } => format!("Line {line} — ringing: {caller}"),
         CallUiState::Outgoing { number, .. } => format!("Line {line} — calling {number}"),
+        CallUiState::EarlyMedia { number, .. } => format!("Line {line} — calling {number} (early media)"),
         CallUiState::Active { number, on_hold, .. } => {
             if let Some(partner) = joined_with {
                 format!("Line {line} — {number} (joined with Line {partner})")
@@ -417,10 +420,18 @@ fn tab_bar(current: Screen, scale: f32) -> Element<'static, Message> {
 fn footer(acc: &AccountSession) -> Element<'_, Message> {
     let mut bar = row![].align_y(Alignment::Center);
     if let Some(status) = line_status_label(acc) {
-        bar = bar.push(text(status).size(11).color(muted_text()));
+        bar = bar.push(
+            container(text(status).size(11).color(muted_text()))
+                .padding([2, 8])
+                .style(theme::chip),
+        );
     }
     bar = bar.push(iced::widget::space::horizontal());
-    bar = bar.push(status_led(&acc.registration));
+    bar = bar.push(
+        container(status_led(&acc.registration))
+            .padding([2, 8])
+            .style(theme::chip),
+    );
 
     column![rule::horizontal(1), bar].spacing(8).into()
 }
@@ -450,7 +461,7 @@ fn line_status_label(acc: &AccountSession) -> Option<String> {
         CallUiState::Incoming { ringing_since, .. } => {
             Some(format!("(L{line} {})", format_elapsed(ringing_since.elapsed())))
         }
-        CallUiState::Outgoing { started_at, .. } => {
+        CallUiState::Outgoing { started_at, .. } | CallUiState::EarlyMedia { started_at, .. } => {
             Some(format!("(L{line} {})", format_elapsed(started_at.elapsed())))
         }
         CallUiState::Active { answered_at, .. } => {
@@ -493,6 +504,13 @@ fn status_led(registration: &RegistrationStatus) -> Element<'_, Message> {
         RegistrationStatus::Failed { reason } => {
             (palette.danger, "Offline", format!("Registration failed: {reason}"))
         }
+        RegistrationStatus::Halted { reason } => (
+            palette.danger,
+            "Registration stopped",
+            format!(
+                "Registration stopped: {reason} — edit and re-save SIP Settings to retry"
+            ),
+        ),
     };
     let dot = container(text(""))
         .width(Length::Fixed(7.0))
@@ -560,7 +578,9 @@ fn dialer_tab<'a>(app: &'a App, acc: &'a AccountSession, scale: f32) -> Element<
             idle_view(app, &app.dial_input, has_last_outgoing, scale)
         }
         CallUiState::Incoming { caller, .. } => incoming_view(&app.contacts, caller, scale),
-        CallUiState::Outgoing { number, .. } => outgoing_view(&app.contacts, number, scale),
+        CallUiState::Outgoing { number, .. } | CallUiState::EarlyMedia { number, .. } => {
+            outgoing_view(&app.contacts, number, scale)
+        }
         CallUiState::Active {
             number,
             media,
@@ -773,6 +793,63 @@ fn incoming_view<'a>(contacts: &[Contact], caller: &'a str, scale: f32) -> Eleme
     .width(Length::Fill)
     .align_x(Alignment::Center)
     .into()
+}
+
+/// The small always-on-top popup window spawned per ringing incoming call
+/// (see `app.rs`'s `incoming_call_windows`) — reuses `incoming_view`'s exact
+/// avatar/label/button visual language, but wired to the call-scoped
+/// `AnswerIncomingCall`/`RejectIncomingCall` messages (rather than the
+/// unscoped `AnswerPressed`/`RejectPressed`, which act on whichever line is
+/// currently selected in the main window) and wrapped in its own
+/// full-window centering container, since — unlike `incoming_view` — this
+/// is the popup's entire content, not one screen embedded in the larger
+/// dialer layout.
+pub fn incoming_call_popup_view<'a>(app: &'a App, account: usize, call_id: &CallId) -> Element<'a, Message> {
+    let caller = app
+        .accounts
+        .get(account)
+        .and_then(|acc| acc.line_index_for_call(call_id))
+        .and_then(|idx| match &app.accounts[account].lines[idx] {
+            CallUiState::Incoming { caller, .. } => Some(caller.as_str()),
+            _ => None,
+        })
+        .unwrap_or("Unknown caller");
+
+    let avatar = container(text(call_avatar_label(&app.contacts, caller)).size(24.0))
+        .width(Length::Fixed(84.0))
+        .height(Length::Fixed(84.0))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(theme::avatar_state(theme::avatar_color(caller), true));
+
+    let content = column![
+        column![avatar].width(Length::Fill).align_x(Alignment::Center),
+        column![
+            text("Incoming call").size(13).color(muted_text()),
+            text(caller).size(18),
+        ]
+        .spacing(4)
+        .width(Length::Fill)
+        .align_x(Alignment::Center),
+        row![
+            pill_action_button("Decline", theme::pill(Pill::Danger), 1.0)
+                .on_press(Message::RejectIncomingCall(account, call_id.clone())),
+            pill_action_button("Answer", theme::pill(Pill::Success), 1.0)
+                .on_press(Message::AnswerIncomingCall(account, call_id.clone())),
+        ]
+        .spacing(16),
+    ]
+    .spacing(18)
+    .width(Length::Fill)
+    .align_x(Alignment::Center);
+
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .padding(20)
+        .into()
 }
 
 /// The dialing-out screen — between pressing Call and the far end actually

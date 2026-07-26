@@ -1,0 +1,66 @@
+id: io.github.zerodaylabz.OxideSip
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+# rust-stable provides cargo/rustc inside the build sandbox; llvm20 provides
+# libclang, needed at build time by softphone-media's `pipewire` dependency
+# (its FFI bindings are generated with bindgen, which needs libclang to
+# parse PipeWire's C headers). Both confirmed present for the 25.08 branch.
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm20
+command: oxidesip
+
+# Only what's actually needed, following org.pipewire.Helvum's manifest for
+# the PipeWire-access pattern (a native `pipewire`-crate client like ours,
+# not routed through the pulseaudio compatibility layer):
+#   --share=network        SIP signaling + RTP media to/from the PBX
+#   --share=ipc             PipeWire's shared-memory buffer transport
+#   --socket=wayland/--socket=fallback-x11   the GUI itself
+#   --device=dri            GPU acceleration for iced's renderer
+#   --filesystem=xdg-run/pipewire-0   direct access to the native PipeWire
+#                                     socket (not `:ro` — the app both
+#                                     captures/plays audio and, for the
+#                                     secondary-output feature, links a
+#                                     stream directly into another client's
+#                                     node, which needs write access)
+# No filesystem permission is needed for config/state persistence — it's
+# already scoped correctly to this app's own sandboxed
+# ~/.var/app/io.github.zerodaylabz.OxideSip/config via `dirs::config_dir()`.
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=xdg-run/pipewire-0
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+  prepend-ld-library-path: /usr/lib/sdk/llvm20/lib
+  env:
+    LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
+  # cargo needs to fetch crates.io dependencies during the build. Flathub's
+  # own build infrastructure requires vendoring dependencies instead (no
+  # network during build), but this manifest is for our own CI-built
+  # bundle attached to GitHub Releases, not a Flathub submission, so
+  # allowing network here is the simpler, equally valid choice.
+  build-args:
+    - --share=network
+
+modules:
+  - name: oxidesip
+    buildsystem: simple
+    build-commands:
+      - cargo build --release -p softphone-ui
+      - install -Dm755 target/release/oxidesip /app/bin/oxidesip
+      - install -Dm644 flatpak/io.github.zerodaylabz.OxideSip.desktop
+        /app/share/applications/io.github.zerodaylabz.OxideSip.desktop
+      - install -Dm644 flatpak/io.github.zerodaylabz.OxideSip.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.zerodaylabz.OxideSip.svg
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - .git

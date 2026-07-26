@@ -235,15 +235,49 @@ async fn handle_dialog_state(
                 .ok();
             dlg.ringing(None, None).ok();
         }
-        DialogState::Early(id, _resp) => {
+        DialogState::Early(id, resp) => {
             if find_outbound_line(tracker, &id).is_some() {
-                event_tx
-                    .send(CoreEvent::CallStateChanged {
-                        id: id.call_id.clone(),
-                        state: CallState::Ringing,
-                    })
-                    .await
-                    .ok();
+                match resp.status_code {
+                    StatusCode::Ringing => {
+                        event_tx
+                            .send(CoreEvent::CallStateChanged {
+                                id: id.call_id.clone(),
+                                state: CallState::Ringing,
+                            })
+                            .await
+                            .ok();
+                    }
+                    // 183 Session Progress with an SDP body: the far end
+                    // offered early media before the final 200 OK (e.g. an
+                    // in-band ringback/announcement) — parse it the same
+                    // way `Confirmed` below parses the real answer, so the
+                    // UI can open an RTP stream toward it right away. A
+                    // parse failure or missing connection address is a
+                    // silent no-op here (unlike `Confirmed`'s reject-the-
+                    // call handling) — this is only early media, not the
+                    // final answer, so there's no reason to give up on the
+                    // call over it.
+                    StatusCode::SessionProgress if !resp.body.is_empty() => {
+                        let sdp_str = String::from_utf8_lossy(&resp.body);
+                        if let Ok(remote_offer) = sdp::parse_offer(&sdp_str)
+                            && let Some(remote_addr) = remote_offer.remote_addr
+                        {
+                            let remote_info = RemoteMediaInfo {
+                                remote_addr,
+                                payload_type: remote_offer.payload_types.first().copied().unwrap_or(0),
+                                crypto_key: remote_offer.crypto_key,
+                            };
+                            event_tx
+                                .send(CoreEvent::CallStateChanged {
+                                    id: id.call_id.clone(),
+                                    state: CallState::EarlyMedia { remote: remote_info },
+                                })
+                                .await
+                                .ok();
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         DialogState::Confirmed(id, resp) => {

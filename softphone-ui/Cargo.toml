@@ -7,6 +7,14 @@ description.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+# The installed/distributed program is "OxideSip" (lowercase `oxidesip` for
+# the actual binary, matching standard Unix CLI naming); `softphone-ui`
+# stays the internal crate name, consistent with its `softphone-core`/
+# `softphone-media` workspace siblings.
+[[bin]]
+name = "oxidesip"
+path = "src/main.rs"
+
 [dependencies]
 softphone-core = { path = "../softphone-core" }
 softphone-media = { path = "../softphone-media" }
@@ -32,6 +40,7 @@ dirs = "6.0.0"
 # requirements (libpipewire, etc.) from whatever binary was actually built,
 # which is more accurate than a hand-maintained package-name list.
 [package.metadata.generate-rpm]
+name = "oxidesip"
 assets = [
-    { source = "target/release/softphone-ui", dest = "/usr/bin/softphone-ui", mode = "755" },
+    { source = "target/release/oxidesip", dest = "/usr/bin/oxidesip", mode = "755" },
 ]

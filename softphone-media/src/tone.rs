@@ -106,11 +106,16 @@ fn generate_dial_tone() -> Vec<i16> {
 const CALL_PROGRESS_FREQUENCIES: (f32, f32) = (480.0, 620.0);
 const CALL_PROGRESS_FADE_SAMPLES: usize = 60;
 
-fn generate_cadence_tone(on_ms: u32, off_ms: u32, cycles: usize) -> Vec<i16> {
-    let (f1, f2) = CALL_PROGRESS_FREQUENCIES;
+/// Shared cadence-tone renderer: `cycles` repeats of `freqs` for `on_ms`
+/// (faded in/out over `fade_samples`) followed by `off_ms` of silence.
+/// Generalized (rather than hardcoded to `CALL_PROGRESS_FREQUENCIES`) so
+/// ringback/incoming-ring — which need their own frequency pairs — can
+/// reuse it instead of duplicating this loop.
+fn generate_cadence_tone(freqs: (f32, f32), fade_samples: usize, on_ms: u32, off_ms: u32, cycles: usize) -> Vec<i16> {
+    let (f1, f2) = freqs;
     let mut samples = Vec::new();
     for _ in 0..cycles {
-        samples.extend(generate_dual_tone(f1, f2, on_ms, CALL_PROGRESS_FADE_SAMPLES));
+        samples.extend(generate_dual_tone(f1, f2, on_ms, fade_samples));
         samples.extend(std::iter::repeat_n(
             0i16,
             (SAMPLE_RATE as usize * off_ms as usize) / 1000,
@@ -127,7 +132,7 @@ fn generate_cadence_tone(on_ms: u32, off_ms: u32, cycles: usize) -> Vec<i16> {
 /// for this — the phone itself always plays this tone in response to the
 /// SIP status, which is exactly what this does.
 fn generate_busy_tone() -> Vec<i16> {
-    generate_cadence_tone(500, 500, 3)
+    generate_cadence_tone(CALL_PROGRESS_FREQUENCIES, CALL_PROGRESS_FADE_SAMPLES, 500, 500, 3)
 }
 
 /// Reorder ("fast busy") signal — the same two frequencies at double the
@@ -136,7 +141,43 @@ fn generate_busy_tone() -> Vec<i16> {
 /// dial tone playing and no digits dialed for too long — the same "please
 /// hang up and try again" cue a real phone gives you in both situations.
 fn generate_reorder_tone() -> Vec<i16> {
-    generate_cadence_tone(250, 250, 4)
+    generate_cadence_tone(CALL_PROGRESS_FREQUENCIES, CALL_PROGRESS_FADE_SAMPLES, 250, 250, 4)
+}
+
+/// Standard North American audible ringback (440Hz+480Hz, 2s on/4s off) —
+/// what the *caller* hears while an outbound call is ringing (180) or
+/// playing early media without its own in-band audio. Rendered as a single
+/// full cadence cycle; `DtmfTonePlayer` loops it (see `QueuedSound::Ringback`)
+/// since ring duration isn't known up front.
+const RINGBACK_FREQUENCIES: (f32, f32) = (440.0, 480.0);
+const RINGBACK_FADE_SAMPLES: usize = 200;
+const RINGBACK_ON_MS: u32 = 2000;
+const RINGBACK_OFF_MS: u32 = 4000;
+
+fn generate_ringback_cycle() -> Vec<i16> {
+    generate_cadence_tone(RINGBACK_FREQUENCIES, RINGBACK_FADE_SAMPLES, RINGBACK_ON_MS, RINGBACK_OFF_MS, 1)
+}
+
+/// Local incoming-call ringtone — what the *callee* (this app) plays while
+/// a line is `Incoming`. Deliberately a different frequency pair/cadence
+/// from ringback so the two are distinguishable by ear and, more
+/// importantly, so they can be started/stopped independently: an active
+/// call on one line and a fresh incoming call ringing on another are a
+/// legitimate simultaneous scenario, and sharing one tone/flag would let
+/// stopping one wrongly cut off the other.
+const INCOMING_RING_FREQUENCIES: (f32, f32) = (750.0, 800.0);
+const INCOMING_RING_FADE_SAMPLES: usize = 150;
+const INCOMING_RING_ON_MS: u32 = 1000;
+const INCOMING_RING_OFF_MS: u32 = 3000;
+
+fn generate_incoming_ring_cycle() -> Vec<i16> {
+    generate_cadence_tone(
+        INCOMING_RING_FREQUENCIES,
+        INCOMING_RING_FADE_SAMPLES,
+        INCOMING_RING_ON_MS,
+        INCOMING_RING_OFF_MS,
+        1,
+    )
 }
 
 // A short, soft two-note descending cue — played once whenever a call ends
@@ -236,15 +277,35 @@ enum QueuedSound {
     BusyTone,
     ReorderTone,
     Disconnect,
+    /// Ringback/incoming-ring both carry the epoch they were queued under
+    /// (see `SoundKind`'s doc comment) so the worker can tell, after a cycle
+    /// finishes playing, whether it should queue another cycle (still the
+    /// current epoch) or stop looping (a `stop_*`/`play_*` call already
+    /// moved on to a new epoch while this cycle was playing).
+    Ringback(u64),
+    IncomingRing(u64),
 }
 
-/// Whichever `pw-play` child is currently running, tagged with whether it's
-/// one of the "line status" tones (dial/busy/reorder) — lets
-/// `stop_line_tone` reach in and kill it specifically, without touching an
-/// in-flight DTMF digit or the disconnect cue, which are always short and
-/// meant to just finish playing on their own. `None` whenever nothing's
-/// currently playing.
-type CurrentChild = Option<(bool, tokio::process::Child)>;
+/// Tags whichever `pw-play` child is currently running. `LineTone`
+/// (dial/busy/reorder) lets `stop_line_tone` reach in and kill it
+/// specifically; `Ringback`/`IncomingRing` are similarly independently
+/// killable by their own `stop_*` methods — kept as *separate* kinds
+/// (rather than folded into `LineTone`) because an active call on one line
+/// and a fresh incoming call ringing on another are a legitimate
+/// simultaneous scenario, and a `stop_ringback()` must never be able to cut
+/// off an in-flight incoming ring (or vice versa). `Other` covers DTMF
+/// digits and the disconnect cue, which are always short and just meant to
+/// finish playing on their own — never targeted by any `stop_*` method.
+#[derive(Clone, Copy, PartialEq)]
+enum SoundKind {
+    LineTone,
+    Ringback,
+    IncomingRing,
+    Other,
+}
+
+/// `None` whenever nothing's currently playing.
+type CurrentChild = Option<(SoundKind, tokio::process::Child)>;
 
 pub struct DtmfTonePlayer {
     wav_paths: HashMap<char, PathBuf>,
@@ -261,6 +322,13 @@ pub struct DtmfTonePlayer {
     /// on each keystroke) for tones that always sound correct.
     queue_tx: tokio::sync::mpsc::UnboundedSender<QueuedSound>,
     current_child: Arc<Mutex<CurrentChild>>,
+    /// Bumped by every `play_ringback_tone()`/`stop_ringback()` call and
+    /// carried on each queued `QueuedSound::Ringback` cycle — see
+    /// `QueuedSound`'s doc comment for how this drives the looping/stop
+    /// logic without needing to distinguish "child was killed" from "child
+    /// exited on its own" (both look identical through `try_wait`).
+    ringback_epoch: Arc<Mutex<u64>>,
+    incoming_ring_epoch: Arc<Mutex<u64>>,
 }
 
 impl DtmfTonePlayer {
@@ -288,23 +356,38 @@ impl DtmfTonePlayer {
         write_wav(&reorder_tone_path, &generate_reorder_tone()).map_err(MediaError::Io)?;
         let disconnect_tone_path = dir.join("disconnect-tone.wav");
         write_wav(&disconnect_tone_path, &generate_disconnect_tone()).map_err(MediaError::Io)?;
+        let ringback_path = dir.join("ringback.wav");
+        write_wav(&ringback_path, &generate_ringback_cycle()).map_err(MediaError::Io)?;
+        let incoming_ring_path = dir.join("incoming-ring.wav");
+        write_wav(&incoming_ring_path, &generate_incoming_ring_cycle()).map_err(MediaError::Io)?;
 
         let (queue_tx, mut queue_rx) = tokio::sync::mpsc::unbounded_channel::<QueuedSound>();
         let worker_paths = wav_paths.clone();
         let current_child: Arc<Mutex<CurrentChild>> = Arc::new(Mutex::new(None));
         let worker_current_child = current_child.clone();
+        let ringback_epoch: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let incoming_ring_epoch: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let worker_ringback_epoch = ringback_epoch.clone();
+        let worker_incoming_ring_epoch = incoming_ring_epoch.clone();
+        let worker_requeue_tx = queue_tx.clone();
         tokio::spawn(async move {
             while let Some(sound) = queue_rx.recv().await {
-                let is_line_tone = matches!(
-                    sound,
-                    QueuedSound::DialTone | QueuedSound::BusyTone | QueuedSound::ReorderTone
-                );
+                let kind = match &sound {
+                    QueuedSound::DialTone | QueuedSound::BusyTone | QueuedSound::ReorderTone => {
+                        SoundKind::LineTone
+                    }
+                    QueuedSound::Ringback(_) => SoundKind::Ringback,
+                    QueuedSound::IncomingRing(_) => SoundKind::IncomingRing,
+                    QueuedSound::Digit(_) | QueuedSound::Disconnect => SoundKind::Other,
+                };
                 let path = match &sound {
                     QueuedSound::Digit(digit) => worker_paths.get(digit),
                     QueuedSound::DialTone => Some(&dial_tone_path),
                     QueuedSound::BusyTone => Some(&busy_tone_path),
                     QueuedSound::ReorderTone => Some(&reorder_tone_path),
                     QueuedSound::Disconnect => Some(&disconnect_tone_path),
+                    QueuedSound::Ringback(_) => Some(&ringback_path),
+                    QueuedSound::IncomingRing(_) => Some(&incoming_ring_path),
                 };
                 let Some(path) = path else {
                     continue;
@@ -325,7 +408,7 @@ impl DtmfTonePlayer {
                         continue;
                     }
                 };
-                *worker_current_child.lock().unwrap() = Some((is_line_tone, child));
+                *worker_current_child.lock().unwrap() = Some((kind, child));
                 // Polled rather than a single `child.wait().await` — that
                 // would need to hold the child (and thus the lock guarding
                 // it) for the whole playback, which would block
@@ -353,6 +436,22 @@ impl DtmfTonePlayer {
                     }
                     tokio::time::sleep(Duration::from_millis(15)).await;
                 }
+                // A ringback/incoming-ring cycle just ended, either because
+                // it finished playing on its own or because a `stop_*` call
+                // killed it — `try_wait` can't tell those apart, but the
+                // epoch can: if nothing has bumped it since this cycle was
+                // queued, keep looping by queuing another cycle under the
+                // same epoch; if it changed (a `stop_*`/fresh `play_*` call
+                // happened), this loop's job is done.
+                match sound {
+                    QueuedSound::Ringback(epoch) if *worker_ringback_epoch.lock().unwrap() == epoch => {
+                        let _ = worker_requeue_tx.send(QueuedSound::Ringback(epoch));
+                    }
+                    QueuedSound::IncomingRing(epoch) if *worker_incoming_ring_epoch.lock().unwrap() == epoch => {
+                        let _ = worker_requeue_tx.send(QueuedSound::IncomingRing(epoch));
+                    }
+                    _ => {}
+                }
             }
         });
 
@@ -360,6 +459,8 @@ impl DtmfTonePlayer {
             wav_paths,
             queue_tx,
             current_child,
+            ringback_epoch,
+            incoming_ring_epoch,
         })
     }
 
@@ -405,7 +506,7 @@ impl DtmfTonePlayer {
     /// else.
     pub fn stop_line_tone(&self) {
         let mut guard = self.current_child.lock().unwrap();
-        if let Some((true, child)) = guard.as_mut() {
+        if let Some((SoundKind::LineTone, child)) = guard.as_mut() {
             let _ = child.start_kill();
         }
     }
@@ -414,5 +515,59 @@ impl DtmfTonePlayer {
     /// doc comment for why it's deliberately soft rather than alarming.
     pub fn play_disconnect_tone(&self) {
         let _ = self.queue_tx.send(QueuedSound::Disconnect);
+    }
+
+    /// Starts (or restarts) looping outbound ringback — played while an
+    /// outbound call is ringing (180) or between ringing and real early
+    /// media landing. Loops indefinitely (re-queuing its own cadence cycle,
+    /// see the worker's epoch check) until `stop_ringback` is called.
+    pub fn play_ringback_tone(&self) {
+        let epoch = {
+            let mut epoch = self.ringback_epoch.lock().unwrap();
+            *epoch = epoch.wrapping_add(1);
+            *epoch
+        };
+        let _ = self.queue_tx.send(QueuedSound::Ringback(epoch));
+    }
+
+    /// Stops a looping ringback started by `play_ringback_tone`, if one is
+    /// running — bumps the epoch (so an in-flight cycle won't re-queue
+    /// itself) and kills the current child if it's actually the ringback
+    /// tone (never touches an unrelated in-flight sound).
+    pub fn stop_ringback(&self) {
+        {
+            let mut epoch = self.ringback_epoch.lock().unwrap();
+            *epoch = epoch.wrapping_add(1);
+        }
+        let mut guard = self.current_child.lock().unwrap();
+        if let Some((SoundKind::Ringback, child)) = guard.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+
+    /// Starts (or restarts) the looping incoming-call ringtone — played
+    /// while a line is `Incoming`, independent of any ringback tone playing
+    /// for a different, simultaneously-in-progress outbound call. See
+    /// `play_ringback_tone`'s doc comment for the looping mechanism.
+    pub fn play_incoming_ringtone(&self) {
+        let epoch = {
+            let mut epoch = self.incoming_ring_epoch.lock().unwrap();
+            *epoch = epoch.wrapping_add(1);
+            *epoch
+        };
+        let _ = self.queue_tx.send(QueuedSound::IncomingRing(epoch));
+    }
+
+    /// Stops a looping incoming ringtone started by `play_incoming_ringtone`,
+    /// if one is running. See `stop_ringback`'s doc comment.
+    pub fn stop_incoming_ringtone(&self) {
+        {
+            let mut epoch = self.incoming_ring_epoch.lock().unwrap();
+            *epoch = epoch.wrapping_add(1);
+        }
+        let mut guard = self.current_child.lock().unwrap();
+        if let Some((SoundKind::IncomingRing, child)) = guard.as_mut() {
+            let _ = child.start_kill();
+        }
     }
 }

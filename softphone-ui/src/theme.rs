@@ -54,6 +54,23 @@ pub fn card(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Small inline "chip" background — same surface/border tone as `card` but
+/// a touch less round and with no drop shadow, since this is meant for
+/// small inline footer badges (the call-status label, the registration
+/// LED) rather than an elevated panel.
+pub fn chip(_theme: &Theme) -> container::Style {
+    container::Style {
+        text_color: None,
+        background: Some(Background::Color(SURFACE)),
+        border: Border {
+            color: SURFACE_BORDER,
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Faint inset "track" container behind the Dialer/Contacts/History tab
 /// pills — gives them a modern segmented-control look (the active tab's
 /// filled pill standing out against a subtly recessed background) instead
