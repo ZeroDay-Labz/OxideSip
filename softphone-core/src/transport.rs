@@ -83,7 +83,7 @@ pub async fn build_transport_layer(
 
 pub fn build_endpoint(transport_layer: TransportLayer, cancel_token: CancellationToken) -> Endpoint {
     EndpointBuilder::new()
-        .with_user_agent("OxideSip/0.1.2")
+        .with_user_agent("OxideSip/0.1.6")
         .with_cancel_token(cancel_token)
         .with_transport_layer(transport_layer)
         .build()
