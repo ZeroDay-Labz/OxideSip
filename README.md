@@ -12,8 +12,11 @@ than a bare-bones reference client.
 
 - **Multiple SIP accounts, registered simultaneously** — each with its own set of 5 call lines,
   switchable from the main window without losing state on the others.
-- **Full call handling** — place/answer/reject/hang up, hold & resume, blind transfer, DTMF (SIP
-  INFO), mute, join two lines into a local 3-way conference, and a compact "mini" window mode.
+- **Full call handling** — place/answer/reject/hang up, hold & resume, blind transfer, mute, join
+  two lines into a local 3-way conference, and a compact "mini" window mode.
+- **DTMF over RFC 4733 (RTP telephone-event) by default**, automatically falling back to SIP INFO
+  for peers that don't negotiate it — override per-account to force one or the other (interop
+  troubleshooting) in Audio & Codecs settings.
 - **Do Not Disturb, Auto-Answer, and a deny list** — checked before an incoming call ever rings.
 - **Call recording** — WAV, both directions mixed into one file per call, saved to a folder you
   pick with a native file dialog.
@@ -27,6 +30,11 @@ than a bare-bones reference client.
   file picker.
 - **Dial-history dropdown**, redial, and per-line call history.
 - **SDES-SRTP** media encryption (opt-in) alongside plain RTP, and UDP/TCP/TLS SIP transports.
+- **A real icon-based UI** — every call-control, list, and settings action uses a bundled Bootstrap
+  Icons glyph (not a system font dependency, so it renders identically everywhere) instead of
+  small-caps text labels, plus a live-animated call glow via `iced`'s native animation support.
+  Caller name lookup shows a saved contact's name (not just their number) while dialing and once
+  connected.
 
 ## Requirements
 
@@ -60,20 +68,25 @@ The workspace has three crates:
 | Crate             | What it is                                                             |
 |--------------------|-------------------------------------------------------------------------|
 | `softphone-core`  | SIP signaling (via [`rsipstack`](https://crates.io/crates/rsipstack)), SDP negotiation, registration — no UI or audio code. |
-| `softphone-media` | PipeWire capture/playback, RTP send/recv, DTMF/dial tones, call recording, codec en/decoding. |
+| `softphone-media` | PipeWire capture/playback, RTP send/recv (incl. RFC 4733 DTMF events), dial tones, call recording, codec en/decoding. |
 | `softphone-ui`    | The [`iced`](https://github.com/iced-rs/iced) 0.14 desktop app tying both together. |
 
 ### Prebuilt releases
 
 Tagged pushes (`v*`, e.g. `v0.1.0`) trigger [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which builds a release binary and publishes two artifacts to the repo's
+which builds and publishes four artifacts to the repo's
 [Releases](https://github.com/ZeroDay-Labz/OxideSip/releases) page:
 
 - `softphone-ui-linux-x86_64.tar.gz` — a plain binary tarball. Your system needs PipeWire ≥ 0.3.44
   already installed (true by default on Fedora/KDE); nothing else is bundled.
-- an RPM, installable with `sudo dnf install ./softphone-ui-*.rpm` on Fedora and other RPM-based
+- an RPM, installable with `sudo dnf install ./oxidesip-*.rpm` on Fedora and other RPM-based
   distros — its runtime dependencies (PipeWire, etc.) are declared automatically from the binary's
   actual shared-library links, so `dnf` will pull in anything missing.
+- a `.deb`, installable with `sudo apt install ./oxidesip_*.deb` on Debian/Ubuntu and derivatives —
+  same auto-detected-dependency approach as the RPM.
+- a Flatpak bundle (`oxidesip-x86_64.flatpak`), installable with
+  `flatpak install ./oxidesip-x86_64.flatpak` — sandboxed, distro-independent, built from the
+  manifest in [`flatpak/`](flatpak/).
 
 To cut a release yourself: bump `version` in the root `Cargo.toml`, then
 
@@ -136,7 +149,6 @@ virtual sink of your own instead (also selectable from the same dropdown).
   `rsipstack`'s dialog-reject API doesn't currently expose a way to send a proper SIP 3xx redirect.
   This is disclosed, not silently faked.
 - **No echo cancellation** yet — a real AEC integration is planned but not implemented.
-- **DTMF** is sent via SIP INFO only; RFC 2833/in-band tone negotiation isn't implemented yet.
 - **No STUN/ICE** — works well on a LAN or over a VPN to the PBX; NAT traversal beyond basic
   registration isn't handled yet.
 - Some PipeWire configurations exhibit high playback-callback latency for client streams; the app

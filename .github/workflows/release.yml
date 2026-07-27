@@ -13,8 +13,11 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Build Linux binary and Fedora RPM
+  # Tarball + RPM + deb, all built from the same `cargo build --release`
+  # output, so they share one job/one build rather than three separate
+  # checkouts+builds.
+  linux:
+    name: Build Linux binary, RPM, and deb
     runs-on: ubuntu-latest
 
     steps:
@@ -25,6 +28,12 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+
+      # Caches `~/.cargo` + `target/` keyed on the lockfile, so a normal
+      # release build (nothing changed but the version bump) reuses prior
+      # compilation instead of a fully cold `cargo build` every tag push.
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
 
       # softphone-media links against PipeWire and generates its FFI
       # bindings at build time via bindgen, so both the library headers and
@@ -38,7 +47,7 @@ jobs:
         run: cargo build --release -p softphone-ui
 
       # cargo-generate-rpm's README recommends stripping debug symbols
-      # before packaging; do it once so both artifacts below ship a
+      # before packaging; do it once so every artifact below ships a
       # stripped binary.
       - name: Strip debug symbols
         run: strip -s target/release/oxidesip
@@ -46,11 +55,16 @@ jobs:
       - name: Package general Linux binary (.tar.gz)
         run: tar -czvf softphone-ui-linux-x86_64.tar.gz -C target/release oxidesip
 
-      - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm
+      - name: Install cargo-generate-rpm and cargo-deb
+        run: cargo install cargo-generate-rpm cargo-deb
 
       - name: Generate Fedora RPM
         run: cargo generate-rpm -p softphone-ui
+
+      # `--no-build`: reuse the release binary already built above instead
+      # of cargo-deb triggering its own separate `cargo build --release`.
+      - name: Generate Debian/Ubuntu deb
+        run: cargo deb -p softphone-ui --no-build
 
       - name: Upload to GitHub Releases
         uses: softprops/action-gh-release@v3
@@ -59,3 +73,33 @@ jobs:
           files: |
             softphone-ui-linux-x86_64.tar.gz
             target/generate-rpm/*.rpm
+            target/debian/*.deb
+
+  # Builds independently inside its own Flatpak sandbox (via the manifest's
+  # own `rust-stable`/`llvm20` SDK extensions), so this runs as a separate
+  # parallel job rather than appended to `linux` above — it doesn't share
+  # that job's `cargo build` output and pulls its own (large) runtime/SDK
+  # images, making it the slowest job in this workflow.
+  flatpak:
+    name: Build Flatpak bundle
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: oxidesip-x86_64.flatpak
+          manifest-path: flatpak/io.github.zerodaylabz.OxideSip.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: oxidesip-x86_64.flatpak
