@@ -4,6 +4,7 @@ mod audio_devices;
 mod bridge;
 mod contacts;
 mod history;
+mod icon;
 mod paths;
 mod theme;
 mod view;

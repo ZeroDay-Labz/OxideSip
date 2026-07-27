@@ -2,9 +2,9 @@ use crate::app_settings::{self, AppSettings};
 use crate::audio_devices::{self, AudioDeviceConfig};
 use crate::contacts::{self, Contact};
 use crate::history;
-use crate::{bridge, view};
+use crate::{bridge, icon, view};
 use iced::{window, Element, Subscription, Task};
-use softphone_core::config::{PreferredCodec, SipAccountConfig, SipTransport, PREFERRED_CODECS};
+use softphone_core::config::{DtmfMode, PreferredCodec, SipAccountConfig, SipTransport, PREFERRED_CODECS};
 use softphone_core::events::{CallId, CallState, CoreCommand, CoreEvent, RemoteMediaInfo};
 use softphone_media::{AudioDevice, DtmfTonePlayer, MediaSession, ReservedSocket};
 use std::collections::{HashMap, VecDeque};
@@ -95,7 +95,20 @@ pub enum CallUiState {
         /// comma in the original dial string — drained one step at a time
         /// by `Message::PostDialAdvance` once the call is answered.
         post_dial: VecDeque<char>,
+        /// Drives the avatar's live-glow cross-fade (`theme::avatar_state`)
+        /// as `media.is_some() && !on_hold` changes over the call's
+        /// lifetime, instead of the glow snapping on/off. Updated wherever
+        /// either of those two inputs changes; read (via `.interpolate`) at
+        /// render time in `view.rs::dialer_tab`.
+        avatar_glow: iced::Animation<bool>,
     },
+}
+
+/// `live` here means "the avatar's glow should be showing" — audio is
+/// actually flowing, not just that a `MediaSession` exists (e.g. it stays
+/// `false` while on hold even though `media` is still `Some`).
+fn avatar_live(media_ready: bool, on_hold: bool) -> bool {
+    media_ready && !on_hold
 }
 
 impl CallUiState {
@@ -166,6 +179,10 @@ pub struct AudioSettingsForm {
     /// (see `from_config`), never partial, so the list editor can freely
     /// reorder without an "empty list" edge case to guard against.
     pub codecs: Vec<PreferredCodec>,
+    /// Which DTMF transport this account uses during calls. See `DtmfMode`
+    /// — `Auto` (the default) negotiates RFC 4733 and falls back to SIP
+    /// INFO; the other two are an interop-troubleshooting override.
+    pub dtmf_mode: DtmfMode,
 }
 
 impl AudioSettingsForm {
@@ -185,6 +202,7 @@ impl AudioSettingsForm {
             output_device: audio.output_device.clone(),
             srtp: config.srtp,
             codecs,
+            dtmf_mode: config.dtmf_mode,
         }
     }
 }
@@ -359,6 +377,24 @@ impl AccountSession {
     fn send_command(&self, command: CoreCommand) {
         if let Some(tx) = &self.command_tx {
             let _ = tx.try_send(command);
+        }
+    }
+
+    /// Sends one DTMF digit for line `idx`'s active call, choosing between
+    /// RFC 4733 (RTP telephone-event) and SIP INFO per `self.config.dtmf_mode`:
+    /// `Auto` tries RFC 4733 first and falls back to INFO if this call never
+    /// negotiated it; `Rfc4733Only` never falls back (fails silently rather
+    /// than degrading, matching the mode's name — no interop workaround is
+    /// attempted); `InfoOnly` always uses INFO, reproducing this app's exact
+    /// pre-RFC4733 behavior. A no-op if line `idx` isn't `Active`.
+    fn send_dtmf_digit(&self, idx: usize, digit: char) {
+        let CallUiState::Active { id, media, .. } = &self.lines[idx] else {
+            return;
+        };
+        let sent_via_rtp = self.config.dtmf_mode != DtmfMode::InfoOnly
+            && media.as_ref().is_some_and(|m| m.send_dtmf(digit, DTMF_EVENT_DURATION_MS));
+        if !sent_via_rtp && self.config.dtmf_mode != DtmfMode::Rfc4733Only {
+            self.send_command(CoreCommand::SendDtmf { id: id.clone(), digit });
         }
     }
 
@@ -585,6 +621,7 @@ pub enum Message {
     /// Moves the codec at this index one slot earlier/later in priority
     /// (`true` = move up/earlier). No-op at the relevant end of the list.
     AudioSettingsCodecMoved(usize, bool),
+    AudioSettingsDtmfModeChanged(DtmfMode),
     AudioSettingsSavePressed,
     AudioSettingsCancelPressed,
     DevicesLoaded(Vec<AudioDevice>, Vec<AudioDevice>),
@@ -650,6 +687,7 @@ pub enum Message {
     BrowseContactsImportPressed,
     BrowseContactsExportPressed,
     TonePlayerReady(Result<Arc<DtmfTonePlayer>, String>),
+    IconFontLoaded(Result<(), iced::font::Error>),
 }
 
 /// Legacy single-account migration lives in `main.rs` (it needs to run once
@@ -677,6 +715,10 @@ const SETTINGS_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(360.0, 440.0);
 /// Tuned to feel like a real-time meter without redrawing so often it wastes
 /// cycles — noticeably snappier than a 200ms poll (which reads as laggy).
 const TICK_INTERVAL: Duration = Duration::from_millis(80);
+/// Matches the `Duration=250` sent in the SIP INFO body (`dialog.rs`), so a
+/// digit sounds/feels the same length regardless of which DTMF transport
+/// actually carried it.
+const DTMF_EVENT_DURATION_MS: u32 = 250;
 
 impl App {
     /// Opens the main window and constructs the initial `App` state — the
@@ -767,7 +809,9 @@ impl App {
             Message::TonePlayerReady(result)
         });
 
-        let mut startup = vec![open_task.discard(), tone_task];
+        let icon_font_task = iced::font::load(icon::FONT_BYTES).map(Message::IconFontLoaded);
+
+        let mut startup = vec![open_task.discard(), tone_task, icon_font_task];
         if needs_setup {
             startup.push(Task::done(Message::OpenSipSettings));
         }
@@ -1073,6 +1117,9 @@ impl App {
                         }
                     }
                     *media = session;
+                    if let CallUiState::Active { media, on_hold, avatar_glow, .. } = &mut acc.lines[idx] {
+                        avatar_glow.go_mut(avatar_live(media.is_some(), *on_hold), Instant::now());
+                    }
                 }
                 // else: call already ended before the pipeline finished
                 // starting; `session` is dropped here, tearing itself down.
@@ -1265,6 +1312,10 @@ impl App {
                 }
                 Task::none()
             }
+            Message::AudioSettingsDtmfModeChanged(mode) => {
+                self.audio_settings_form.dtmf_mode = mode;
+                Task::none()
+            }
             Message::AudioSettingsSavePressed => {
                 self.handle_audio_settings_save();
                 if let Some(id) = self.audio_settings_window.take() {
@@ -1444,6 +1495,7 @@ impl App {
                         media: Some(session),
                         input_level,
                         output_level,
+                        dtmf_feedback,
                         ..
                     } = &mut acc.lines[idx]
                     {
@@ -1457,6 +1509,10 @@ impl App {
                         const SMOOTHING: f32 = 0.55;
                         *input_level += (session.input_level() - *input_level) * SMOOTHING;
                         *output_level += (session.output_level() - *output_level) * SMOOTHING;
+                        // Digits the peer sent us via RFC 4733 — shares the
+                        // same on-screen feedback trail as digits we sent,
+                        // same as a real desk phone's display.
+                        dtmf_feedback.extend(session.drain_received_dtmf());
                     }
                 }
                 Task::none()
@@ -1632,10 +1688,7 @@ impl App {
                 if let Some(player) = &self.tone_player {
                     player.play(next);
                 }
-                acc.send_command(CoreCommand::SendDtmf {
-                    id: id.clone(),
-                    digit: next,
-                });
+                acc.send_dtmf_digit(idx, next);
                 if has_more {
                     let call_id = id.clone();
                     Task::future(async move {
@@ -1839,6 +1892,13 @@ impl App {
                 tracing::warn!(%e, "failed to start DTMF tone player");
                 Task::none()
             }
+            Message::IconFontLoaded(Err(e)) => {
+                // Non-fatal: icon glyphs render as tofu boxes instead of the
+                // intended symbol, everything else keeps working.
+                tracing::warn!(?e, "failed to load bundled icon font");
+                Task::none()
+            }
+            Message::IconFontLoaded(Ok(())) => Task::none(),
         }
     }
 
@@ -2129,9 +2189,11 @@ impl App {
     fn handle_audio_settings_save(&mut self) {
         let srtp = self.audio_settings_form.srtp;
         let codecs = self.audio_settings_form.codecs.clone();
+        let dtmf_mode = self.audio_settings_form.dtmf_mode;
         if let Some(acc) = self.selected_mut() {
             acc.config.srtp = srtp;
             acc.config.preferred_codecs = codecs;
+            acc.config.dtmf_mode = dtmf_mode;
             self.persist_accounts();
         }
 
@@ -2199,6 +2261,7 @@ impl App {
                         reserved,
                         remote.remote_addr,
                         remote.payload_type,
+                        remote.telephone_event_pt,
                         capture_target,
                         playback_target,
                         label,
@@ -2224,6 +2287,7 @@ impl App {
                     output_volume,
                     muted,
                     media,
+                    avatar_glow,
                     ..
                 } = &mut acc.lines[idx]
                 {
@@ -2232,6 +2296,7 @@ impl App {
                     // instead of rebuilding the whole call state.
                     *on_hold = false;
                     *output_volume = *pre_hold_output_volume;
+                    avatar_glow.go_mut(avatar_live(media.is_some(), false), Instant::now());
                     if let Some(session) = media {
                         session.set_mic_muted(*muted);
                         session.set_output_volume(*output_volume);
@@ -2262,6 +2327,8 @@ impl App {
                         // the only path that avoids a pointless rebuild of a
                         // session that may already be carrying real audio.
                         let post_dial: VecDeque<char> = acc.pending_post_dials[idx].drain(..).collect();
+                        let avatar_glow =
+                            iced::Animation::new(avatar_live(media.is_some(), false)).quick();
                         acc.lines[idx] = CallUiState::Active {
                             id: id.clone(),
                             number,
@@ -2278,6 +2345,7 @@ impl App {
                             pre_hold_output_volume: 1.0,
                             transfer_input: None,
                             post_dial,
+                            avatar_glow,
                         };
                         return Task::none();
                     }
@@ -2333,6 +2401,7 @@ impl App {
                     pre_hold_output_volume: 1.0,
                     transfer_input: None,
                     post_dial,
+                    avatar_glow: iced::Animation::new(false).quick(),
                 };
                 let capture_target = self.audio_devices.input_device.clone();
                 let playback_target = self.audio_devices.output_device.clone();
@@ -2343,6 +2412,7 @@ impl App {
                         reserved,
                         remote.remote_addr,
                         remote.payload_type,
+                        remote.telephone_event_pt,
                         capture_target,
                         playback_target,
                         label,
@@ -2374,11 +2444,13 @@ impl App {
                         pre_hold_output_volume,
                         output_volume,
                         media,
+                        avatar_glow,
                         ..
                     } = &mut acc.lines[idx]
                 {
                     *on_hold = true;
                     *pre_hold_output_volume = *output_volume;
+                    avatar_glow.go_mut(false, Instant::now());
                     if let Some(session) = media {
                         session.set_mic_muted(true);
                         session.set_output_volume(0.0);
@@ -2543,10 +2615,9 @@ impl App {
                 self.dial_input.push(digit);
                 Task::none()
             }
-            CallUiState::Active { id, dtmf_feedback, .. } => {
+            CallUiState::Active { dtmf_feedback, .. } => {
                 dtmf_feedback.push(digit);
-                let id = id.clone();
-                acc.send_command(CoreCommand::SendDtmf { id, digit });
+                acc.send_dtmf_digit(idx, digit);
                 Task::none()
             }
             _ => Task::none(),

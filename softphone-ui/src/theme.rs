@@ -20,6 +20,34 @@ pub fn theme() -> Theme {
     Theme::custom("OxideSip".to_string(), oxide_palette())
 }
 
+/// A shared spacing scale, so `.spacing()`/`.padding()` calls across
+/// `view.rs` pick from one small vocabulary instead of arbitrary per-call-site
+/// pixel values. Existing screens still use hand-picked literals in most
+/// places (all of them run through `scaled()` for responsive sizing anyway,
+/// so a token here is just `scaled(space::MD, scale)` at the call site) —
+/// this scale is meant to be adopted incrementally, screen by screen, not as
+/// a single mechanical find-replace across the whole file.
+#[allow(dead_code)] // adopted incrementally screen-by-screen, see module doc above
+pub mod space {
+    pub const XS: f32 = 4.0;
+    pub const SM: f32 = 8.0;
+    pub const MD: f32 = 12.0;
+    pub const LG: f32 = 16.0;
+    pub const XL: f32 = 24.0;
+    pub const XXL: f32 = 32.0;
+}
+
+/// A shared type scale, same intent as `space` above — covers the ~6-28px
+/// range of `.size()` calls already in use across `view.rs`.
+#[allow(dead_code)] // adopted incrementally screen-by-screen, see module doc above
+pub mod text_size {
+    pub const CAPTION: f32 = 11.0;
+    pub const BODY: f32 = 13.0;
+    pub const SUBHEAD: f32 = 15.0;
+    pub const TITLE: f32 = 20.0;
+    pub const DISPLAY: f32 = 28.0;
+}
+
 /// Slightly lighter than the app background, used for card-like panels
 /// (rows, footers, forms) so they read as distinct surfaces.
 const SURFACE: Color = color!(0x1c1f26);
@@ -150,15 +178,19 @@ pub fn avatar(fill: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// Same as `avatar`, plus (when `live`) a soft colored glow — used for the
-/// caller/callee avatar on the incoming-call and in-call screens while
-/// there's actually live audio (ringing, or connected and not on hold), so
-/// the one moment that matters most in the whole app reads as more alive
-/// than a flat circle. A single function (not two) so both branches share
-/// one concrete return type — `if`/`else` can't pick between two `impl
-/// Trait` functions even when their signatures match, since each one is
-/// still a distinct anonymous type.
-pub fn avatar_state(fill: Color, live: bool) -> impl Fn(&Theme) -> container::Style {
+/// Same as `avatar`, plus a soft colored glow scaled by `live_amount`
+/// (0.0-1.0) — used for the caller/callee avatar on the incoming-call and
+/// in-call screens while there's actually live audio (ringing, or connected
+/// and not on hold), so the one moment that matters most in the whole app
+/// reads as more alive than a flat circle. Takes a continuous amount rather
+/// than a bool so a caller can drive it from an `iced::Animation<bool>`
+/// (see `CallUiState::Active::avatar_glow`) and get a real cross-fade
+/// instead of the glow snapping on/off. A single function (not two) so
+/// every call site shares one concrete return type — `if`/`else` can't pick
+/// between two `impl Trait` functions even when their signatures match,
+/// since each one is still a distinct anonymous type.
+pub fn avatar_state(fill: Color, live_amount: f32) -> impl Fn(&Theme) -> container::Style {
+    let live_amount = live_amount.clamp(0.0, 1.0);
     move |_theme| container::Style {
         text_color: Some(Color::WHITE),
         background: Some(Background::Color(fill)),
@@ -167,14 +199,10 @@ pub fn avatar_state(fill: Color, live: bool) -> impl Fn(&Theme) -> container::St
             width: 0.0,
             radius: 999.0.into(),
         },
-        shadow: if live {
-            Shadow {
-                color: fill.scale_alpha(0.55),
-                offset: iced::Vector::new(0.0, 0.0),
-                blur_radius: 22.0,
-            }
-        } else {
-            Shadow::default()
+        shadow: Shadow {
+            color: fill.scale_alpha(0.55 * live_amount),
+            offset: iced::Vector::new(0.0, 0.0),
+            blur_radius: 22.0 * live_amount,
         },
         ..container::Style::default()
     }

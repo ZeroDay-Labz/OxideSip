@@ -26,6 +26,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.9"
 iced = { version = "0.14", features = ["tokio"] }
+iced_fonts = { version = "0.3", features = ["bootstrap"] }
 rfd = "0.17.2"
 dirs = "6.0.0"
 
@@ -53,4 +54,25 @@ assets = [
     { source = "target/release/oxidesip", dest = "/usr/bin/oxidesip", mode = "755" },
     { source = "flatpak/io.github.zerodaylabz.OxideSip.desktop", dest = "/usr/share/applications/io.github.zerodaylabz.OxideSip.desktop", mode = "644" },
     { source = "flatpak/io.github.zerodaylabz.OxideSip.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
+]
+
+# Consumed by `cargo deb` (see .github/workflows/release.yml) to build a
+# Debian/Ubuntu-installable .deb from the release binary — same asset list
+# and same "let the tool ldd-discover real shared-library deps instead of
+# hand-maintaining a package list" philosophy as `generate-rpm` above, just
+# in cargo-deb's own `[source, dest, mode]` triple format instead of a
+# dotted table, and with the opposite path-resolution rule: unlike
+# `generate-rpm` above, cargo-deb resolves non-`target/`-prefixed `source`
+# paths relative to *this crate's own directory* regardless of CWD (verified
+# by running `cargo deb -p softphone-ui --no-build` from the repo root — the
+# `target/release/...` asset resolved fine via cargo's own target-dir
+# metadata, but the plain repo-relative `flatpak/...` paths did not, and
+# needed `../` to reach the repo-root `flatpak/` directory from here).
+[package.metadata.deb]
+name = "oxidesip"
+copyright = "2026, ZeroDay-Labz"
+assets = [
+    ["target/release/oxidesip", "usr/bin/", "755"],
+    ["../flatpak/io.github.zerodaylabz.OxideSip.desktop", "usr/share/applications/", "644"],
+    ["../flatpak/io.github.zerodaylabz.OxideSip.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
 ]
