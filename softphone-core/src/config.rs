@@ -74,6 +74,44 @@ impl std::fmt::Display for PreferredCodec {
 
 pub const PREFERRED_CODECS: [PreferredCodec; 2] = [PreferredCodec::Ulaw, PreferredCodec::Alaw];
 
+/// Which DTMF transport to use during a call. `Auto` negotiates RFC 4733
+/// (RTP `telephone-event`) and falls back to SIP INFO when the peer doesn't
+/// support it — the mainstream default in softphones like Linphone/Zoiper.
+/// The other two are an interop-troubleshooting escape hatch: `Rfc4733Only`
+/// never falls back (fails visibly instead of silently degrading), and
+/// `InfoOnly` reproduces this app's exact pre-RFC4733 behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DtmfMode {
+    #[default]
+    Auto,
+    Rfc4733Only,
+    InfoOnly,
+}
+
+impl DtmfMode {
+    fn parse_env(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "rfc4733only" | "rfc4733" => Some(Self::Rfc4733Only),
+            "infoonly" | "info" => Some(Self::InfoOnly),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DtmfMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DtmfMode::Auto => "Auto (RFC 4733, falls back to SIP INFO)",
+            DtmfMode::Rfc4733Only => "RFC 4733 only",
+            DtmfMode::InfoOnly => "SIP INFO only",
+        })
+    }
+}
+
+pub const DTMF_MODES: [DtmfMode; 3] = [DtmfMode::Auto, DtmfMode::Rfc4733Only, DtmfMode::InfoOnly];
+
 #[derive(Debug, Clone, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SipAccountConfig {
@@ -108,6 +146,9 @@ pub struct SipAccountConfig {
     /// ceremony here — the UI's codec list editor just always keeps at
     /// least one entry.
     pub preferred_codecs: Vec<PreferredCodec>,
+    /// Which DTMF transport to use during calls on this account. See
+    /// `DtmfMode` for the tradeoffs of each option.
+    pub dtmf_mode: DtmfMode,
     /// Bumped on every SIP Settings Save (see `app.rs::handle_sip_settings_save`),
     /// even when nothing else changed. Never persisted — its only purpose is
     /// to change this struct's `Hash` so `bridge::subscription`'s
@@ -138,6 +179,7 @@ impl Default for SipAccountConfig {
             client_cert_path: None,
             client_key_path: None,
             preferred_codecs: vec![PreferredCodec::Ulaw, PreferredCodec::Alaw],
+            dtmf_mode: DtmfMode::default(),
             reg_epoch: 0,
         }
     }
@@ -158,6 +200,7 @@ struct RawConfig {
     client_cert_path: Option<PathBuf>,
     client_key_path: Option<PathBuf>,
     preferred_codecs: Option<Vec<PreferredCodec>>,
+    dtmf_mode: Option<DtmfMode>,
 }
 
 impl RawConfig {
@@ -212,6 +255,11 @@ impl RawConfig {
                 self.preferred_codecs = Some(codecs);
             }
         }
+        if let Ok(v) = std::env::var("OXIDESIP_DTMF_MODE")
+            && let Some(mode) = DtmfMode::parse_env(&v)
+        {
+            self.dtmf_mode = Some(mode);
+        }
     }
 
     fn into_config(self) -> Result<SipAccountConfig> {
@@ -250,6 +298,7 @@ impl RawConfig {
                 .preferred_codecs
                 .filter(|c| !c.is_empty())
                 .unwrap_or_else(|| vec![PreferredCodec::Ulaw, PreferredCodec::Alaw]),
+            dtmf_mode: self.dtmf_mode.unwrap_or_default(),
             reg_epoch: 0,
         })
     }

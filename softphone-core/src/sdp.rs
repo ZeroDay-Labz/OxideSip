@@ -8,6 +8,12 @@ use sdp_rs::{MediaDescription, SessionDescription, Time};
 use std::net::{IpAddr, SocketAddr};
 use vec1::vec1;
 
+/// RFC 4733 §2.2 dynamic payload type for RTP `telephone-event`. Fixed
+/// rather than negotiated from the dynamic range — 101 is the de facto
+/// standard virtually every SIP stack/PBX uses, and this app doesn't use any
+/// other dynamic payload type today, so collision risk is negligible.
+pub const TELEPHONE_EVENT_PT: u8 = 101;
+
 /// Negotiated audio media parameters. `port` is a placeholder until
 /// softphone-media reserves a real local port (see `dialog.rs`'s deferred
 /// answer-SDP construction); no RTP/SRTP socket is opened by this crate.
@@ -20,7 +26,12 @@ pub struct MediaOffer {
     /// remote's — always settles on exactly one, so this ends up a
     /// single-element list once negotiation is done. See
     /// `select_payload_type` for picking one from a remote's offered list.
+    /// Never includes `telephone_event_pt` — that's tracked separately so it
+    /// can't accidentally be selected as an audio codec.
     pub payload_types: Vec<u8>,
+    /// The RFC 4733 `telephone-event` payload type, if this offer/answer
+    /// advertises RTP-based DTMF alongside the audio codec(s) above.
+    pub telephone_event_pt: Option<u8>,
     /// base64-encoded 30-byte AES_CM_128_HMAC_SHA1_80 master key + salt.
     /// `None` when negotiating plain RTP (no SDES-SRTP, RFC 4568).
     pub crypto_key: Option<String>,
@@ -33,7 +44,13 @@ pub struct MediaOffer {
     pub hold: bool,
 }
 
-pub fn generate_offer(port: u16, srtp: bool, hold: bool, payload_types: &[u8]) -> MediaOffer {
+pub fn generate_offer(
+    port: u16,
+    srtp: bool,
+    hold: bool,
+    payload_types: &[u8],
+    telephone_event: bool,
+) -> MediaOffer {
     let crypto_key = srtp.then(|| {
         let mut key_and_salt = [0u8; 30];
         rand::fill(&mut key_and_salt);
@@ -42,6 +59,7 @@ pub fn generate_offer(port: u16, srtp: bool, hold: bool, payload_types: &[u8]) -
     MediaOffer {
         port,
         payload_types: payload_types.to_vec(),
+        telephone_event_pt: telephone_event.then_some(TELEPHONE_EVENT_PT),
         crypto_key,
         remote_addr: None,
         hold,
@@ -102,6 +120,16 @@ pub fn build_sdp(local_addr: IpAddr, offer: &MediaOffer) -> SessionDescription {
             })
         })
         .collect();
+    if let Some(pt) = offer.telephone_event_pt {
+        attributes.push(Attribute::Rtpmap(Rtpmap {
+            payload_type: pt as u32,
+            encoding_name: "telephone-event".into(),
+            clock_rate: 8000,
+            encoding_params: None,
+        }));
+        // Digits 0-15: 0-9, *, #, and the A-D "letter" events (RFC 4733 §3.2).
+        attributes.push(Attribute::Other("fmtp".into(), Some(format!("{pt} 0-15"))));
+    }
     if let Some(crypto_key) = &offer.crypto_key {
         attributes.push(Attribute::Other(
             "crypto".into(),
@@ -149,6 +177,7 @@ pub fn build_sdp(local_addr: IpAddr, offer: &MediaOffer) -> SessionDescription {
                 fmt: offer
                     .payload_types
                     .iter()
+                    .chain(offer.telephone_event_pt.iter())
                     .map(|pt| pt.to_string())
                     .collect::<Vec<_>>()
                     .join(" "),
@@ -175,14 +204,26 @@ pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
         .find(|m| m.media.media == MediaType::Audio)
         .ok_or_else(|| CoreError::Sdp("no audio media line".into()))?;
 
+    // The peer's `a=rtpmap` for `telephone-event`, if any — pulled out
+    // before the audio-codec list below so RFC 4733 DTMF is never mistaken
+    // for (and never accidentally decoded as) an audio codec.
+    let telephone_event_pt = media.attributes.iter().find_map(|attr| match attr {
+        Attribute::Rtpmap(r) if r.encoding_name.eq_ignore_ascii_case("telephone-event") => {
+            Some(r.payload_type as u8)
+        }
+        _ => None,
+    });
+
     // Every payload type the peer listed, in the order *they* prioritized
     // them — `select_payload_type` is what reconciles this against our own
-    // preference order when we're the one answering.
+    // preference order when we're the one answering. Excludes
+    // `telephone_event_pt`, which isn't an audio codec candidate.
     let payload_types: Vec<u8> = media
         .media
         .fmt
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
+        .filter(|pt| Some(*pt) != telephone_event_pt)
         .collect();
     if payload_types.is_empty() {
         return Err(CoreError::Sdp("empty or invalid fmt list".into()));
@@ -207,8 +248,70 @@ pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
     Ok(MediaOffer {
         port: media.media.port,
         payload_types,
+        telephone_event_pt,
         crypto_key,
         remote_addr,
         hold: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn build_and_parse_round_trip_without_telephone_event() {
+        let offer = generate_offer(10000, false, false, &[0, 8], false);
+        let sdp = build_sdp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), &offer);
+        let parsed = parse_offer(&sdp.to_string()).unwrap();
+        assert_eq!(parsed.payload_types, vec![0, 8]);
+        assert_eq!(parsed.telephone_event_pt, None);
+    }
+
+    #[test]
+    fn build_and_parse_round_trip_with_telephone_event() {
+        let offer = generate_offer(10000, false, false, &[0, 8], true);
+        assert_eq!(offer.telephone_event_pt, Some(TELEPHONE_EVENT_PT));
+
+        let sdp = build_sdp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), &offer);
+        let sdp_text = sdp.to_string();
+        assert!(sdp_text.contains("a=rtpmap:101 telephone-event/8000"));
+        assert!(sdp_text.contains("a=fmtp:101 0-15"));
+
+        let parsed = parse_offer(&sdp_text).unwrap();
+        assert_eq!(parsed.payload_types, vec![0, 8]);
+        assert_eq!(parsed.telephone_event_pt, Some(TELEPHONE_EVENT_PT));
+    }
+
+    #[test]
+    fn parse_offer_handles_telephone_event_listed_first() {
+        let sdp_text = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=OxideSip\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 101 0 8\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=fmtp:101 0-15\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:8 PCMA/8000\r\n";
+        let parsed = parse_offer(sdp_text).unwrap();
+        assert_eq!(parsed.payload_types, vec![0, 8]);
+        assert_eq!(parsed.telephone_event_pt, Some(101));
+    }
+
+    #[test]
+    fn parse_offer_with_only_telephone_event_errors_as_empty_codec_list() {
+        let sdp_text = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=OxideSip\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 101\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=fmtp:101 0-15\r\n";
+        let err = parse_offer(sdp_text).unwrap_err();
+        assert!(matches!(err, CoreError::Sdp(_)));
+    }
 }

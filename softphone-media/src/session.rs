@@ -4,12 +4,13 @@ use crate::pipewire_io::{self, PipewireShared, PwThreadHandle};
 use crate::rtp::RtpHeader;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
 // A few hundred ms is plenty for the bridge relay — it only needs to smooth
@@ -37,6 +38,13 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 // out-of-order arrival — keeping it modest bounds the worst-case latency a
 // real gap can add.
 const REORDER_WINDOW: usize = 5;
+
+// RFC 4733 §2.5.1.3: send the "end" packet multiple times in case one is
+// lost — 3 is the commonly-used redundancy count (matches most SIP stacks).
+const DTMF_END_PACKET_REPEATS: u8 = 3;
+// RFC 4733 §2.3: "volume" is attenuation in dB below full scale, 0 (loudest)
+// to 63 (quietest). 10 is a typical value used by other softphones.
+const DTMF_VOLUME: u8 = 10;
 
 /// A bound-but-unused UDP socket, reserved synchronously (no PipeWire
 /// involved) so its port is known before the SDP answer/offer is built.
@@ -88,6 +96,21 @@ pub struct MediaSession {
     /// The playback-only PipeWire stream feeding from `secondary_relay`, if
     /// a secondary output target is currently configured.
     secondary_pw: Mutex<Option<PwThreadHandle>>,
+    /// The negotiated RFC 4733 `telephone-event` payload type, if any.
+    /// `None` means this call never negotiated RTP-based DTMF, so
+    /// `send_dtmf` always returns `false` (caller falls back to SIP INFO).
+    telephone_event_pt: Option<u8>,
+    /// Queues a digit for `send_loop` to send as an RFC 4733 event train.
+    dtmf_send_tx: mpsc::UnboundedSender<DtmfSend>,
+    /// Digits `recv_loop` has decoded from the peer's RFC 4733 event
+    /// packets, since the last `drain_received_dtmf` call.
+    received_dtmf: Arc<Mutex<VecDeque<char>>>,
+}
+
+/// One queued outbound DTMF digit, RFC 4733-style.
+struct DtmfSend {
+    digit: char,
+    duration_ms: u32,
 }
 
 enum RecordChannel {
@@ -146,6 +169,7 @@ impl MediaSession {
         reserved: ReservedSocket,
         remote_addr: SocketAddr,
         payload_type: u8,
+        telephone_event_pt: Option<u8>,
         capture_target: Option<String>,
         playback_target: Option<String>,
         label: String,
@@ -184,25 +208,31 @@ impl MediaSession {
         let bridge_relay_in: Arc<Mutex<Option<HeapCons<i16>>>> = Arc::new(Mutex::new(None));
         let record_mixer: Arc<Mutex<Option<RecordMixer>>> = Arc::new(Mutex::new(None));
         let secondary_relay: Arc<Mutex<Option<HeapProd<i16>>>> = Arc::new(Mutex::new(None));
+        let (dtmf_send_tx, dtmf_send_rx) = mpsc::unbounded_channel::<DtmfSend>();
+        let received_dtmf: Arc<Mutex<VecDeque<char>>> = Arc::new(Mutex::new(VecDeque::new()));
 
         let send_task = tokio::spawn(send_loop(
             socket.clone(),
             remote_addr,
             payload_type,
+            telephone_event_pt,
             capture_cons,
             notify,
             bridge_relay_in.clone(),
             record_mixer.clone(),
+            dtmf_send_rx,
             cancel.child_token(),
         ));
         let recv_task = tokio::spawn(recv_loop(
             socket,
             payload_type,
+            telephone_event_pt,
             playback_prod,
             output_gain_bits.clone(),
             bridge_relay_out.clone(),
             record_mixer.clone(),
             secondary_relay.clone(),
+            received_dtmf.clone(),
             cancel.child_token(),
         ));
 
@@ -221,6 +251,9 @@ impl MediaSession {
             record_mixer,
             secondary_relay,
             secondary_pw: Mutex::new(None),
+            telephone_event_pt,
+            dtmf_send_tx,
+            received_dtmf,
         })
     }
 
@@ -341,6 +374,23 @@ impl MediaSession {
     pub fn output_level(&self) -> f32 {
         f32::from_bits(self.output_level_bits.load(Ordering::Relaxed))
     }
+
+    /// Queues `digit` to be sent as an RFC 4733 RTP telephone-event train.
+    /// Returns `false` without queueing anything if this session never
+    /// negotiated a telephone-event payload type (or `digit` isn't a valid
+    /// DTMF character) — callers use that to fall back to SIP INFO instead.
+    pub fn send_dtmf(&self, digit: char, duration_ms: u32) -> bool {
+        if self.telephone_event_pt.is_none() || digit_to_event_code(digit).is_none() {
+            return false;
+        }
+        self.dtmf_send_tx.send(DtmfSend { digit, duration_ms }).is_ok()
+    }
+
+    /// Drains DTMF digits the peer has sent via RFC 4733 since the last call
+    /// — poll this the same way `input_level`/`output_level` are polled.
+    pub fn drain_received_dtmf(&self) -> Vec<char> {
+        self.received_dtmf.lock().unwrap().drain(..).collect()
+    }
 }
 
 impl Drop for MediaSession {
@@ -364,14 +414,17 @@ async fn wait_for_data(notify: &Notify) {
     let _ = tokio::time::timeout(NOTIFY_TIMEOUT, notify.notified()).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_loop(
     socket: Arc<UdpSocket>,
     remote_addr: SocketAddr,
     payload_type: u8,
+    telephone_event_pt: Option<u8>,
     mut capture_cons: ringbuf::HeapCons<i16>,
     notify: Arc<Notify>,
     bridge_relay_in: Arc<Mutex<Option<HeapCons<i16>>>>,
     record_mixer: Arc<Mutex<Option<RecordMixer>>>,
+    mut dtmf_rx: mpsc::UnboundedReceiver<DtmfSend>,
     cancel: CancellationToken,
 ) {
     let codec = codec::Codec::from_payload_type(payload_type);
@@ -382,10 +435,20 @@ async fn send_loop(
     let mut scratch = [0i16; SAMPLES_PER_PACKET];
     let mut sent_count: u64 = 0;
     let mut empty_wakes: u64 = 0;
+    // Digits queued but not yet in flight — serialized one at a time (like
+    // dialog.rs's SIP-INFO worker) so a burst of key presses doesn't
+    // interleave multiple events' packets together.
+    let mut dtmf_queue: VecDeque<DtmfSend> = VecDeque::new();
+    let mut dtmf_active: Option<DtmfEventState> = None;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            Some(req) = dtmf_rx.recv() => {
+                if telephone_event_pt.is_some() {
+                    dtmf_queue.push_back(req);
+                }
+            }
             _ = wait_for_data(&notify) => {
                 // Drain every full packet currently available (not just
                 // one) — `Notify` collapses back-to-back `notify_one()`
@@ -441,31 +504,73 @@ async fn send_loop(
                         tracing::info!(sent_count, empty_wakes, "send_loop stats");
                     }
                 }
+
+                // Advance at most one RFC 4733 event packet per wake — the
+                // same ~20ms cadence audio packets ride, comfortably inside
+                // RFC 4733 §2.5.1.3's "retransmit at least every 50ms". This
+                // keeps `sequence_number`/`timestamp`/`ssrc` single-owned
+                // (no locking) and means DTMF can never block or race audio.
+                if let Some(pt) = telephone_event_pt {
+                    if dtmf_active.is_none() {
+                        dtmf_active = dtmf_queue
+                            .pop_front()
+                            .map(|req| DtmfEventState::new(req, timestamp));
+                    }
+                    if let Some(state) = dtmf_active.as_mut() {
+                        let done = state
+                            .send_next(&socket, remote_addr, pt, ssrc, &mut sequence_number)
+                            .await;
+                        if done {
+                            dtmf_active = None;
+                        }
+                    }
+                }
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recv_loop(
     socket: Arc<UdpSocket>,
     payload_type: u8,
+    telephone_event_pt: Option<u8>,
     mut playback_prod: ringbuf::HeapProd<i16>,
     output_gain_bits: Arc<AtomicU32>,
     bridge_relay_out: Arc<Mutex<Option<HeapProd<i16>>>>,
     record_mixer: Arc<Mutex<Option<RecordMixer>>>,
     secondary_relay: Arc<Mutex<Option<HeapProd<i16>>>>,
+    received_dtmf: Arc<Mutex<VecDeque<char>>>,
     cancel: CancellationToken,
 ) {
     let codec = codec::Codec::from_payload_type(payload_type);
     let mut buf = [0u8; 2048];
     let mut reorder = ReorderBuffer::new();
     let mut received_count: u64 = 0;
+    // Dedups a digit to one `received_dtmf` push per key press, keyed by
+    // (event code, timestamp) — timestamp, not sequence number, is what the
+    // sender holds frozen across the `DTMF_END_PACKET_REPEATS` redundant end
+    // packets of one event train (see `DtmfEventState::send_next`).
+    let mut last_surfaced_dtmf: Option<(u8, u32)> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             result = socket.recv_from(&mut buf) => {
                 let Ok((n, _from)) = result else { continue };
                 let Ok((header, payload)) = RtpHeader::decode(&buf[..n]) else { continue };
+                if Some(header.payload_type) == telephone_event_pt {
+                    if let [event_code, byte1, ..] = *payload {
+                        let end = byte1 & 0x80 != 0;
+                        let key = (event_code, header.timestamp);
+                        if end && last_surfaced_dtmf != Some(key) {
+                            if let Some(digit) = event_code_to_digit(event_code) {
+                                received_dtmf.lock().unwrap().push_back(digit);
+                            }
+                            last_surfaced_dtmf = Some(key);
+                        }
+                    }
+                    continue;
+                }
                 if header.payload_type != payload_type {
                     tracing::debug!(
                         got = header.payload_type,
@@ -506,6 +611,120 @@ async fn recv_loop(
                     playback_prod.push_iter(ready.into_iter());
                 }
             }
+        }
+    }
+}
+
+/// One RFC 4733 telephone-event 4-byte payload:
+/// `event(8) | E(1) R(1) volume(6) | duration(16)`.
+fn encode_telephone_event(event_code: u8, end: bool, volume: u8, duration: u16) -> [u8; 4] {
+    [
+        event_code,
+        (u8::from(end) << 7) | (volume & 0x3F),
+        (duration >> 8) as u8,
+        duration as u8,
+    ]
+}
+
+/// DTMF digit -> RFC 4733 §3.2 event code (0-9, *, #, then the A-D "letter"
+/// events). Returns `None` for anything else, including e.g. a raw ASCII
+/// letter this app's dialpad never produces.
+fn digit_to_event_code(digit: char) -> Option<u8> {
+    match digit {
+        '0'..='9' => Some(digit as u8 - b'0'),
+        '*' => Some(10),
+        '#' => Some(11),
+        'A'..='D' => Some(digit as u8 - b'A' + 12),
+        'a'..='d' => Some(digit as u8 - b'a' + 12),
+        _ => None,
+    }
+}
+
+/// Inverse of `digit_to_event_code`, for decoding a peer's RFC 4733 events.
+fn event_code_to_digit(code: u8) -> Option<char> {
+    match code {
+        0..=9 => Some((b'0' + code) as char),
+        10 => Some('*'),
+        11 => Some('#'),
+        12..=15 => Some((b'A' + (code - 12)) as char),
+        _ => None,
+    }
+}
+
+/// Tracks one in-flight RFC 4733 event send across multiple `send_loop`
+/// wakes: one packet is emitted per call to `send_next` (see `send_loop`'s
+/// doc comment on why — this keeps the shared RTP sequence/timestamp state
+/// single-owned with no locking, at a cadence that comfortably satisfies
+/// RFC 4733 §2.5.1.3's retransmission requirement).
+struct DtmfEventState {
+    event_code: u8,
+    /// The RTP timestamp at the *start* of this event — held fixed across
+    /// every packet of the whole event train per RFC 4733 §2.5.1.3, even as
+    /// the shared `send_loop` timestamp keeps advancing for audio packets
+    /// sent alongside it.
+    start_timestamp: u32,
+    elapsed_ticks: u32,
+    total_ticks: u32,
+    marker_sent: bool,
+    end_packets_sent: u8,
+}
+
+impl DtmfEventState {
+    /// `event_code_for(req.digit)` is guaranteed valid here — `send_dtmf`
+    /// already rejected anything `digit_to_event_code` can't encode before
+    /// it ever reached the queue this state is built from.
+    fn new(req: DtmfSend, start_timestamp: u32) -> Self {
+        let event_code = digit_to_event_code(req.digit).unwrap_or(0);
+        // RTP clock is 8000Hz regardless of codec, so ms -> ticks is *8; at
+        // least one packet's worth so a very short/zero duration still
+        // produces a valid (marker + immediate end) packet train.
+        let total_ticks = (req.duration_ms * 8).max(SAMPLES_PER_PACKET as u32);
+        Self {
+            event_code,
+            start_timestamp,
+            elapsed_ticks: 0,
+            total_ticks,
+            marker_sent: false,
+            end_packets_sent: 0,
+        }
+    }
+
+    /// Sends exactly one packet of this event train. Returns `true` once
+    /// the event is fully done (all redundant end packets sent) — the
+    /// caller then drops this state and can start the next queued digit.
+    async fn send_next(
+        &mut self,
+        socket: &UdpSocket,
+        remote_addr: SocketAddr,
+        payload_type: u8,
+        ssrc: u32,
+        sequence_number: &mut u16,
+    ) -> bool {
+        let marker = !self.marker_sent;
+        self.marker_sent = true;
+
+        if self.elapsed_ticks < self.total_ticks {
+            self.elapsed_ticks = (self.elapsed_ticks + SAMPLES_PER_PACKET as u32).min(self.total_ticks);
+        }
+        let end = self.elapsed_ticks >= self.total_ticks;
+        let duration = self.elapsed_ticks.min(u16::MAX as u32) as u16;
+
+        let payload = encode_telephone_event(self.event_code, end, DTMF_VOLUME, duration);
+        let header = RtpHeader {
+            marker,
+            payload_type,
+            sequence_number: *sequence_number,
+            timestamp: self.start_timestamp,
+            ssrc,
+        };
+        let _ = socket.send_to(&header.build_packet(&payload), remote_addr).await;
+        *sequence_number = sequence_number.wrapping_add(1);
+
+        if end {
+            self.end_packets_sent += 1;
+            self.end_packets_sent >= DTMF_END_PACKET_REPEATS
+        } else {
+            false
         }
     }
 }
@@ -619,5 +838,98 @@ mod tests {
         let mut rb = ReorderBuffer::new();
         assert_eq!(rb.push(65535, vec![1]), vec![1]);
         assert_eq!(rb.push(0, vec![2]), vec![2]);
+    }
+
+    #[test]
+    fn digit_event_code_round_trips() {
+        for digit in "0123456789*#ABCD".chars() {
+            let code = digit_to_event_code(digit).unwrap();
+            assert_eq!(event_code_to_digit(code), Some(digit));
+        }
+        // Lowercase letters encode the same events as uppercase, but decode
+        // back to uppercase (RFC 4733 events don't carry case).
+        assert_eq!(digit_to_event_code('a'), digit_to_event_code('A'));
+        assert!(digit_to_event_code('x').is_none());
+    }
+
+    async fn drive_event(state: &mut DtmfEventState, packets: usize) -> Vec<(bool, bool, u16)> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut seq = 0u16;
+        let mut out = Vec::new();
+        for _ in 0..packets {
+            let marker_before = !state.marker_sent;
+            let done = state.send_next(&socket, remote_addr, 101, 0xdead_beef, &mut seq).await;
+            out.push((marker_before, done, state.elapsed_ticks as u16));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn dtmf_event_marker_only_on_first_packet() {
+        let mut state = DtmfEventState::new(
+            DtmfSend { digit: '5', duration_ms: 250 },
+            1000,
+        );
+        let results = drive_event(&mut state, 3).await;
+        assert!(results[0].0, "marker must be set on the first packet");
+        assert!(!results[1].0, "marker must not repeat on later packets");
+        assert!(!results[2].0);
+    }
+
+    #[tokio::test]
+    async fn dtmf_event_timestamp_stays_frozen_across_packets() {
+        let mut state = DtmfEventState::new(
+            DtmfSend { digit: '5', duration_ms: 250 },
+            42_000,
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut seq = 0u16;
+        for _ in 0..5 {
+            state.send_next(&socket, remote_addr, 101, 1, &mut seq).await;
+            assert_eq!(state.start_timestamp, 42_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn dtmf_event_sends_end_packet_exactly_three_times() {
+        // 250ms @ 8kHz = 2000 ticks = ceil(2000/160) = 13 packets to reach
+        // the end, then 3 total end-marked packets (this one plus 2 more).
+        let mut state = DtmfEventState::new(
+            DtmfSend { digit: '5', duration_ms: 250 },
+            0,
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut seq = 0u16;
+        let mut done_at = None;
+        for i in 1..=20 {
+            let done = state.send_next(&socket, remote_addr, 101, 1, &mut seq).await;
+            if done {
+                done_at = Some(i);
+                break;
+            }
+        }
+        assert_eq!(state.end_packets_sent, DTMF_END_PACKET_REPEATS);
+        assert!(done_at.is_some(), "event never completed");
+    }
+
+    #[tokio::test]
+    async fn dtmf_event_zero_duration_still_completes() {
+        // A degenerate very-short digit still produces a valid marker+end
+        // packet train rather than looping forever.
+        let mut state = DtmfEventState::new(DtmfSend { digit: '1', duration_ms: 0 }, 0);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut seq = 0u16;
+        let mut completed = false;
+        for _ in 0..(DTMF_END_PACKET_REPEATS as usize + 1) {
+            if state.send_next(&socket, remote_addr, 101, 1, &mut seq).await {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
     }
 }

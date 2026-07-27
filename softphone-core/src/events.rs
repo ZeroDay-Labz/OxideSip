@@ -11,6 +11,11 @@ pub type CallId = String;
 pub struct RemoteMediaInfo {
     pub remote_addr: SocketAddr,
     pub payload_type: u8,
+    /// The negotiated RFC 4733 `telephone-event` payload type, if both sides
+    /// advertised it in this offer/answer exchange. `softphone-ui` uses this
+    /// to decide whether `MediaSession::send_dtmf` can be used, falling back
+    /// to `CoreCommand::SendDtmf` (SIP INFO) when `None`.
+    pub telephone_event_pt: Option<u8>,
     pub crypto_key: Option<String>,
 }
 

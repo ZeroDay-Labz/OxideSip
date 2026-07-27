@@ -1,4 +1,4 @@
-use crate::config::SipAccountConfig;
+use crate::config::{DtmfMode, SipAccountConfig};
 use crate::events::{CallId, CallState, CoreCommand, CoreEvent, LocalMediaInfo, RemoteMediaInfo};
 use crate::sdp;
 use rsipstack::dialog::authenticate::Credential;
@@ -95,6 +95,12 @@ struct CurrentCall {
     /// supported codec via `sdp::select_payload_type` instead of just
     /// taking whichever one the caller listed first.
     remote_payload_types: Vec<u8>,
+    /// The RFC 4733 `telephone-event` payload type the peer offered, if any
+    /// — stashed alongside `remote_payload_types` for the same reason:
+    /// `AnswerCall` needs it to decide whether to advertise telephone-event
+    /// back in the answer (RFC 3264 requires an answer be a subset of what
+    /// was offered).
+    remote_telephone_event_pt: Option<u8>,
 }
 
 /// Up to 5 concurrent calls, matching the UI's Line 1-5 buttons. All lines
@@ -201,6 +207,7 @@ async fn handle_dialog_state(
             let remote_info = RemoteMediaInfo {
                 remote_addr,
                 payload_type: remote_offer.payload_types.first().copied().unwrap_or(0),
+                telephone_event_pt: remote_offer.telephone_event_pt,
                 crypto_key: remote_offer.crypto_key,
             };
 
@@ -217,6 +224,7 @@ async fn handle_dialog_state(
                     local_rtp_port: None,
                     dtmf_tx: None,
                     remote_payload_types: remote_offer.payload_types,
+                    remote_telephone_event_pt: remote_offer.telephone_event_pt,
                 },
             );
 
@@ -265,6 +273,7 @@ async fn handle_dialog_state(
                             let remote_info = RemoteMediaInfo {
                                 remote_addr,
                                 payload_type: remote_offer.payload_types.first().copied().unwrap_or(0),
+                                telephone_event_pt: remote_offer.telephone_event_pt,
                                 crypto_key: remote_offer.crypto_key,
                             };
                             event_tx
@@ -302,6 +311,7 @@ async fn handle_dialog_state(
             let remote_info = RemoteMediaInfo {
                 remote_addr,
                 payload_type: remote_offer.payload_types.first().copied().unwrap_or(0),
+                telephone_event_pt: remote_offer.telephone_event_pt,
                 crypto_key: remote_offer.crypto_key,
             };
 
@@ -455,7 +465,13 @@ async fn handle_command(
 
             let preferred_payload_types: Vec<u8> =
                 config.preferred_codecs.iter().map(|c| c.payload_type()).collect();
-            let local_offer = sdp::generate_offer(local_rtp_port, srtp, false, &preferred_payload_types);
+            let local_offer = sdp::generate_offer(
+                local_rtp_port,
+                srtp,
+                false,
+                &preferred_payload_types,
+                config.dtmf_mode != DtmfMode::InfoOnly,
+            );
             let local_crypto_key = local_offer.crypto_key.clone();
             let offer_sdp = sdp::build_sdp(local_media_addr, &local_offer).to_string();
             let sip_call_id = format!("{:x}-oxidesip", rand::random::<u64>());
@@ -510,6 +526,7 @@ async fn handle_command(
                     // offerer, so codec selection happens on the far end,
                     // not here.
                     remote_payload_types: Vec::new(),
+                    remote_telephone_event_pt: None,
                 },
             );
 
@@ -566,6 +583,7 @@ async fn handle_command(
                 return;
             };
             let remote_payload_types = current.remote_payload_types.clone();
+            let remote_telephone_event_pt = current.remote_telephone_event_pt;
             let Some(Dialog::ServerInvite(dlg)) = dialog_layer.get_dialog(&dialog_id) else {
                 return;
             };
@@ -583,8 +601,18 @@ async fn handle_command(
             let answer_payload_type =
                 sdp::select_payload_type(&remote_payload_types, &preferred_payload_types)
                     .unwrap_or(remote.payload_type);
-            let local_offer =
-                sdp::generate_offer(local_rtp_port, srtp, false, &[answer_payload_type]);
+            // RFC 3264: an answer may only include what the offer included —
+            // only advertise telephone-event back if the caller offered it
+            // *and* our own mode allows it.
+            let answer_telephone_event =
+                remote_telephone_event_pt.is_some() && config.dtmf_mode != DtmfMode::InfoOnly;
+            let local_offer = sdp::generate_offer(
+                local_rtp_port,
+                srtp,
+                false,
+                &[answer_payload_type],
+                answer_telephone_event,
+            );
             let local_crypto_key = local_offer.crypto_key.clone();
             let answer_sdp = sdp::build_sdp(local_media_addr, &local_offer).to_string();
             let headers = vec![Header::ContentType("application/sdp".into())];
@@ -803,8 +831,16 @@ async fn handle_hold_resume(
     // re-deriving from `config.preferred_codecs` — a hold/resume re-INVITE
     // shouldn't silently renegotiate the codec mid-call.
     let active_payload_type = remote.payload_type;
-    let local_offer =
-        sdp::generate_offer(local_rtp_port, config.srtp, hold, &[active_payload_type]);
+    // Don't renegotiate telephone-event support mid-call either — keep
+    // whatever was already agreed for this call.
+    let active_telephone_event = remote.telephone_event_pt.is_some();
+    let local_offer = sdp::generate_offer(
+        local_rtp_port,
+        config.srtp,
+        hold,
+        &[active_payload_type],
+        active_telephone_event,
+    );
     let local_crypto_key = local_offer.crypto_key.clone();
     let body = sdp::build_sdp(local_media_addr, &local_offer)
         .to_string()
