@@ -148,6 +148,11 @@ virtual sink of your own instead (also selectable from the same dropdown).
 - **Call Forwarding** has a toggle and number field in Settings, but doesn't yet redirect calls —
   `rsipstack`'s dialog-reject API doesn't currently expose a way to send a proper SIP 3xx redirect.
   This is disclosed, not silently faked.
+- **Blind transfer can't confirm the target actually answered.** A transfer is reported as
+  "requested," not "succeeded" — `rsipstack`'s REFER support only reports whether the server
+  accepted the REFER itself, with no way to correlate the follow-up NOTIFY(sipfrag) that would
+  carry the real outcome. Our leg is dropped once the REFER is accepted either way, matching how a
+  real deskphone hands off a blind transfer.
 - **No echo cancellation** yet — a real AEC integration is planned but not implemented.
 - **No STUN/ICE** — works well on a LAN or over a VPN to the PBX; NAT traversal beyond basic
   registration isn't handled yet.

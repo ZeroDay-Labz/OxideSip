@@ -3929,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "softphone-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64",
  "dotenvy",
@@ -3949,8 +3949,9 @@ dependencies = [
 
 [[package]]
 name = "softphone-media"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
+ "libc",
  "pipewire",
  "rand 0.10.2",
  "ringbuf",
@@ -3963,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "softphone-ui"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "dirs",
  "iced",
