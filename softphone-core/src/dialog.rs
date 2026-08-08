@@ -7,7 +7,7 @@ use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::dialog::DialogId;
 use rsipstack::sip::prelude::HeadersExt;
-use rsipstack::sip::{Header, Method, StatusCode, Uri};
+use rsipstack::sip::{Header, Method, StatusCode, StatusCodeKind, Uri};
 use rsipstack::transaction::TransactionReceiver;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -375,6 +375,30 @@ fn terminated_reason_label(reason: &TerminatedReason) -> String {
         {
             "busy".to_string()
         }
+        // A few more common codes in plain English, for the same footer
+        // readout — everything else still falls through to `code`'s own
+        // `Display` (e.g. "488 Not Acceptable Here"), which is a real SIP
+        // reason phrase and still readable, just not as casual as these.
+        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
+            if *code == StatusCode::NotFound =>
+        {
+            "number not found".to_string()
+        }
+        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
+            if *code == StatusCode::TemporarilyUnavailable =>
+        {
+            "unavailable".to_string()
+        }
+        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
+            if *code == StatusCode::Forbidden =>
+        {
+            "forbidden".to_string()
+        }
+        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
+            if code.kind() == StatusCodeKind::ServerFailure =>
+        {
+            "server error".to_string()
+        }
         TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code) => code.to_string(),
     }
 }
@@ -625,6 +649,21 @@ async fn handle_command(
                 current.local_rtp_port = Some(local_rtp_port);
             }
 
+            // `remote` still carries whatever the caller *offered* —
+            // override its `telephone_event_pt` with what our own answer
+            // actually declared (`answer_telephone_event`, computed above
+            // per RFC 3264 and honoring `config.dtmf_mode`), so the UI
+            // (which uses this field to pick RTP telephone-event vs. SIP
+            // INFO for outgoing DTMF on this call) doesn't send RFC 4733
+            // packets our SDP answer never negotiated.
+            let remote = RemoteMediaInfo {
+                telephone_event_pt: if answer_telephone_event {
+                    remote_telephone_event_pt
+                } else {
+                    None
+                },
+                ..remote
+            };
             event_tx
                 .send(CoreEvent::CallStateChanged {
                     id,
@@ -870,6 +909,14 @@ async fn handle_hold_resume(
         };
         if let Err(e) = result {
             warn!(error = %e, hold, "re-invite failed");
+            event_tx
+                .send(CoreEvent::HoldResumeFailed {
+                    id,
+                    hold,
+                    reason: e.to_string(),
+                })
+                .await
+                .ok();
             return;
         }
         let state = if hold {

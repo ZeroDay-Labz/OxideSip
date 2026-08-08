@@ -65,7 +65,19 @@ pub enum CoreEvent {
     CallStateChanged { id: CallId, state: CallState },
     PlaceCallFailed { line: u8, reason: String },
     DtmfResult { id: CallId, digit: char, ok: bool },
+    /// `ok` reflects only whether the REFER transaction itself was accepted
+    /// by the server — rsipstack's `refer()` has no way to correlate the
+    /// follow-up NOTIFY(sipfrag) that would report whether the transfer
+    /// target actually answered, so this is *not* a "transfer completed"
+    /// signal. `softphone-ui` deliberately words this as "requested," not
+    /// "succeeded" (see README's Known limitations).
     TransferResult { id: CallId, ok: bool },
+    /// A hold/resume re-INVITE failed at the transport/dialog level (e.g.
+    /// the peer rejected it). Distinct from a silent no-op: without this,
+    /// pressing Hold/Resume against a peer that rejects the re-INVITE left
+    /// the UI's `on_hold` flag untouched with no indication anything went
+    /// wrong.
+    HoldResumeFailed { id: CallId, hold: bool, reason: String },
 }
 
 #[derive(Debug, Clone)]
