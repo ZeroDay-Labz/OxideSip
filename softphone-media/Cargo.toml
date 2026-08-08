@@ -11,6 +11,7 @@ thiserror = { workspace = true }
 pipewire = { version = "0.10", features = ["v0_3_44"] }
 ringbuf = "0.5"
 rand = "0.10"
+libc = "0.2"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
