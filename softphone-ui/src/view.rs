@@ -7,8 +7,8 @@ use crate::history::{self, CallDirection, CallOutcome, HistoryEntry};
 use crate::icon;
 use crate::theme::{self, Pill};
 use iced::widget::{
-    button, column, container, pick_list, row, rule, scrollable, slider, stack, text, text_input, toggler,
-    tooltip,
+    button, column, container, mouse_area, pick_list, row, rule, scrollable, slider, stack, text, text_input,
+    toggler, tooltip,
 };
 use iced::{Alignment, Color, Element, Length};
 use softphone_core::config::{SipTransport, DTMF_MODES, SIP_TRANSPORTS};
@@ -51,7 +51,7 @@ pub fn main_view(app: &App) -> Element<'_, Message> {
 
     let body = match app.screen {
         Screen::Dialer => row![
-            line_sidebar(acc, scale),
+            line_sidebar(acc, scale, app.settings.secondary_input_target.is_some()),
             rule::vertical(1),
             dialer_tab(app, acc, scale)
         ]
@@ -67,7 +67,7 @@ pub fn main_view(app: &App) -> Element<'_, Message> {
         .padding(scaled(14.0, scale))
         .style(theme::card);
 
-    let mut content = column![tab_bar(app.screen, scale), panel, footer(acc),]
+    let mut content = column![tab_bar(app, scale), panel, footer(acc),]
         .spacing(scaled(14.0, scale))
         .padding(scaled(16.0, scale))
         .height(Length::Fill);
@@ -76,12 +76,18 @@ pub fn main_view(app: &App) -> Element<'_, Message> {
         content = content.push(text(error).size(13).color(DANGER_TEXT));
     }
 
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .max_width(MAX_CONTENT_WIDTH)
-        .align_x(Alignment::Center)
-        .into()
+    container(
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .max_width(MAX_CONTENT_WIDTH)
+            .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(Alignment::Center)
+    .style(theme::app_background)
+    .into()
 }
 
 /// Shown instead of the normal dialer when there are no SIP accounts
@@ -156,7 +162,7 @@ fn account_switcher(app: &App, scale: f32) -> Option<Element<'_, Message>> {
 /// idle line opens it (LED on, dial tone, ready to dial); tapping the line
 /// you're already on while it's idle toggles it back off — see
 /// `App::select_line`/`App.line_open`.
-fn line_sidebar(acc: &AccountSession, scale: f32) -> Element<'_, Message> {
+fn line_sidebar(acc: &AccountSession, scale: f32, secondary_input_configured: bool) -> Element<'_, Message> {
     let width = scaled(46.0, scale);
     let mut col = column![].spacing(scaled(6.0, scale));
     for line in 1..=5u8 {
@@ -236,6 +242,44 @@ fn line_sidebar(acc: &AccountSession, scale: f32) -> Element<'_, Message> {
         .on_press(Message::LineSelected(line));
         col = col.push(with_tooltip(btn, line_tooltip(line, call, acc.joined[idx], armed_idle)));
     }
+
+    // Quick on/off toggle for mixing the Settings-configured secondary
+    // input (e.g. Discord's own playback) into the selected line's
+    // outgoing call audio — "let Discord speak to the caller," turned on
+    // or off per call without going back into Settings. Disabled (greyed
+    // out, standard `Status::Disabled` styling) whenever no secondary
+    // input target is configured, rather than silently no-op'ing.
+    let secondary_input_on = matches!(
+        acc.selected_call(),
+        CallUiState::Active { secondary_input_on: true, .. }
+    );
+    let secondary_input_btn = button(
+        container(icon::soundwave().size(scaled(15.0, scale)))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center),
+    )
+    .style(theme::circle(secondary_input_on))
+    .width(Length::Fixed(width))
+    .height(Length::Fixed(width))
+    .padding(0);
+    let secondary_input_btn = if secondary_input_configured {
+        secondary_input_btn.on_press(Message::ToggleSecondaryInputInjection)
+    } else {
+        secondary_input_btn
+    };
+    let tooltip_text = if secondary_input_configured {
+        if secondary_input_on {
+            "Stop letting the secondary input speak to the caller"
+        } else {
+            "Let the secondary input (e.g. Discord) speak to the caller"
+        }
+    } else {
+        "Pick a secondary input in Settings to enable this"
+    };
+    col = col.push(with_tooltip(secondary_input_btn, tooltip_text));
+
     col.into()
 }
 
@@ -366,6 +410,8 @@ pub fn settings_window_view(app: &App) -> Element<'_, Message> {
         &app.settings_form,
         &app.output_devices,
         &app.app_capture_streams,
+        &app.input_devices,
+        &app.app_playback_streams,
         app.error.as_deref(),
     )
 }
@@ -381,7 +427,8 @@ fn with_tooltip<'a>(
         .into()
 }
 
-fn tab_bar(current: Screen, scale: f32) -> Element<'static, Message> {
+fn tab_bar(app: &App, scale: f32) -> Element<'static, Message> {
+    let now = Instant::now();
     let tab = |label: &'static str, screen: Screen| {
         // The label needs its own `width(Fill) + align_x(Center)` — a bare
         // `text(label)` shrinks to its natural size and sits at the *left*
@@ -394,7 +441,7 @@ fn tab_bar(current: Screen, scale: f32) -> Element<'static, Message> {
                 .align_x(Alignment::Center)
                 .width(Length::Fill),
         )
-        .style(theme::pill(Pill::Tab(current == screen)))
+        .style(theme::pill(Pill::Tab(app.tab_animations.amount(screen, now))))
         .padding(scaled(9.0, scale))
         .width(Length::Fill)
         .on_press(Message::TabSelected(screen))
@@ -577,9 +624,17 @@ fn dialer_tab<'a>(app: &'a App, acc: &'a AccountSession, scale: f32) -> Element<
                 .any(|e| e.direction == CallDirection::Outgoing);
             idle_view(app, &app.dial_input, has_last_outgoing, scale)
         }
-        CallUiState::Incoming { caller, .. } => incoming_view(&app.contacts, caller, scale),
-        CallUiState::Outgoing { number, .. } | CallUiState::EarlyMedia { number, .. } => {
-            outgoing_view(&app.contacts, number, scale)
+        CallUiState::Incoming { caller, ringing_since, .. } => {
+            ease_in(incoming_view(&app.contacts, caller, scale), *ringing_since, scale)
+        }
+        // Outgoing and EarlyMedia intentionally share both `started_at` (set
+        // once, when dialing begins — see `CoreEvent::OutgoingCallStarted`'s
+        // handler) and this same view function, so early media arriving
+        // doesn't reset/replay the entrance animation — only the initial
+        // Idle → Outgoing transition should slide in.
+        CallUiState::Outgoing { number, started_at, .. }
+        | CallUiState::EarlyMedia { number, started_at, .. } => {
+            ease_in(outgoing_view(&app.contacts, number, scale), *started_at, scale)
         }
         CallUiState::Active {
             number,
@@ -595,24 +650,51 @@ fn dialer_tab<'a>(app: &'a App, acc: &'a AccountSession, scale: f32) -> Element<
             transfer_input,
             avatar_glow,
             ..
-        } => active_view(
-            &app.contacts,
-            number,
-            media.is_some(),
-            avatar_glow.interpolate(0.0_f32, 1.0_f32, Instant::now()),
+        } => ease_in(
+            active_view(
+                &app.contacts,
+                number,
+                media.is_some(),
+                avatar_glow.interpolate(0.0_f32, 1.0_f32, Instant::now()),
+                *answered_at,
+                *input_level,
+                *output_level,
+                *muted,
+                *output_volume,
+                *input_volume,
+                *on_hold,
+                transfer_input.as_deref(),
+                dtmf_feedback,
+                join_ui,
+                app.dialpad_flash,
+                scale,
+            ),
             *answered_at,
-            *input_level,
-            *output_level,
-            *muted,
-            *output_volume,
-            *input_volume,
-            *on_hold,
-            transfer_input.as_deref(),
-            dtmf_feedback,
-            join_ui,
             scale,
         ),
     }
+}
+
+/// Eases a just-entered call screen into place with a short settling slide,
+/// instead of it snapping straight to its resting position — driven off the
+/// `Instant` each `CallUiState` variant already stamps when it began
+/// (`ringing_since`/`started_at`/`answered_at`), so no new animation state
+/// is needed on `App`: the redraw cadence that already keeps the live
+/// elapsed-time readouts ticking is what carries this too. Purely additive
+/// top padding rather than true opacity/transform (iced 0.14 has no generic
+/// per-widget opacity for arbitrary content, only `image`/`svg`), so it's a
+/// cheap, self-contained effect with no risk to the surrounding layout.
+fn ease_in<'a>(content: Element<'a, Message>, entered_at: Instant, scale: f32) -> Element<'a, Message> {
+    const DURATION_MS: f32 = 220.0;
+    let t = (entered_at.elapsed().as_secs_f32() * 1000.0 / DURATION_MS).min(1.0);
+    if t >= 1.0 {
+        return content;
+    }
+    // Ease-out cubic: fast start, gentle settle — matches the "quick"/
+    // "very_quick" feel `iced::Animation` presets elsewhere in this app use.
+    let eased = 1.0 - (1.0 - t).powi(3);
+    let offset = (1.0 - eased) * scaled(14.0, scale);
+    container(content).padding(iced::padding::top(offset)).into()
 }
 
 /// Centers `content` inside a fixed-size circle — the shared shape behind
@@ -690,6 +772,7 @@ fn idle_view<'a>(app: &'a App, dial_input: &'a str, has_last_outgoing: bool, sca
     // carded visual language.
     let input = text_input("Enter number", dial_input)
         .on_input(Message::DialInputChanged)
+        .on_paste(Message::DialInputPasted)
         .on_submit(Message::CallPressed)
         .padding([scaled(9.0, scale), scaled(13.0, scale)])
         .size(scaled(18.0, scale))
@@ -736,7 +819,7 @@ fn idle_view<'a>(app: &'a App, dial_input: &'a str, has_last_outgoing: bool, sca
     if app.dial_history_open {
         content = content.push(dial_history_panel(app));
     }
-    content = content.push(dialpad(scale)).push(actions);
+    content = content.push(dialpad(scale, app.dialpad_flash)).push(actions);
 
     content.spacing(scaled(16.0, scale)).into()
 }
@@ -966,6 +1049,7 @@ fn active_view<'a>(
     transfer_input: Option<&'a str>,
     dtmf_feedback: &'a [char],
     join_ui: JoinUi,
+    dialpad_flash: Option<(char, Instant)>,
     scale: f32,
 ) -> Element<'a, Message> {
     let status = if let JoinUi::Joined { partner_number } = &join_ui {
@@ -989,9 +1073,9 @@ fn active_view<'a>(
     let digits: String = dtmf_feedback.iter().rev().take(8).rev().collect();
 
     let avatar_style = theme::avatar_state(theme::avatar_color(number), avatar_live_amount);
-    let avatar = container(text(call_avatar_label(contacts, number)).size(scaled(19.0, scale)))
-        .width(Length::Fixed(scaled(60.0, scale)))
-        .height(Length::Fixed(scaled(60.0, scale)))
+    let avatar = container(text(call_avatar_label(contacts, number)).size(scaled(23.0, scale)))
+        .width(Length::Fixed(scaled(72.0, scale)))
+        .height(Length::Fixed(scaled(72.0, scale)))
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(avatar_style);
@@ -1002,13 +1086,19 @@ fn active_view<'a>(
         "Shrink to compact call bar",
     );
 
+    // The caller's own screen during a live call is the one moment that
+    // matters most in the whole app — the name (or number, if there's no
+    // saved contact) gets clear top billing at a noticeably larger size
+    // than everything else here, instead of reading at the same weight as
+    // the secondary number/status lines underneath it.
     let mut caller_info = column![];
     if let Some(name) = contact_name_for(contacts, number) {
-        caller_info = caller_info.push(text(name).size(scaled(16.0, scale)));
+        caller_info = caller_info.push(text(name).size(scaled(20.0, scale)));
+        caller_info = caller_info.push(text(number).size(scaled(13.0, scale)).color(muted_text()));
+    } else {
+        caller_info = caller_info.push(text(number).size(scaled(20.0, scale)));
     }
-    caller_info = caller_info
-        .push(text(number).size(scaled(16.0, scale)))
-        .push(text(status).size(scaled(12.0, scale)).color(status_color));
+    caller_info = caller_info.push(text(status).size(scaled(12.0, scale)).color(status_color));
 
     let header = row![
         row![avatar, caller_info.spacing(2)]
@@ -1133,7 +1223,7 @@ fn active_view<'a>(
         );
     }
 
-    content = content.push(dialpad(scale));
+    content = content.push(dialpad(scale, dialpad_flash));
     content = content.push(pill_call_button("Hang Up", theme::pill(Pill::Danger), icon::telephone_x_fill(), scale).on_press(Message::HangUpPressed));
 
     content.into()
@@ -1212,7 +1302,11 @@ fn dialpad_letters(key: char) -> &'static str {
     }
 }
 
-fn dialpad<'a>(scale: f32) -> Element<'a, Message> {
+/// How long a dialpad key's press flash (see `App::dialpad_flash`) stays
+/// visible before fully decaying back to its normal neutral fill.
+const DIALPAD_FLASH_MS: f32 = 260.0;
+
+fn dialpad<'a>(scale: f32, flash: Option<(char, Instant)>) -> Element<'a, Message> {
     let key_size = scaled(42.0, scale);
     let mut rows = column![].spacing(scaled(6.0, scale));
     for keys in DIALPAD_KEYS {
@@ -1230,8 +1324,15 @@ fn dialpad<'a>(scale: f32) -> Element<'a, Message> {
                 .align_x(Alignment::Center)
                 .into()
             };
+            let amount = match flash {
+                Some((k, at)) if k == key => {
+                    let t = (at.elapsed().as_secs_f32() * 1000.0 / DIALPAD_FLASH_MS).min(1.0);
+                    (1.0 - t).powi(2)
+                }
+                _ => 0.0,
+            };
             r = r.push(
-                circle_button(label, key_size, theme::circle(false))
+                circle_button(label, key_size, theme::circle_flash(amount))
                     .on_press(Message::DialpadPressed(key)),
             );
         }
@@ -1299,7 +1400,7 @@ fn contacts_tab(app: &App, scale: f32) -> Element<'_, Message> {
     }
 
     let count = matches.len();
-    let mut list = column![].spacing(8);
+    let mut list = column![].spacing(10);
     for (index, contact) in matches {
         list = list.push(contact_row(index, contact));
     }
@@ -1307,10 +1408,20 @@ fn contacts_tab(app: &App, scale: f32) -> Element<'_, Message> {
         .size(11)
         .color(muted_text());
 
+    // An unadorned `scrollable` uses a *floating* scrollbar (no reserved
+    // layout space) that overlaps whatever's underneath it — at narrower
+    // window widths that meant it sat right on top of each row's trash
+    // button. Giving the scrollbar its own `spacing` embeds it instead: it
+    // gets a real reserved lane next to the content, so it never overlaps
+    // the delete button regardless of window width.
+    let contacts_scrollbar = scrollable::Scrollbar::new().width(6).scroller_width(6).spacing(8);
+
     column![
         row![search, sort_button, add_button].spacing(10).align_y(Alignment::Center),
         count_label,
-        scrollable(list).height(Length::Fill),
+        scrollable(list)
+            .direction(scrollable::Direction::Vertical(contacts_scrollbar))
+            .height(Length::Fill),
         contacts_io_row(app),
     ]
     .spacing(10)
@@ -1392,7 +1503,7 @@ fn contact_row(index: usize, contact: &Contact) -> Element<'_, Message> {
                 .align_y(Alignment::Center),
             )
             .style(theme::list_row)
-            .padding(9)
+            .padding(11)
             .width(Length::Fill)
             .on_press(Message::DialNumber(contact.number.clone())),
             with_tooltip(
@@ -1406,9 +1517,15 @@ fn contact_row(index: usize, contact: &Contact) -> Element<'_, Message> {
                 "Delete contact",
             ),
         ]
-        .spacing(6)
+        .spacing(8)
         .align_y(Alignment::Center),
     )
+    .padding(iced::Padding {
+        top: 0.0,
+        right: 4.0,
+        bottom: 0.0,
+        left: 0.0,
+    })
     .into()
 }
 
@@ -1471,16 +1588,30 @@ fn history_tab(app: &App, _scale: f32) -> Element<'_, Message> {
     }
     let now = history::now_unix();
     let mut list = column![].spacing(8);
-    for entry in app.call_history.iter().rev() {
-        list = list.push(history_row(now, entry));
+    for (index, entry) in app.call_history.iter().enumerate().rev() {
+        list = list.push(history_row(now, index, entry, app.history_context_menu == Some(index)));
     }
-    let heading = text("Recent Calls").size(11).color(muted_text());
-    column![heading, scrollable(list).height(Length::Fill)]
-        .spacing(10)
-        .into()
+    let heading = row![
+        text("Recent Calls").size(11).color(muted_text()).width(Length::Fill),
+        with_tooltip(
+            circle_button(icon::trash_fill().size(11).color(DANGER_TEXT), 24.0, theme::circle(false))
+                .on_press(Message::ClearHistoryPressed),
+            "Clear call history",
+        ),
+    ]
+    .align_y(Alignment::Center);
+    let history_scrollbar = scrollable::Scrollbar::new().width(6).scroller_width(6).spacing(8);
+    column![
+        heading,
+        scrollable(list)
+            .direction(scrollable::Direction::Vertical(history_scrollbar))
+            .height(Length::Fill),
+    ]
+    .spacing(10)
+    .into()
 }
 
-fn history_row(now: i64, entry: &HistoryEntry) -> Element<'_, Message> {
+fn history_row(now: i64, index: usize, entry: &HistoryEntry, menu_open: bool) -> Element<'_, Message> {
     let palette = theme::oxide_palette();
     let (direction_icon, glyph_color) = match (entry.direction, entry.outcome) {
         (_, CallOutcome::Missed) => (icon::telephone_x(), palette.danger),
@@ -1498,7 +1629,7 @@ fn history_row(now: i64, entry: &HistoryEntry) -> Element<'_, Message> {
         history::relative_label(now, entry.unix_secs)
     };
 
-    button(
+    let row_button = button(
         row![
             avatar_small(&entry.number),
             direction_icon.color(glyph_color).size(13),
@@ -1514,8 +1645,31 @@ fn history_row(now: i64, entry: &HistoryEntry) -> Element<'_, Message> {
     .style(theme::list_row)
     .padding(9)
     .width(Length::Fill)
-    .on_press(Message::DialNumber(entry.number.clone()))
-    .into()
+    .on_press(Message::DialNumber(entry.number.clone()));
+
+    // Right-click toggles a small inline action row instead of a floating
+    // cursor-position context menu — iced has no built-in overlay widget for
+    // that, and an inline expand avoids the dismiss/positioning/edge-clamping
+    // complexity a custom floating popup would need.
+    let row_with_menu = mouse_area(row_button).on_right_press(Message::HistoryContextMenuToggled(index));
+
+    if menu_open {
+        column![
+            row_with_menu,
+            button(
+                row![icon::person_lines_fill().size(12), text("Add to Contacts").size(12)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            )
+            .style(theme::pill(Pill::Neutral))
+            .padding(7)
+            .on_press(Message::AddHistoryEntryToContacts(index)),
+        ]
+        .spacing(4)
+        .into()
+    } else {
+        row_with_menu.into()
+    }
 }
 
 /// Adapter so `AudioDevice` (from `softphone_media`, no `Display`/`PartialEq`)
@@ -1628,7 +1782,7 @@ fn accounts_sidebar(app: &App) -> Element<'_, Message> {
         let editing = app.editing_account == Some(index);
         let row_content = row![
             button(text(name).size(12))
-                .style(theme::pill(Pill::Tab(editing)))
+                .style(theme::pill(Pill::Tab(if editing { 1.0 } else { 0.0 })))
                 .padding(7)
                 .width(Length::Fill)
                 .on_press(Message::SelectAccountForEditing(index)),
@@ -1963,10 +2117,73 @@ fn secondary_output_picker<'a>(
     )
 }
 
+/// Input counterpart to `secondary_output_picker` — same shape, but sourcing
+/// from mic-class hardware/virtual devices plus live application *playback*
+/// streams (e.g. Discord's own outgoing audio) instead of sinks/capture
+/// streams. See `list_app_playback_streams`'s doc comment for why the media
+/// class differs from the output picker's (avoiding a feedback loop).
+fn secondary_input_picker<'a>(
+    inputs: &[softphone_media::AudioDevice],
+    app_streams: &[softphone_media::AudioDevice],
+    selected: &Option<String>,
+) -> Element<'a, Message> {
+    let mut options: Vec<DeviceOption> = vec![DeviceOption {
+        id: SYSTEM_DEFAULT_ID.to_string(),
+        description: "None".to_string(),
+    }];
+    options.extend(app_streams.iter().map(|d| DeviceOption {
+        id: d.id.clone(),
+        description: format!("App: {}", d.description),
+    }));
+    options.extend(inputs.iter().map(|d| DeviceOption {
+        id: d.id.clone(),
+        description: d.description.clone(),
+    }));
+    let selected = options
+        .iter()
+        .find(|o| o.id == selected.clone().unwrap_or_default())
+        .cloned();
+
+    let refresh = with_tooltip(
+        button(icon::arrow_clockwise().size(11))
+            .style(theme::pill(Pill::Neutral))
+            .padding(7)
+            .on_press(Message::RefreshSecondaryOutputTargets),
+        "Re-scan for input devices and live app streams (e.g. after joining a Discord voice channel)",
+    );
+
+    field(
+        "Mix into outgoing call audio from",
+        column![
+            row![
+                pick_list(options, selected, |opt: DeviceOption| {
+                    Message::SettingsSecondaryInputChanged(
+                        (opt.id != SYSTEM_DEFAULT_ID).then_some(opt.id),
+                    )
+                })
+                .width(Length::Fill)
+                .padding(10),
+                refresh,
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(
+                "Pick a live app stream (e.g. Discord) to let it speak to the caller. Turn it on \
+                 or off per call with the button below the line buttons."
+            )
+            .size(11)
+            .color(muted_text()),
+        ]
+        .spacing(6),
+    )
+}
+
 fn settings_view<'a>(
     form: &'a SettingsForm,
     output_devices: &[softphone_media::AudioDevice],
     app_capture_streams: &[softphone_media::AudioDevice],
+    input_devices: &[softphone_media::AudioDevice],
+    app_playback_streams: &[softphone_media::AudioDevice],
     error: Option<&'a str>,
 ) -> Element<'a, Message> {
     let call_handling = column![
@@ -2067,6 +2284,8 @@ fn settings_view<'a>(
 
     let secondary_output =
         secondary_output_picker(output_devices, app_capture_streams, &form.secondary_output_target);
+    let secondary_input =
+        secondary_input_picker(input_devices, app_playback_streams, &form.secondary_input_target);
 
     let actions = row![
         button(text("Save").size(12))
@@ -2089,6 +2308,7 @@ fn settings_view<'a>(
         section("Deny List", deny_list),
         section("Recording", recording),
         section("Secondary Output", secondary_output),
+        section("Secondary Input", secondary_input),
     ]
     .spacing(16);
 

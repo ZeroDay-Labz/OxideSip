@@ -12,7 +12,7 @@ pub use iced_fonts::BOOTSTRAP_FONT_BYTES as FONT_BYTES;
 pub use iced_fonts::bootstrap::{
     arrow_clockwise, arrow_left_right, arrows_fullscreen, box_arrow_in_down, box_arrow_up, chevron_down,
     chevron_up, clock_history, dash_lg, diagram_three_fill, foldertwo_open, gear_fill, mic_fill, mic_mute_fill,
-    pause_fill, pencil_fill, person_lines_fill, person_x, play_fill, plus_lg, search, sliders,
+    pause_fill, pencil_fill, person_lines_fill, person_x, play_fill, plus_lg, search, sliders, soundwave,
     telephone_fill, telephone_forward_fill, telephone_inbound_fill, telephone_outbound_fill, telephone_x,
     telephone_x_fill, trash_fill, x_circle_fill,
 };

@@ -40,6 +40,20 @@ pub struct AppSettings {
     /// primary device pickers.
     #[serde(default)]
     pub secondary_output_target: Option<String>,
+    /// PipeWire `node.name` to pull additional audio *from* and mix into
+    /// this call's outgoing (RTP-sent) audio — the input counterpart to
+    /// `secondary_output_target`. Expected to be another app's own
+    /// *playback* stream (e.g. Discord's "what other members are saying",
+    /// `Stream/Output/Audio`; see
+    /// `softphone_media::devices::list_app_playback_streams`), not a
+    /// capture stream — sourcing from a capture stream would loop our own
+    /// injected audio back on itself. `None` disables it. Configuring a
+    /// target here only sets up the PipeWire stream; whether it's actually
+    /// mixed in is controlled per-call by the live toggle next to the line
+    /// buttons (`MediaSession::set_secondary_input_enabled`), which starts
+    /// off for every new call regardless of this setting.
+    #[serde(default)]
+    pub secondary_input_target: Option<String>,
 }
 
 pub fn load() -> AppSettings {

@@ -88,6 +88,13 @@ pub enum CallUiState {
         /// Output volume to restore on resume — the actual applied gain is
         /// forced to 0 while `on_hold`, independent of what the slider shows.
         pre_hold_output_volume: f32,
+        /// Live on/off state for the secondary-input toggle (mixing another
+        /// app's audio, e.g. Discord, into what's sent to the SIP peer) —
+        /// mirrored onto `media`'s `MediaSession::set_secondary_input_enabled`
+        /// whenever it changes. Always starts `false` for a fresh call,
+        /// regardless of whether a target is configured in Settings — the
+        /// user opts in per call via the toggle below the line buttons.
+        secondary_input_on: bool,
         /// `None` = transfer panel collapsed; `Some(text)` = panel open with
         /// the in-progress target number.
         transfer_input: Option<String>,
@@ -145,6 +152,46 @@ pub enum Screen {
     Dialer,
     Contacts,
     History,
+}
+
+/// Drives the tab bar's selected-pill cross-fade (`theme::Pill::Tab`,
+/// `view.rs::tab_bar`) — one `Animation<bool>` per tab so the newly
+/// selected one eases its fill in (and the previously selected one eases
+/// out) instead of snapping, same pattern as `CallUiState::Active`'s
+/// `avatar_glow`.
+pub struct TabAnimations {
+    dialer: iced::Animation<bool>,
+    contacts: iced::Animation<bool>,
+    history: iced::Animation<bool>,
+}
+
+impl TabAnimations {
+    fn new(selected: Screen) -> Self {
+        TabAnimations {
+            dialer: iced::Animation::new(selected == Screen::Dialer).quick(),
+            contacts: iced::Animation::new(selected == Screen::Contacts).quick(),
+            history: iced::Animation::new(selected == Screen::History).quick(),
+        }
+    }
+
+    /// Retargets all three tabs' animations toward `selected` — safe to call
+    /// even if `selected` is already the current target (`Animation::go_mut`
+    /// is a no-op in that case).
+    fn select(&mut self, selected: Screen) {
+        let now = Instant::now();
+        self.dialer.go_mut(selected == Screen::Dialer, now);
+        self.contacts.go_mut(selected == Screen::Contacts, now);
+        self.history.go_mut(selected == Screen::History, now);
+    }
+
+    pub(crate) fn amount(&self, screen: Screen, now: Instant) -> f32 {
+        let anim = match screen {
+            Screen::Dialer => &self.dialer,
+            Screen::Contacts => &self.contacts,
+            Screen::History => &self.history,
+        };
+        anim.interpolate(0.0_f32, 1.0_f32, now)
+    }
 }
 
 #[derive(Default)]
@@ -222,6 +269,7 @@ pub struct SettingsForm {
     pub recording_enabled: bool,
     pub recording_path: String,
     pub secondary_output_target: Option<String>,
+    pub secondary_input_target: Option<String>,
 }
 
 impl SettingsForm {
@@ -236,6 +284,7 @@ impl SettingsForm {
             recording_enabled: settings.recording_enabled,
             recording_path: settings.recording_path.clone(),
             secondary_output_target: settings.secondary_output_target.clone(),
+            secondary_input_target: settings.secondary_input_target.clone(),
         }
     }
 }
@@ -509,6 +558,7 @@ pub struct App {
     /// switcher currently show — index into `accounts`.
     pub(crate) selected_account: usize,
     pub(crate) screen: Screen,
+    pub(crate) tab_animations: TabAnimations,
     pub(crate) dial_input: String,
     /// Whether the recent-outgoing-numbers panel below the dial input is
     /// expanded. Toggled by its own button rather than on focus, since
@@ -530,6 +580,11 @@ pub struct App {
     /// distinct group in the secondary-output picker. Re-scanned via
     /// `Message::RefreshSecondaryOutputTargets`, not just once at boot.
     pub(crate) app_capture_streams: Vec<AudioDevice>,
+    /// Live application *playback* streams (e.g. Discord's own outgoing
+    /// audio — what other voice-channel members are saying), the input
+    /// counterpart to `app_capture_streams`, shown in the secondary-input
+    /// picker. Same "re-scanned on demand, not cached" treatment.
+    pub(crate) app_playback_streams: Vec<AudioDevice>,
     pub(crate) error: Option<String>,
     main_window: window::Id,
     main_window_size: iced::Size,
@@ -552,6 +607,11 @@ pub struct App {
     pub(crate) settings: AppSettings,
     pub(crate) settings_form: SettingsForm,
     pub(crate) call_history: Vec<history::HistoryEntry>,
+    /// Index into `call_history` whose inline "Add to Contacts" row is
+    /// expanded (opened via right-click on that entry) — `None` when no
+    /// entry's menu is open. A single `Option` since only one can be open
+    /// at a time.
+    pub(crate) history_context_menu: Option<usize>,
     pub(crate) contacts: Vec<Contact>,
     pub(crate) contact_filter: String,
     pub(crate) contact_form: Option<ContactForm>,
@@ -569,6 +629,16 @@ pub struct App {
     /// follow later Settings changes without an app restart, same as a
     /// call's `MediaSession` needing a fresh call to pick up a device change.
     tone_player: Option<Arc<DtmfTonePlayer>>,
+    /// The most recently pressed dialpad key and when — `view.rs`'s
+    /// `dialpad` reads this to give the just-pressed key a brief colored
+    /// flash that decays over a couple hundred ms, so a tap gets its own
+    /// visible confirmation instead of relying solely on the (easy to miss
+    /// under a fast finger) held-down hover state. Shared by both the idle
+    /// dialer and in-call DTMF pad, since both render through the same
+    /// `dialpad` function. No cleanup needed: `dialpad`'s own elapsed-time
+    /// check just stops drawing the flash once its short window has
+    /// passed — the stale `Some` sitting in state afterward costs nothing.
+    pub(crate) dialpad_flash: Option<(char, Instant)>,
 }
 
 /// `iced`'s interactive widgets (`on_press`, `on_input`, ...) require
@@ -583,6 +653,11 @@ pub enum Message {
     CoreConnected(usize, mpsc::Sender<CoreCommand>),
     Core(usize, CoreEvent),
     DialInputChanged(String),
+    /// Fired instead of `DialInputChanged` specifically for Ctrl+V paste
+    /// (see the dial `text_input`'s `.on_paste` in `view.rs`) — sets the
+    /// field without playing a dial tone per pasted character, since a
+    /// pasted number wasn't actually dialed.
+    DialInputPasted(String),
     DialHistoryToggled,
     DialHistorySelected(String),
     DialpadPressed(char),
@@ -644,6 +719,11 @@ pub enum Message {
     /// while that app is actually in a voice channel.
     RefreshSecondaryOutputTargets,
     SecondaryOutputTargetsLoaded(Vec<AudioDevice>, Vec<AudioDevice>),
+    /// `None` selects the "None" (disabled) option in the picker.
+    SettingsSecondaryInputChanged(Option<String>),
+    /// Fired alongside `SecondaryOutputTargetsLoaded` by the same refresh —
+    /// see `refresh_secondary_output_targets`.
+    SecondaryInputTargetsLoaded(Vec<AudioDevice>, Vec<AudioDevice>),
     SettingsSavePressed,
     SettingsCancelPressed,
     /// Tab/Shift+Tab pressed anywhere, not already consumed by the focused
@@ -654,6 +734,10 @@ pub enum Message {
     FocusPrevious,
     Tick,
     MuteToggled,
+    /// Toggles mixing the Settings-configured secondary input (e.g.
+    /// Discord's own playback) into the selected line's outgoing call
+    /// audio. No-op if no secondary input target is configured.
+    ToggleSecondaryInputInjection,
     OutputVolumeChanged(f32),
     InputVolumeChanged(f32),
     WindowClosed(window::Id),
@@ -681,6 +765,12 @@ pub enum Message {
     ContactSavePressed,
     ContactCancelPressed,
     DeleteContactPressed(usize),
+    ClearHistoryPressed,
+    /// Right-click on a history entry — toggles that entry's inline
+    /// "Add to Contacts" action row (opening it closes any other entry's,
+    /// since only one can be open at a time).
+    HistoryContextMenuToggled(usize),
+    AddHistoryEntryToContacts(usize),
     ContactsIoPathChanged(String),
     ContactsImportPressed,
     ContactsExportPressed,
@@ -767,6 +857,7 @@ impl App {
             accounts: sessions,
             selected_account: 0,
             screen: Screen::Dialer,
+            tab_animations: TabAnimations::new(Screen::Dialer),
             dial_input: String::new(),
             dial_history_open: false,
             sip_settings_form,
@@ -776,6 +867,7 @@ impl App {
             input_devices: Vec::new(),
             output_devices: Vec::new(),
             app_capture_streams: Vec::new(),
+            app_playback_streams: Vec::new(),
             error: None,
             main_window,
             main_window_size: MAIN_WINDOW_SIZE,
@@ -788,6 +880,7 @@ impl App {
             settings_form: SettingsForm::from_settings(&settings),
             settings,
             call_history: history::load(),
+            history_context_menu: None,
             contacts: contacts::load(),
             contact_filter: String::new(),
             contact_form: None,
@@ -795,6 +888,7 @@ impl App {
             contacts_io_path: "./contacts_export.json".to_string(),
             contacts_io_status: None,
             tone_player: None,
+            dialpad_flash: None,
         };
 
         let tone_target = app.audio_devices.output_device.clone();
@@ -1008,11 +1102,19 @@ impl App {
             }
             Message::Core(account, CoreEvent::PlaceCallFailed { line, reason }) => {
                 let idx = line_idx(line);
-                self.error = Some(reason);
                 if let Some(acc) = self.accounts.get_mut(account) {
                     acc.lines[idx] = CallUiState::Idle;
                     acc.pending_sockets[idx] = None;
+                    // Also feed the footer's bottom-left readout
+                    // (`line_status_label` in view.rs), same as
+                    // `CallState::Terminated` already does — so an
+                    // immediate setup failure (bad number, transport error)
+                    // shows "why it's not going through" in the same place
+                    // a denial/hangup reason would, not just the banner
+                    // below.
+                    acc.last_call_status[idx] = Some(reason.clone());
                 }
+                self.error = Some(reason);
                 Task::none()
             }
             Message::Core(_, CoreEvent::DtmfResult { ok, digit, .. }) => {
@@ -1021,10 +1123,30 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Core(_, CoreEvent::TransferResult { ok, .. }) => {
-                if !ok {
-                    self.error = Some("call transfer failed".to_string());
+            Message::Core(account, CoreEvent::TransferResult { id, ok }) => {
+                // `ok` only means the REFER transaction itself was accepted
+                // by the server — rsipstack gives no way to correlate the
+                // follow-up NOTIFY(sipfrag) that would report whether the
+                // transfer target actually answered, so this can't claim
+                // more than "requested" (see README's Known limitations).
+                if ok {
+                    if let Some(acc) = self.accounts.get_mut(account)
+                        && let Some(idx) = acc.line_index_for_call(&id)
+                    {
+                        acc.last_call_status[idx] = Some("transfer requested".to_string());
+                    }
+                } else {
+                    self.error = Some("transfer request rejected".to_string());
                 }
+                Task::none()
+            }
+            Message::Core(_, CoreEvent::HoldResumeFailed { hold, reason, .. }) => {
+                // `on_hold` is never flipped optimistically (see
+                // `HoldToggled`), so there's no state to roll back here —
+                // just surface why the button press didn't visibly do
+                // anything, instead of leaving it silently swallowed.
+                let action = if hold { "hold" } else { "resume" };
+                self.error = Some(format!("{action} failed: {reason}"));
                 Task::none()
             }
 
@@ -1033,9 +1155,12 @@ impl App {
             }
 
             Message::DialInputChanged(s) => {
-                // Play a tone for whatever digits were just typed/pasted
-                // (not just clicked on the dialpad) — a real phone gives
-                // audible feedback for typed digits too.
+                // Play a tone for whatever digit was just typed (not
+                // clicked on the dialpad, which plays its own via
+                // `DialpadPressed`) — a real phone gives audible feedback
+                // for typed digits too. Paste is routed to
+                // `DialInputPasted` instead (see `view.rs`'s `.on_paste`),
+                // so this only ever sees genuine keystrokes.
                 if s.len() > self.dial_input.len() && s.starts_with(self.dial_input.as_str()) {
                     let added = s[self.dial_input.len()..].to_string();
                     if let Some(player) = &self.tone_player {
@@ -1044,6 +1169,11 @@ impl App {
                         }
                     }
                 }
+                self.dial_input = s;
+                Task::none()
+            }
+            Message::DialInputPasted(s) => {
+                // No tone playback — a pasted number wasn't dialed.
                 self.dial_input = s;
                 Task::none()
             }
@@ -1060,6 +1190,7 @@ impl App {
                 if let Some(player) = &self.tone_player {
                     player.play(digit);
                 }
+                self.dialpad_flash = Some((digit, Instant::now()));
                 self.handle_dialpad(digit)
             }
             Message::CallPressed => self.handle_call_pressed(),
@@ -1115,10 +1246,28 @@ impl App {
                                 tracing::warn!(%e, "failed to start secondary audio output");
                             }
                         }
+                        if let Some(target) = self.settings.secondary_input_target.clone() {
+                            let label = format!("OxideSip Acct{} Line {} (secondary in)", account + 1, idx + 1);
+                            if let Err(e) = session.set_secondary_input(Some(target), label) {
+                                tracing::warn!(%e, "failed to start secondary audio input");
+                            }
+                        }
                     }
                     *media = session;
-                    if let CallUiState::Active { media, on_hold, avatar_glow, .. } = &mut acc.lines[idx] {
+                    if let CallUiState::Active {
+                        media,
+                        on_hold,
+                        avatar_glow,
+                        secondary_input_on,
+                        ..
+                    } = &mut acc.lines[idx]
+                    {
                         avatar_glow.go_mut(avatar_live(media.is_some(), *on_hold), Instant::now());
+                        if let Some(session) = media.as_ref()
+                            && *secondary_input_on
+                        {
+                            session.set_secondary_input_enabled(true);
+                        }
                     }
                 }
                 // else: call already ended before the pipeline finished
@@ -1247,13 +1396,33 @@ impl App {
                 Task::none()
             }
             Message::DeleteAccountPressed(index) => {
+                if let Some(acc) = self.accounts.get(index) {
+                    // Removing the account cancels its `SoftphoneCore` task
+                    // outright (see `bridge::subscription`), with no
+                    // graceful teardown of whatever dialogs it still had —
+                    // without sending these first, any non-idle line's call
+                    // is dropped purely on our side, leaving the far
+                    // end/PBX thinking it's still up until it times out.
+                    for line in &acc.lines {
+                        match line {
+                            CallUiState::Incoming { id, .. } => {
+                                acc.send_command(CoreCommand::RejectCall(id.clone()));
+                            }
+                            CallUiState::Outgoing { id, .. }
+                            | CallUiState::EarlyMedia { id, .. }
+                            | CallUiState::Active { id, .. } => {
+                                acc.send_command(CoreCommand::HangUp(id.clone()));
+                            }
+                            CallUiState::Idle => {}
+                        }
+                    }
+                }
                 if index < self.accounts.len() {
                     self.accounts.remove(index);
                     if self.selected_account >= self.accounts.len() {
                         self.selected_account = self.accounts.len().saturating_sub(1);
                     }
                     if self.editing_account == Some(index) {
-                        self.editing_account = self.accounts.is_empty().then_some(0).or(Some(0));
                         self.editing_account = if self.accounts.is_empty() { None } else { Some(0) };
                         self.sip_settings_form = self
                             .accounts
@@ -1346,12 +1515,24 @@ impl App {
                     self.settings_window = Some(id);
                     open_task.discard()
                 };
-                Task::batch([window_task, self.refresh_secondary_output_targets()])
+                Task::batch([
+                    window_task,
+                    self.refresh_secondary_output_targets(),
+                    self.refresh_secondary_input_targets(),
+                ])
             }
-            Message::RefreshSecondaryOutputTargets => self.refresh_secondary_output_targets(),
+            Message::RefreshSecondaryOutputTargets => Task::batch([
+                self.refresh_secondary_output_targets(),
+                self.refresh_secondary_input_targets(),
+            ]),
             Message::SecondaryOutputTargetsLoaded(sinks, app_streams) => {
                 self.output_devices = sinks;
                 self.app_capture_streams = app_streams;
+                Task::none()
+            }
+            Message::SecondaryInputTargetsLoaded(inputs, app_streams) => {
+                self.input_devices = inputs;
+                self.app_playback_streams = app_streams;
                 Task::none()
             }
             Message::SettingsDndToggled(enabled) => {
@@ -1414,6 +1595,10 @@ impl App {
                 self.settings_form.secondary_output_target = target;
                 Task::none()
             }
+            Message::SettingsSecondaryInputChanged(target) => {
+                self.settings_form.secondary_input_target = target;
+                Task::none()
+            }
             Message::SettingsSavePressed => {
                 self.settings = AppSettings {
                     dnd: self.settings_form.dnd,
@@ -1424,6 +1609,7 @@ impl App {
                     recording_enabled: self.settings_form.recording_enabled,
                     recording_path: self.settings_form.recording_path.trim().to_string(),
                     secondary_output_target: self.settings_form.secondary_output_target.clone(),
+                    secondary_input_target: self.settings_form.secondary_input_target.clone(),
                 };
                 if let Err(e) = app_settings::save(&self.settings) {
                     tracing::warn!(%e, "failed to save settings");
@@ -1529,6 +1715,25 @@ impl App {
                 }
                 Task::none()
             }
+            Message::ToggleSecondaryInputInjection => {
+                if self.settings.secondary_input_target.is_some()
+                    && let Some(acc) = self.selected_mut()
+                {
+                    let idx = acc.selected_idx();
+                    if let CallUiState::Active {
+                        media,
+                        secondary_input_on,
+                        ..
+                    } = &mut acc.lines[idx]
+                    {
+                        *secondary_input_on = !*secondary_input_on;
+                        if let Some(session) = media {
+                            session.set_secondary_input_enabled(*secondary_input_on);
+                        }
+                    }
+                }
+                Task::none()
+            }
             Message::OutputVolumeChanged(gain) => {
                 if let Some(acc) = self.selected_mut() {
                     let idx = acc.selected_idx();
@@ -1569,6 +1774,7 @@ impl App {
 
             Message::TabSelected(screen) => {
                 self.screen = screen;
+                self.tab_animations.select(screen);
                 Task::none()
             }
             Message::DialNumber(number) => {
@@ -1580,6 +1786,7 @@ impl App {
                 }
                 self.dial_input = number;
                 self.screen = Screen::Dialer;
+                self.tab_animations.select(Screen::Dialer);
                 self.handle_call_pressed()
             }
             Message::RedialPressed => {
@@ -1676,9 +1883,14 @@ impl App {
                 };
                 if next == ',' {
                     // A pause: nothing to send yet, just wait and advance.
+                    // Each comma is its own queued step (see `split_dial_
+                    // input`'s doc comment — consecutive commas aren't
+                    // collapsed), so a run of N commas in a row stacks N of
+                    // these waits back to back, giving an N-second pause —
+                    // e.g. "5,,,2" sends `5`, waits 3s, then sends `2`.
                     let call_id = id.clone();
                     return Task::future(async move {
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        tokio::time::sleep(Duration::from_millis(1000)).await;
                         Message::PostDialAdvance(account, call_id)
                     });
                 }
@@ -1733,12 +1945,17 @@ impl App {
                 });
                 if has_other_active {
                     acc.pending_join = Some(selected_line);
+                    self.error = None;
                 } else {
                     self.error = Some("no other active call to join".to_string());
                 }
                 Task::none()
             }
             Message::SplitCallPressed => {
+                // Split is the corrective action for "can't hold a joined
+                // call — split it first" (see `HoldToggled`) — clear it
+                // unconditionally so it doesn't linger once followed.
+                self.error = None;
                 if let Some(acc) = self.selected_mut() {
                     let idx = acc.selected_idx();
                     if let Some(partner) = acc.joined[idx] {
@@ -1755,7 +1972,10 @@ impl App {
                     l != selected_line && matches!(acc.lines[line_idx(l)], CallUiState::Idle)
                 });
                 match free {
-                    Some(line) => self.select_line(line),
+                    Some(line) => {
+                        self.error = None;
+                        self.select_line(line)
+                    }
                     None => {
                         self.error = Some("all lines are busy".to_string());
                         Task::none()
@@ -1823,6 +2043,30 @@ impl App {
                     self.contacts.remove(index);
                     self.persist_contacts();
                 }
+                Task::none()
+            }
+            Message::ClearHistoryPressed => {
+                self.call_history.clear();
+                self.history_context_menu = None;
+                history::save(&self.call_history);
+                Task::none()
+            }
+            Message::HistoryContextMenuToggled(index) => {
+                self.history_context_menu =
+                    if self.history_context_menu == Some(index) { None } else { Some(index) };
+                Task::none()
+            }
+            Message::AddHistoryEntryToContacts(index) => {
+                if let Some(entry) = self.call_history.get(index) {
+                    self.contact_form = Some(ContactForm {
+                        name: String::new(),
+                        number: entry.number.clone(),
+                        editing_index: None,
+                    });
+                    self.screen = Screen::Contacts;
+                    self.tab_animations.select(Screen::Contacts);
+                }
+                self.history_context_menu = None;
                 Task::none()
             }
             Message::ContactsIoPathChanged(path) => {
@@ -2186,6 +2430,28 @@ impl App {
         })
     }
 
+    /// Input counterpart to `refresh_secondary_output_targets` — see that
+    /// method's doc comment for why this is re-scanned on demand rather than
+    /// cached from boot/the Audio settings window.
+    fn refresh_secondary_input_targets(&self) -> Task<Message> {
+        Task::future(async {
+            let (inputs, app_streams) = tokio::task::spawn_blocking(|| {
+                let inputs = softphone_media::devices::list_input_devices().unwrap_or_else(|e| {
+                    tracing::warn!(%e, "failed to list input devices");
+                    Vec::new()
+                });
+                let app_streams = softphone_media::devices::list_app_playback_streams().unwrap_or_else(|e| {
+                    tracing::warn!(%e, "failed to list app playback streams");
+                    Vec::new()
+                });
+                (inputs, app_streams)
+            })
+            .await
+            .unwrap_or_default();
+            Message::SecondaryInputTargetsLoaded(inputs, app_streams)
+        })
+    }
+
     fn handle_audio_settings_save(&mut self) {
         let srtp = self.audio_settings_form.srtp;
         let codecs = self.audio_settings_form.codecs.clone();
@@ -2343,6 +2609,7 @@ impl App {
                             input_volume: 1.0,
                             on_hold: false,
                             pre_hold_output_volume: 1.0,
+                            secondary_input_on: false,
                             transfer_input: None,
                             post_dial,
                             avatar_glow,
@@ -2399,6 +2666,7 @@ impl App {
                     input_volume: 1.0,
                     on_hold: false,
                     pre_hold_output_volume: 1.0,
+                    secondary_input_on: false,
                     transfer_input: None,
                     post_dial,
                     avatar_glow: iced::Animation::new(false).quick(),
