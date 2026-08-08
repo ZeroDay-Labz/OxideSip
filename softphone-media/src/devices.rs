@@ -41,6 +41,19 @@ pub fn list_app_capture_streams() -> Result<Vec<AudioDevice>, MediaError> {
     list_devices("Stream/Input/Audio")
 }
 
+/// Currently-active application audio *playback* streams (PipeWire class
+/// `Stream/Output/Audio`) — e.g. what Discord itself is playing out (other
+/// voice-channel members), as opposed to `list_app_capture_streams`'s "what
+/// Discord is listening on." This is the secondary-*input* counterpart:
+/// mixing an app's own playback into what we send as RTP. Deliberately a
+/// different media class from `list_app_capture_streams` — sourcing from an
+/// app's *capture* stream here would mean capturing our own audio right back
+/// out after `set_secondary_output` (or a real mic) fed it in, an instant
+/// feedback loop.
+pub fn list_app_playback_streams() -> Result<Vec<AudioDevice>, MediaError> {
+    list_devices("Stream/Output/Audio")
+}
+
 fn pw_err(e: pw::Error) -> MediaError {
     MediaError::PipeWire(e.to_string())
 }

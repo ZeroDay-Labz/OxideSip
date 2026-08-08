@@ -369,6 +369,123 @@ fn run_playback_only(
     Ok(())
 }
 
+struct SecondaryCaptureUserData {
+    prod: HeapProd<i16>,
+}
+
+/// Spawns a capture-*only* PipeWire stream on its own thread — the mirror of
+/// `spawn_playback`, used for `session.rs`'s secondary audio *input*: mixing
+/// another app's own playback stream (e.g. Discord's "what other members are
+/// saying," `Stream/Output/Audio` — never that app's *capture* class, which
+/// would loop our own injected audio back on itself) into what gets sent as
+/// RTP. `target` (a PipeWire node's `node.name`) pins the stream to that
+/// app's playback node; `None` follows the system default capture device.
+pub fn spawn_capture(
+    prod: HeapProd<i16>,
+    target: Option<String>,
+    label: String,
+) -> Result<PwThreadHandle, MediaError> {
+    ensure_init();
+
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<PwCommand>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    let thread = std::thread::Builder::new()
+        .name("pipewire-io-secondary-in".into())
+        .spawn(move || {
+            if let Err(e) = run_capture_only(shutdown_rx, prod, target, &label, &ready_tx) {
+                let _ = ready_tx.send(Err(e.to_string()));
+            }
+        })
+        .map_err(MediaError::Io)?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(PwThreadHandle {
+            thread: Some(thread),
+            shutdown: shutdown_tx,
+        }),
+        Ok(Err(e)) => Err(MediaError::PipeWire(e)),
+        Err(_) => Err(MediaError::PipeWire(
+            "pipewire thread exited before starting".into(),
+        )),
+    }
+}
+
+/// Mirrors `run_playback_only`'s shape, but for a capture-only stream — the
+/// `process` callback here is the same as `run`'s primary capture stream
+/// (just pushing decoded samples into a ring buffer), minus the mic-mute/
+/// gain/level-meter handling that's specific to the real local microphone.
+fn run_capture_only(
+    shutdown_rx: std::sync::mpsc::Receiver<PwCommand>,
+    prod: HeapProd<i16>,
+    target: Option<String>,
+    label: &str,
+    ready_tx: &std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<(), MediaError> {
+    // SAFETY: `pw::init()` has already been called via `ensure_init()` in
+    // `spawn_capture()`, before this function runs.
+    let thread_loop = unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io-secondary-in"), None) }
+        .map_err(pw_err)?;
+    let context_props = properties! { *pw::keys::CONFIG_NAME => "client.conf" };
+    let context = pw::context::ContextRc::new(&thread_loop, Some(context_props)).map_err(pw_err)?;
+    let core = context.connect_rc(None).map_err(pw_err)?;
+
+    let capture_stream = pw::stream::StreamBox::new(
+        &core,
+        "OxideSip secondary capture",
+        stream_properties("Capture", target.as_deref(), label),
+    )
+    .map_err(pw_err)?;
+
+    let capture_user_data = SecondaryCaptureUserData { prod };
+
+    let _capture_listener = capture_stream
+        .add_local_listener_with_user_data(capture_user_data)
+        .process(|stream, user_data| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let data = &mut datas[0];
+            let n_bytes = data.chunk().size() as usize;
+            let Some(samples) = data.data() else {
+                return;
+            };
+            let n_bytes = n_bytes.min(samples.len());
+            let iter = samples[..n_bytes]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]));
+            user_data.prod.push_iter(iter);
+        })
+        .register()
+        .map_err(pw_err)?;
+
+    let capture_format = audio_format_pod()?;
+    let mut capture_params = [Pod::from_bytes(&capture_format)
+        .ok_or_else(|| MediaError::PipeWire("invalid capture format pod".into()))?];
+    capture_stream
+        .connect(
+            spa::utils::Direction::Input,
+            None,
+            pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::MAP_BUFFERS
+                | pw::stream::StreamFlags::RT_PROCESS,
+            &mut capture_params,
+        )
+        .map_err(pw_err)?;
+
+    let _ = ready_tx.send(Ok(()));
+    thread_loop.start();
+
+    let _ = shutdown_rx.recv();
+    thread_loop.stop();
+
+    Ok(())
+}
+
 fn audio_format_pod() -> Result<Vec<u8>, MediaError> {
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::S16LE);

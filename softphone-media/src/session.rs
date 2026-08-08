@@ -96,6 +96,20 @@ pub struct MediaSession {
     /// The playback-only PipeWire stream feeding from `secondary_relay`, if
     /// a secondary output target is currently configured.
     secondary_pw: Mutex<Option<PwThreadHandle>>,
+    /// Set by `set_secondary_input` when a secondary input target (e.g.
+    /// Discord's own playback stream) is configured: a capture-only
+    /// PipeWire stream feeds decoded samples in here for `send_loop` to
+    /// mix into the outgoing mic audio, gated by `secondary_input_enabled`.
+    secondary_input_relay: Arc<Mutex<Option<HeapCons<i16>>>>,
+    /// The capture-only PipeWire stream feeding `secondary_input_relay`, if
+    /// a secondary input target is currently configured.
+    secondary_input_pw: Mutex<Option<PwThreadHandle>>,
+    /// Live on/off switch for mixing `secondary_input_relay` into the
+    /// outgoing call audio — separate from whether a target is *configured*
+    /// (which requires tearing down/spawning a PipeWire stream) so the
+    /// user's "turn it off and on at will" toggle is instant, never
+    /// reconnecting anything.
+    secondary_input_enabled: Arc<AtomicBool>,
     /// The negotiated RFC 4733 `telephone-event` payload type, if any.
     /// `None` means this call never negotiated RTP-based DTMF, so
     /// `send_dtmf` always returns `false` (caller falls back to SIP INFO).
@@ -208,6 +222,8 @@ impl MediaSession {
         let bridge_relay_in: Arc<Mutex<Option<HeapCons<i16>>>> = Arc::new(Mutex::new(None));
         let record_mixer: Arc<Mutex<Option<RecordMixer>>> = Arc::new(Mutex::new(None));
         let secondary_relay: Arc<Mutex<Option<HeapProd<i16>>>> = Arc::new(Mutex::new(None));
+        let secondary_input_relay: Arc<Mutex<Option<HeapCons<i16>>>> = Arc::new(Mutex::new(None));
+        let secondary_input_enabled = Arc::new(AtomicBool::new(false));
         let (dtmf_send_tx, dtmf_send_rx) = mpsc::unbounded_channel::<DtmfSend>();
         let received_dtmf: Arc<Mutex<VecDeque<char>>> = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -220,11 +236,14 @@ impl MediaSession {
             notify,
             bridge_relay_in.clone(),
             record_mixer.clone(),
+            secondary_input_relay.clone(),
+            secondary_input_enabled.clone(),
             dtmf_send_rx,
             cancel.child_token(),
         ));
         let recv_task = tokio::spawn(recv_loop(
             socket,
+            remote_addr.ip(),
             payload_type,
             telephone_event_pt,
             playback_prod,
@@ -251,6 +270,9 @@ impl MediaSession {
             record_mixer,
             secondary_relay,
             secondary_pw: Mutex::new(None),
+            secondary_input_relay,
+            secondary_input_pw: Mutex::new(None),
+            secondary_input_enabled,
             telephone_event_pt,
             dtmf_send_tx,
             received_dtmf,
@@ -260,14 +282,19 @@ impl MediaSession {
     /// Starts accumulating a recording of this call — safe to call multiple
     /// times (each call resets to a fresh empty recording).
     pub fn start_recording(&self) {
-        *self.record_mixer.lock().unwrap() = Some(RecordMixer::default());
+        if let Ok(mut mixer) = self.record_mixer.lock() {
+            *mixer = Some(RecordMixer::default());
+        }
     }
 
     /// Stops recording and returns the accumulated mono 8kHz PCM samples,
     /// if recording was active — `None` if `start_recording` was never
-    /// called (or was already stopped) for this session.
+    /// called (or was already stopped) for this session, or if the lock is
+    /// poisoned (a degraded no-op, same as every other lock in this file,
+    /// rather than propagating a panic from one poisoned call's state into
+    /// every future call to this method).
     pub fn stop_recording(&self) -> Option<Vec<i16>> {
-        self.record_mixer.lock().unwrap().take().map(|m| m.samples)
+        self.record_mixer.lock().ok()?.take().map(|m| m.samples)
     }
 
     /// Starts, retargets, or stops streaming the far end's decoded voice to
@@ -277,19 +304,66 @@ impl MediaSession {
     /// in the UI's picker). Safe to call repeatedly, including switching
     /// straight from one target to another.
     pub fn set_secondary_output(&self, target: Option<String>, label: String) -> Result<(), MediaError> {
-        if let Some(handle) = self.secondary_pw.lock().unwrap().take() {
+        if let Ok(mut guard) = self.secondary_pw.lock()
+            && let Some(handle) = guard.take()
+        {
             handle.stop();
         }
-        *self.secondary_relay.lock().unwrap() = None;
+        if let Ok(mut relay) = self.secondary_relay.lock() {
+            *relay = None;
+        }
 
         let Some(target) = target else {
             return Ok(());
         };
         let (prod, cons) = HeapRb::<i16>::new(RING_CAPACITY).split();
         let handle = pipewire_io::spawn_playback(cons, Some(target), label)?;
-        *self.secondary_relay.lock().unwrap() = Some(prod);
-        *self.secondary_pw.lock().unwrap() = Some(handle);
+        if let Ok(mut relay) = self.secondary_relay.lock() {
+            *relay = Some(prod);
+        }
+        if let Ok(mut guard) = self.secondary_pw.lock() {
+            *guard = Some(handle);
+        }
         Ok(())
+    }
+
+    /// Starts, retargets, or stops mixing another app's own playback stream
+    /// (e.g. Discord's "what other members are saying") into this call's
+    /// outgoing audio — the input counterpart to `set_secondary_output`.
+    /// `target` is a PipeWire node's `node.name`, of `Stream/Output/Audio`
+    /// class (see `list_app_playback_streams`'s doc comment for why that
+    /// class specifically); `None` tears the stream down. Mixing itself is
+    /// still gated by `secondary_input_enabled` — configuring a target here
+    /// doesn't start injecting audio on its own.
+    pub fn set_secondary_input(&self, target: Option<String>, label: String) -> Result<(), MediaError> {
+        if let Ok(mut guard) = self.secondary_input_pw.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.stop();
+        }
+        if let Ok(mut relay) = self.secondary_input_relay.lock() {
+            *relay = None;
+        }
+
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let (prod, cons) = HeapRb::<i16>::new(RING_CAPACITY).split();
+        let handle = pipewire_io::spawn_capture(prod, Some(target), label)?;
+        if let Ok(mut relay) = self.secondary_input_relay.lock() {
+            *relay = Some(cons);
+        }
+        if let Ok(mut guard) = self.secondary_input_pw.lock() {
+            *guard = Some(handle);
+        }
+        Ok(())
+    }
+
+    /// Live on/off switch for `set_secondary_input`'s mixing into outgoing
+    /// audio — cheap, no PipeWire reconnect, safe to call at any point
+    /// during a live call (this is what backs the UI's quick toggle).
+    pub fn set_secondary_input_enabled(&self, enabled: bool) {
+        self.secondary_input_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Bridges this call with `other` into a local 3-way conference: audio
@@ -305,10 +379,18 @@ impl MediaSession {
         let (prod_other_to_self, cons_other_to_self) =
             HeapRb::<i16>::new(BRIDGE_RING_CAPACITY).split();
 
-        *self.bridge_relay_out.lock().unwrap() = Some(prod_self_to_other);
-        *other.bridge_relay_in.lock().unwrap() = Some(cons_self_to_other);
-        *other.bridge_relay_out.lock().unwrap() = Some(prod_other_to_self);
-        *self.bridge_relay_in.lock().unwrap() = Some(cons_other_to_self);
+        if let Ok(mut relay) = self.bridge_relay_out.lock() {
+            *relay = Some(prod_self_to_other);
+        }
+        if let Ok(mut relay) = other.bridge_relay_in.lock() {
+            *relay = Some(cons_self_to_other);
+        }
+        if let Ok(mut relay) = other.bridge_relay_out.lock() {
+            *relay = Some(prod_other_to_self);
+        }
+        if let Ok(mut relay) = self.bridge_relay_in.lock() {
+            *relay = Some(cons_other_to_self);
+        }
     }
 
     /// Tears down this call's half of a conference bridge — call on both
@@ -316,8 +398,12 @@ impl MediaSession {
     /// split back apart) so a stale relay doesn't silently keep forwarding
     /// audio nobody asked for anymore.
     pub fn unjoin(&self) {
-        *self.bridge_relay_out.lock().unwrap() = None;
-        *self.bridge_relay_in.lock().unwrap() = None;
+        if let Ok(mut relay) = self.bridge_relay_out.lock() {
+            *relay = None;
+        }
+        if let Ok(mut relay) = self.bridge_relay_in.lock() {
+            *relay = None;
+        }
     }
 
     /// Clean, explicit teardown: cancel + join the tokio tasks, then join
@@ -333,8 +419,12 @@ impl MediaSession {
         if let Some(h) = self.pw_handle.take() {
             let _ = tokio::task::spawn_blocking(move || h.stop()).await;
         }
-        let secondary_pw = self.secondary_pw.lock().unwrap().take();
+        let secondary_pw = self.secondary_pw.lock().ok().and_then(|mut g| g.take());
         if let Some(h) = secondary_pw {
+            let _ = tokio::task::spawn_blocking(move || h.stop()).await;
+        }
+        let secondary_input_pw = self.secondary_input_pw.lock().ok().and_then(|mut g| g.take());
+        if let Some(h) = secondary_input_pw {
             let _ = tokio::task::spawn_blocking(move || h.stop()).await;
         }
     }
@@ -389,7 +479,10 @@ impl MediaSession {
     /// Drains DTMF digits the peer has sent via RFC 4733 since the last call
     /// — poll this the same way `input_level`/`output_level` are polled.
     pub fn drain_received_dtmf(&self) -> Vec<char> {
-        self.received_dtmf.lock().unwrap().drain(..).collect()
+        self.received_dtmf
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -424,6 +517,8 @@ async fn send_loop(
     notify: Arc<Notify>,
     bridge_relay_in: Arc<Mutex<Option<HeapCons<i16>>>>,
     record_mixer: Arc<Mutex<Option<RecordMixer>>>,
+    secondary_input_relay: Arc<Mutex<Option<HeapCons<i16>>>>,
+    secondary_input_enabled: Arc<AtomicBool>,
     mut dtmf_rx: mpsc::UnboundedReceiver<DtmfSend>,
     cancel: CancellationToken,
 ) {
@@ -473,6 +568,25 @@ async fn send_loop(
                             scratch[i] = (scratch[i] as i32 + foreign[i] as i32)
                                 .clamp(i16::MIN as i32, i16::MAX as i32)
                                 as i16;
+                        }
+                    }
+                    // Secondary input (e.g. Discord's own playback, mixed
+                    // in so the SIP peer can hear it too). Always drained
+                    // when present so a disabled/backgrounded relay never
+                    // backs up into stale audio by the time it's re-enabled
+                    // — but only actually mixed into what gets sent when
+                    // the user's toggle is on.
+                    if let Ok(mut relay) = secondary_input_relay.lock()
+                        && let Some(cons) = relay.as_mut()
+                    {
+                        let mut injected = [0i16; SAMPLES_PER_PACKET];
+                        let n = cons.pop_slice(&mut injected[..got]);
+                        if secondary_input_enabled.load(Ordering::Relaxed) {
+                            for i in 0..n {
+                                scratch[i] = (scratch[i] as i32 + injected[i] as i32)
+                                    .clamp(i16::MIN as i32, i16::MAX as i32)
+                                    as i16;
+                            }
                         }
                     }
                     if let Ok(mut mixer) = record_mixer.lock()
@@ -533,6 +647,7 @@ async fn send_loop(
 #[allow(clippy::too_many_arguments)]
 async fn recv_loop(
     socket: Arc<UdpSocket>,
+    remote_ip: std::net::IpAddr,
     payload_type: u8,
     telephone_event_pt: Option<u8>,
     mut playback_prod: ringbuf::HeapProd<i16>,
@@ -556,15 +671,27 @@ async fn recv_loop(
         tokio::select! {
             _ = cancel.cancelled() => break,
             result = socket.recv_from(&mut buf) => {
-                let Ok((n, _from)) = result else { continue };
+                let Ok((n, from)) = result else { continue };
+                // Only the socket itself is bound to our local port — it's
+                // never `connect()`-ed to `remote_addr`, so without this it
+                // would accept and decode/play audio (or forge DTMF events)
+                // from *any* host that can reach this ephemeral UDP port,
+                // not just the peer this call actually negotiated with.
+                // Comparing IP only (not port) tolerates a peer behind a
+                // NAT that rewrites its source port mid-call.
+                if from.ip() != remote_ip {
+                    continue;
+                }
                 let Ok((header, payload)) = RtpHeader::decode(&buf[..n]) else { continue };
                 if Some(header.payload_type) == telephone_event_pt {
                     if let [event_code, byte1, ..] = *payload {
                         let end = byte1 & 0x80 != 0;
                         let key = (event_code, header.timestamp);
                         if end && last_surfaced_dtmf != Some(key) {
-                            if let Some(digit) = event_code_to_digit(event_code) {
-                                received_dtmf.lock().unwrap().push_back(digit);
+                            if let Some(digit) = event_code_to_digit(event_code)
+                                && let Ok(mut q) = received_dtmf.lock()
+                            {
+                                q.push_back(digit);
                             }
                             last_surfaced_dtmf = Some(key);
                         }
