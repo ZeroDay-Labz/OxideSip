@@ -1,6 +1,7 @@
 mod app;
 mod app_settings;
 mod audio_devices;
+mod branding;
 mod bridge;
 mod contacts;
 mod history;

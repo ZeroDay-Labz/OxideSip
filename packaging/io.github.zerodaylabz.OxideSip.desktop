@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=OxideSip
+GenericName=SIP Softphone
+Comment=Native Linux SIP softphone with PipeWire audio
+Exec=oxidesip %u
+Icon=io.github.zerodaylabz.OxideSip
+Terminal=false
+Categories=Network;Telephony;
+Keywords=sip;voip;phone;softphone;pbx;asterisk;freepbx;call;
+MimeType=x-scheme-handler/sip;x-scheme-handler/tel;
+StartupNotify=true
+StartupWMClass=io.github.zerodaylabz.OxideSip

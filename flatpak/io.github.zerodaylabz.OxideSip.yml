@@ -54,9 +54,9 @@ modules:
     build-commands:
       - cargo build --release -p softphone-ui
       - install -Dm755 target/release/oxidesip /app/bin/oxidesip
-      - install -Dm644 flatpak/io.github.zerodaylabz.OxideSip.desktop
+      - install -Dm644 packaging/io.github.zerodaylabz.OxideSip.desktop
         /app/share/applications/io.github.zerodaylabz.OxideSip.desktop
-      - install -Dm644 flatpak/io.github.zerodaylabz.OxideSip.svg
+      - install -Dm644 packaging/io.github.zerodaylabz.OxideSip.svg
         /app/share/icons/hicolor/scalable/apps/io.github.zerodaylabz.OxideSip.svg
     sources:
       - type: dir

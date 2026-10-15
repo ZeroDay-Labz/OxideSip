@@ -2,6 +2,7 @@
 name = "softphone-ui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description.workspace = true
 homepage.workspace = true
@@ -15,6 +16,9 @@ repository.workspace = true
 name = "oxidesip"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 softphone-core = { path = "../softphone-core" }
 softphone-media = { path = "../softphone-media" }
@@ -25,14 +29,17 @@ tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.9"
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "svg"] }
 iced_fonts = { version = "0.3", features = ["bootstrap"] }
 rfd = "0.17.2"
 dirs = "6.0.0"
 
-# --- Phase 4 (future work) ---
-# zbus = "5.18"          # StatusNotifierItem tray service, minimize-to-tray on close
-# notify-rust = "4.18"   # KDE/libnotify call popups
+# PNG decode for the embedded window icon (`branding::app_icon`) and PNG
+# encode for `--screenshot`; codecs other than PNG are not needed.
+image = { version = "0.25", default-features = false, features = ["png"] }
+clap = { version = "4", features = ["derive"] }
+# Desktop notification (with Answer/Decline actions) for incoming calls.
+notify-rust = "4"
 
 # Consumed by `cargo generate-rpm` (see .github/workflows/release.yml) to
 # build a Fedora-installable RPM from the release binary. Deliberately
@@ -52,8 +59,8 @@ dirs = "6.0.0"
 name = "oxidesip"
 assets = [
     { source = "target/release/oxidesip", dest = "/usr/bin/oxidesip", mode = "755" },
-    { source = "flatpak/io.github.zerodaylabz.OxideSip.desktop", dest = "/usr/share/applications/io.github.zerodaylabz.OxideSip.desktop", mode = "644" },
-    { source = "flatpak/io.github.zerodaylabz.OxideSip.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
+    { source = "packaging/io.github.zerodaylabz.OxideSip.desktop", dest = "/usr/share/applications/io.github.zerodaylabz.OxideSip.desktop", mode = "644" },
+    { source = "packaging/icons/256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
 ]
 
 # Consumed by `cargo deb` (see .github/workflows/release.yml) to build a
@@ -66,13 +73,13 @@ assets = [
 # paths relative to *this crate's own directory* regardless of CWD (verified
 # by running `cargo deb -p softphone-ui --no-build` from the repo root — the
 # `target/release/...` asset resolved fine via cargo's own target-dir
-# metadata, but the plain repo-relative `flatpak/...` paths did not, and
-# needed `../` to reach the repo-root `flatpak/` directory from here).
+# metadata, but the plain repo-relative `packaging/...` paths did not, and
+# needed `../` to reach the repo-root `packaging/` directory from here).
 [package.metadata.deb]
 name = "oxidesip"
 copyright = "2026, ZeroDay-Labz"
 assets = [
     ["target/release/oxidesip", "usr/bin/", "755"],
-    ["../flatpak/io.github.zerodaylabz.OxideSip.desktop", "usr/share/applications/", "644"],
-    ["../flatpak/io.github.zerodaylabz.OxideSip.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../packaging/io.github.zerodaylabz.OxideSip.desktop", "usr/share/applications/", "644"],
+    ["../packaging/icons/256.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
 ]

@@ -2,6 +2,10 @@
 name = "softphone-media"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 tokio = { workspace = true }

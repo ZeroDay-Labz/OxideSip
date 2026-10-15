@@ -5,6 +5,7 @@ members = ["softphone-core", "softphone-media", "softphone-ui"]
 [workspace.package]
 version = "0.1.8"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "A professional-grade SIP softphone for Linux"
 homepage = "https://github.com/ZeroDay-Labz/OxideSip"
@@ -18,3 +19,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Lints shared by every crate (`[lints] workspace = true` below in each one).
+# `result_large_err`: CoreError wraps rsipstack's error type, which is large;
+# boxing it would change the public core API for no runtime benefit.
+# `chunks_exact_to_as_chunks`: purely stylistic, and the only hits are in the
+# audio path (softphone-media/src/pipewire_io.rs), which is frozen.
+[workspace.lints.clippy]
+result_large_err = "allow"
+chunks_exact_to_as_chunks = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

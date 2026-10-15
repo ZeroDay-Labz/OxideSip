@@ -2,7 +2,7 @@ use crate::app_settings::{self, AppSettings};
 use crate::audio_devices::{self, AudioDeviceConfig};
 use crate::contacts::{self, Contact};
 use crate::history;
-use crate::{bridge, icon, view};
+use crate::{branding, bridge, icon, view};
 use iced::{Element, Subscription, Task, window};
 use softphone_core::config::{DtmfMode, PREFERRED_CODECS, PreferredCodec, SipAccountConfig, SipTransport};
 use softphone_core::events::{CallId, CallState, CoreCommand, CoreEvent, RemoteMediaInfo};
@@ -846,11 +846,8 @@ impl App {
         // that's always low enough for either mode needs no such
         // coordination — `resize_for_compact` is now just one resize call.
         let (main_window, open_task) = window::open(window::Settings {
-            size: MAIN_WINDOW_SIZE,
-            min_size: Some(COMPACT_WINDOW_MIN_SIZE),
             resizable: true,
-            position: window::Position::Centered,
-            ..Default::default()
+            ..branding::window_settings(MAIN_WINDOW_SIZE, Some(COMPACT_WINDOW_MIN_SIZE))
         });
 
         let audio_devices = audio_devices::load();
@@ -996,15 +993,15 @@ impl App {
 
     pub fn title(&self, window: window::Id) -> String {
         if self.incoming_call_window_ids.contains_key(&window) {
-            "OxideSip — Incoming Call".to_string()
+            format!("{} — Incoming Call", branding::APP_NAME)
         } else if Some(window) == self.sip_settings_window {
-            "OxideSip — SIP Setup".to_string()
+            format!("{} — SIP Setup", branding::APP_NAME)
         } else if Some(window) == self.audio_settings_window {
-            "OxideSip — Audio & Codecs".to_string()
+            format!("{} — Audio & Codecs", branding::APP_NAME)
         } else if Some(window) == self.settings_window {
-            "OxideSip — Settings".to_string()
+            format!("{} — Settings", branding::APP_NAME)
         } else {
-            "OxideSip".to_string()
+            branding::APP_NAME.to_string()
         }
     }
 
@@ -1100,11 +1097,9 @@ impl App {
                     // by call id), so simultaneous incoming calls across
                     // lines/accounts each get their own.
                     let (win_id, open_task) = window::open(window::Settings {
-                        size: iced::Size::new(360.0, 220.0),
                         resizable: false,
-                        position: window::Position::Centered,
                         level: window::Level::AlwaysOnTop,
-                        ..Default::default()
+                        ..branding::window_settings(iced::Size::new(380.0, 300.0), None)
                     });
                     self.incoming_call_windows.insert(id.clone(), (account, win_id));
                     self.incoming_call_window_ids.insert(win_id, (account, id));
@@ -1323,11 +1318,8 @@ impl App {
                     return window::gain_focus(id);
                 }
                 let (id, open_task) = window::open(window::Settings {
-                    size: SIP_SETTINGS_WINDOW_SIZE,
-                    min_size: Some(SIP_SETTINGS_WINDOW_MIN_SIZE),
                     resizable: true,
-                    position: window::Position::Centered,
-                    ..Default::default()
+                    ..branding::window_settings(SIP_SETTINGS_WINDOW_SIZE, Some(SIP_SETTINGS_WINDOW_MIN_SIZE))
                 });
                 self.sip_settings_window = Some(id);
                 open_task.discard()
@@ -1344,11 +1336,8 @@ impl App {
                     return window::gain_focus(id);
                 }
                 let (id, open_task) = window::open(window::Settings {
-                    size: AUDIO_SETTINGS_WINDOW_SIZE,
-                    min_size: Some(AUDIO_SETTINGS_WINDOW_MIN_SIZE),
                     resizable: true,
-                    position: window::Position::Centered,
-                    ..Default::default()
+                    ..branding::window_settings(AUDIO_SETTINGS_WINDOW_SIZE, Some(AUDIO_SETTINGS_WINDOW_MIN_SIZE))
                 });
                 self.audio_settings_window = Some(id);
                 let device_task = Task::future(async {
@@ -1529,11 +1518,8 @@ impl App {
                     window::gain_focus(id)
                 } else {
                     let (id, open_task) = window::open(window::Settings {
-                        size: SETTINGS_WINDOW_SIZE,
-                        min_size: Some(SETTINGS_WINDOW_MIN_SIZE),
                         resizable: true,
-                        position: window::Position::Centered,
-                        ..Default::default()
+                        ..branding::window_settings(SETTINGS_WINDOW_SIZE, Some(SETTINGS_WINDOW_MIN_SIZE))
                     });
                     self.settings_window = Some(id);
                     open_task.discard()
