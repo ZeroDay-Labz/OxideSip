@@ -1,11 +1,11 @@
 use crate::config::{DtmfMode, SipAccountConfig};
 use crate::events::{CallId, CallState, CoreCommand, CoreEvent, LocalMediaInfo, RemoteMediaInfo};
 use crate::sdp;
+use rsipstack::dialog::DialogId;
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog::{Dialog, DialogState, TerminatedReason};
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
-use rsipstack::dialog::DialogId;
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{Header, Method, StatusCode, StatusCodeKind, Uri};
 use rsipstack::transaction::TransactionReceiver;
@@ -33,12 +33,7 @@ pub async fn incoming_request_loop(
 
         match tx.original.method {
             Method::Invite => {
-                match dialog_layer.get_or_create_server_invite(
-                    &tx,
-                    state_sender.clone(),
-                    None,
-                    Some(contact.clone()),
-                ) {
+                match dialog_layer.get_or_create_server_invite(&tx, state_sender.clone(), None, Some(contact.clone())) {
                     Ok(mut invite_dialog) => {
                         tokio::spawn(async move {
                             if let Err(e) = invite_dialog.handle(&mut tx).await {
@@ -176,8 +171,7 @@ async fn handle_dialog_state(
         DialogState::Calling(id) => {
             let Some(line) = tracker.first_free_line() else {
                 if let Some(Dialog::ServerInvite(dlg)) = dialog_layer.get_dialog(&id) {
-                    dlg.reject(Some(StatusCode::BusyHere), Some("Busy here".into()))
-                        .ok();
+                    dlg.reject(Some(StatusCode::BusyHere), Some("Busy here".into())).ok();
                 }
                 return;
             };
@@ -228,10 +222,7 @@ async fn handle_dialog_state(
                 },
             );
 
-            let remote = initial_request
-                .from_header()
-                .map(|h| h.to_string())
-                .unwrap_or_default();
+            let remote = initial_request.from_header().map(|h| h.to_string()).unwrap_or_default();
             event_tx
                 .send(CoreEvent::IncomingCall {
                     id: call_id,
@@ -370,18 +361,14 @@ fn terminated_reason_label(reason: &TerminatedReason) -> String {
         // this is the code path that actually needs to recognize "busy" for
         // the UI to play the real busy cadence (see `app.rs`'s
         // `CallState::Terminated` handling).
-        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
-            if *code == StatusCode::BusyHere =>
-        {
+        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code) if *code == StatusCode::BusyHere => {
             "busy".to_string()
         }
         // A few more common codes in plain English, for the same footer
         // readout — everything else still falls through to `code`'s own
         // `Display` (e.g. "488 Not Acceptable Here"), which is a real SIP
         // reason phrase and still readable, just not as casual as these.
-        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
-            if *code == StatusCode::NotFound =>
-        {
+        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code) if *code == StatusCode::NotFound => {
             "number not found".to_string()
         }
         TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
@@ -389,9 +376,7 @@ fn terminated_reason_label(reason: &TerminatedReason) -> String {
         {
             "unavailable".to_string()
         }
-        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
-            if *code == StatusCode::Forbidden =>
-        {
+        TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code) if *code == StatusCode::Forbidden => {
             "forbidden".to_string()
         }
         TerminatedReason::UacOther(code) | TerminatedReason::UasOther(code)
@@ -471,9 +456,8 @@ async fn handle_command(
                     return;
                 }
             };
-            let caller_uri = match Uri::try_from(
-                format!("sip:{}@{}", config.username, config.sip_server_host).as_str(),
-            ) {
+            let caller_uri = match Uri::try_from(format!("sip:{}@{}", config.username, config.sip_server_host).as_str())
+            {
                 Ok(uri) => uri,
                 Err(e) => {
                     event_tx
@@ -487,8 +471,7 @@ async fn handle_command(
                 }
             };
 
-            let preferred_payload_types: Vec<u8> =
-                config.preferred_codecs.iter().map(|c| c.payload_type()).collect();
+            let preferred_payload_types: Vec<u8> = config.preferred_codecs.iter().map(|c| c.payload_type()).collect();
             let local_offer = sdp::generate_offer(
                 local_rtp_port,
                 srtp,
@@ -519,8 +502,7 @@ async fn handle_command(
             // inline inside dialog_state_loop's select!, so awaiting a
             // blocking invite here would stall all other event/command
             // processing until the call is answered or fails.
-            let (client_dialog, join) = match dialog_layer.do_invite_async(opt, state_tx.clone())
-            {
+            let (client_dialog, join) = match dialog_layer.do_invite_async(opt, state_tx.clone()) {
                 Ok(res) => res,
                 Err(e) => {
                     warn!(error = %e, "failed to start outbound invite");
@@ -588,10 +570,7 @@ async fn handle_command(
             });
 
             event_tx
-                .send(CoreEvent::OutgoingCallStarted {
-                    id: sip_call_id,
-                    line,
-                })
+                .send(CoreEvent::OutgoingCallStarted { id: sip_call_id, line })
                 .await
                 .ok();
         }
@@ -620,16 +599,13 @@ async fn handle_command(
             // to the (pre-negotiation placeholder) `remote.payload_type` if
             // even that's somehow empty — the far end tolerating a
             // mismatch is still better than refusing the call outright.
-            let preferred_payload_types: Vec<u8> =
-                config.preferred_codecs.iter().map(|c| c.payload_type()).collect();
-            let answer_payload_type =
-                sdp::select_payload_type(&remote_payload_types, &preferred_payload_types)
-                    .unwrap_or(remote.payload_type);
+            let preferred_payload_types: Vec<u8> = config.preferred_codecs.iter().map(|c| c.payload_type()).collect();
+            let answer_payload_type = sdp::select_payload_type(&remote_payload_types, &preferred_payload_types)
+                .unwrap_or(remote.payload_type);
             // RFC 3264: an answer may only include what the offer included —
             // only advertise telephone-event back if the caller offered it
             // *and* our own mode allows it.
-            let answer_telephone_event =
-                remote_telephone_event_pt.is_some() && config.dtmf_mode != DtmfMode::InfoOnly;
+            let answer_telephone_event = remote_telephone_event_pt.is_some() && config.dtmf_mode != DtmfMode::InfoOnly;
             let local_offer = sdp::generate_offer(
                 local_rtp_port,
                 srtp,
@@ -678,28 +654,10 @@ async fn handle_command(
                 .ok();
         }
         CoreCommand::HoldCall(id) => {
-            handle_hold_resume(
-                dialog_layer,
-                tracker,
-                event_tx,
-                config,
-                local_media_addr,
-                id,
-                true,
-            )
-            .await;
+            handle_hold_resume(dialog_layer, tracker, event_tx, config, local_media_addr, id, true).await;
         }
         CoreCommand::ResumeCall(id) => {
-            handle_hold_resume(
-                dialog_layer,
-                tracker,
-                event_tx,
-                config,
-                local_media_addr,
-                id,
-                false,
-            )
-            .await;
+            handle_hold_resume(dialog_layer, tracker, event_tx, config, local_media_addr, id, false).await;
         }
         CoreCommand::BlindTransfer { id, target } => {
             let Some(current) = tracker.find(&id) else {
@@ -730,10 +688,7 @@ async fn handle_command(
                     dialog.hangup().await.ok();
                 });
             }
-            event_tx
-                .send(CoreEvent::TransferResult { id, ok })
-                .await
-                .ok();
+            event_tx.send(CoreEvent::TransferResult { id, ok }).await.ok();
         }
         CoreCommand::RejectCall(id) => {
             let Some(current) = tracker.find(&id) else {
@@ -741,8 +696,7 @@ async fn handle_command(
             };
             let dialog_id = current.dialog_id.clone();
             if let Some(Dialog::ServerInvite(dlg)) = dialog_layer.get_dialog(&dialog_id) {
-                dlg.reject(Some(StatusCode::BusyHere), Some("Busy here".into()))
-                    .ok();
+                dlg.reject(Some(StatusCode::BusyHere), Some("Busy here".into())).ok();
             }
             event_tx
                 .send(CoreEvent::CallStateChanged {
@@ -881,9 +835,7 @@ async fn handle_hold_resume(
         active_telephone_event,
     );
     let local_crypto_key = local_offer.crypto_key.clone();
-    let body = sdp::build_sdp(local_media_addr, &local_offer)
-        .to_string()
-        .into_bytes();
+    let body = sdp::build_sdp(local_media_addr, &local_offer).to_string().into_bytes();
     let headers = vec![Header::ContentType("application/sdp".into())];
 
     // `local_crypto_key` is *our own* freshly-generated offer, not something
@@ -929,9 +881,6 @@ async fn handle_hold_resume(
                 remote,
             }
         };
-        event_tx
-            .send(CoreEvent::CallStateChanged { id, state })
-            .await
-            .ok();
+        event_tx.send(CoreEvent::CallStateChanged { id, state }).await.ok();
     });
 }

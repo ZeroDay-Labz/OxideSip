@@ -58,10 +58,7 @@ pub async fn run_registration_loop(
                 let expires = registration.expires();
                 let rtt_ms = sent_at.elapsed().as_millis() as u32;
                 info!(expires, rtt_ms, "registered");
-                event_tx
-                    .send(CoreEvent::Registered { expires, rtt_ms })
-                    .await
-                    .ok();
+                event_tx.send(CoreEvent::Registered { expires, rtt_ms }).await.ok();
                 consecutive_auth_failures = 0;
                 backoff = INITIAL_BACKOFF;
                 Duration::from_secs((expires.max(4) as u64 * 3) / 4)
@@ -101,10 +98,7 @@ pub async fn run_registration_loop(
                 if consecutive_auth_failures >= MAX_CONSECUTIVE_AUTH_FAILURES {
                     event_tx
                         .send(CoreEvent::RegistrationHalted {
-                            reason: format!(
-                                "repeated {} — check username/password",
-                                resp.status_code
-                            ),
+                            reason: format!("repeated {} — check username/password", resp.status_code),
                         })
                         .await
                         .ok();
@@ -135,9 +129,7 @@ pub async fn run_registration_loop(
             Err(e) => {
                 warn!(error = %e, "registration error");
                 event_tx
-                    .send(CoreEvent::RegistrationFailed {
-                        reason: e.to_string(),
-                    })
+                    .send(CoreEvent::RegistrationFailed { reason: e.to_string() })
                     .await
                     .ok();
                 let after = backoff;

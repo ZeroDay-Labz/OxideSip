@@ -1,17 +1,17 @@
 use crate::app::{
-    AccountSession, App, AudioSettingsForm, CallUiState, ContactForm, ContactSort, Message, RegistrationStatus,
-    Screen, SettingsForm, SipSettingsForm,
+    AccountSession, App, AudioSettingsForm, CallUiState, ContactForm, ContactSort, Message, RegistrationStatus, Screen,
+    SettingsForm, SipSettingsForm,
 };
 use crate::contacts::Contact;
 use crate::history::{self, CallDirection, CallOutcome, HistoryEntry};
 use crate::icon;
 use crate::theme::{self, Pill};
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, row, rule, scrollable, slider, stack, text, text_input,
-    toggler, tooltip,
+    button, column, container, mouse_area, pick_list, row, rule, scrollable, slider, stack, text, text_input, toggler,
+    tooltip,
 };
 use iced::{Alignment, Color, Element, Length};
-use softphone_core::config::{SipTransport, DTMF_MODES, SIP_TRANSPORTS};
+use softphone_core::config::{DTMF_MODES, SIP_TRANSPORTS, SipTransport};
 use softphone_core::events::CallId;
 use std::time::Instant;
 
@@ -145,10 +145,12 @@ fn account_switcher(app: &App, scale: f32) -> Option<Element<'_, Message>> {
         .collect();
     let selected = options.get(app.selected_account).cloned();
     Some(
-        pick_list(options, selected, |opt: AccountOption| Message::AccountSwitched(opt.index))
-            .text_size(scaled(11.0, scale))
-            .padding(scaled(7.0, scale))
-            .into(),
+        pick_list(options, selected, |opt: AccountOption| {
+            Message::AccountSwitched(opt.index)
+        })
+        .text_size(scaled(11.0, scale))
+        .padding(scaled(7.0, scale))
+        .into(),
     )
 }
 
@@ -251,7 +253,10 @@ fn line_sidebar(acc: &AccountSession, scale: f32, secondary_input_configured: bo
     // input target is configured, rather than silently no-op'ing.
     let secondary_input_on = matches!(
         acc.selected_call(),
-        CallUiState::Active { secondary_input_on: true, .. }
+        CallUiState::Active {
+            secondary_input_on: true,
+            ..
+        }
     );
     let secondary_input_btn = button(
         container(icon::soundwave().size(scaled(15.0, scale)))
@@ -347,12 +352,9 @@ fn compact_call_view<'a>(
 
     let header = row![
         avatar,
-        column![
-            text(number).size(15),
-            text(status).size(11).color(status_color),
-        ]
-        .spacing(2)
-        .width(Length::Fill),
+        column![text(number).size(15), text(status).size(11).color(status_color),]
+            .spacing(2)
+            .width(Length::Fill),
         with_tooltip(
             circle_button(icon::arrows_fullscreen().size(12), 28.0, theme::circle(false))
                 .on_press(Message::CompactToggled),
@@ -366,16 +368,15 @@ fn compact_call_view<'a>(
     let compact_hold_icon = if on_hold { icon::play_fill() } else { icon::pause_fill() };
     let controls = row![
         with_tooltip(
-            circle_button(compact_mute_icon.size(16), 44.0, theme::circle(muted))
-                .on_press(Message::MuteToggled),
+            circle_button(compact_mute_icon.size(16), 44.0, theme::circle(muted)).on_press(Message::MuteToggled),
             if muted { "Unmute" } else { "Mute" },
         ),
         with_tooltip(
-            circle_button(compact_hold_icon.size(16), 44.0, theme::circle(on_hold))
-                .on_press(Message::HoldToggled),
+            circle_button(compact_hold_icon.size(16), 44.0, theme::circle(on_hold)).on_press(Message::HoldToggled),
             if on_hold { "Resume" } else { "Hold" },
         ),
-        pill_call_button("Hang Up", theme::pill(Pill::Danger), icon::telephone_x_fill(), 1.0).on_press(Message::HangUpPressed),
+        pill_call_button("Hang Up", theme::pill(Pill::Danger), icon::telephone_x_fill(), 1.0)
+            .on_press(Message::HangUpPressed),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -418,10 +419,7 @@ pub fn settings_window_view(app: &App) -> Element<'_, Message> {
 
 /// Wraps `content` with a small hover tooltip — used throughout for the
 /// icon-only circular buttons, whose meaning isn't otherwise labeled.
-fn with_tooltip<'a>(
-    content: impl Into<Element<'a, Message>>,
-    label: impl Into<String>,
-) -> Element<'a, Message> {
+fn with_tooltip<'a>(content: impl Into<Element<'a, Message>>, label: impl Into<String>) -> Element<'a, Message> {
     tooltip(content, text(label.into()).size(12), tooltip::Position::Top)
         .style(theme::card)
         .into()
@@ -506,9 +504,7 @@ fn line_status_label(acc: &AccountSession) -> Option<String> {
         CallUiState::Outgoing { started_at, .. } | CallUiState::EarlyMedia { started_at, .. } => {
             Some(format!("(L{line} {})", format_elapsed(started_at.elapsed())))
         }
-        CallUiState::Active { answered_at, .. } => {
-            Some(format!("(L{line} {})", format_elapsed(answered_at.elapsed())))
-        }
+        CallUiState::Active { answered_at, .. } => Some(format!("(L{line} {})", format_elapsed(answered_at.elapsed()))),
     }
 }
 
@@ -543,15 +539,11 @@ fn status_led(registration: &RegistrationStatus) -> Element<'_, Message> {
                 ),
             )
         }
-        RegistrationStatus::Failed { reason } => {
-            (palette.danger, "Offline", format!("Registration failed: {reason}"))
-        }
+        RegistrationStatus::Failed { reason } => (palette.danger, "Offline", format!("Registration failed: {reason}")),
         RegistrationStatus::Halted { reason } => (
             palette.danger,
             "Registration stopped",
-            format!(
-                "Registration stopped: {reason} — edit and re-save SIP Settings to retry"
-            ),
+            format!("Registration stopped: {reason} — edit and re-save SIP Settings to retry"),
         ),
     };
     let dot = container(text(""))
@@ -569,11 +561,14 @@ fn status_led(registration: &RegistrationStatus) -> Element<'_, Message> {
 /// recent numbers, no call history) instead of bare text, so an empty
 /// screen still reads as designed rather than broken/unfinished.
 fn empty_state<'a>(glyph: iced::widget::Text<'a>, label: &'a str) -> Element<'a, Message> {
-    column![glyph.size(30).color(muted_text()), text(label).size(14).color(muted_text())]
-        .spacing(10)
-        .width(Length::Fill)
-        .align_x(Alignment::Center)
-        .into()
+    column![
+        glyph.size(30).color(muted_text()),
+        text(label).size(14).color(muted_text())
+    ]
+    .spacing(10)
+    .width(Length::Fill)
+    .align_x(Alignment::Center)
+    .into()
 }
 
 /// What the JOIN/SPLIT control on the active-call view should show for
@@ -587,7 +582,9 @@ enum JoinUi {
     Available,
     /// Waiting for the user to tap another active line's sidebar button.
     Pending,
-    Joined { partner_number: String },
+    Joined {
+        partner_number: String,
+    },
 }
 
 fn selected_join_ui(acc: &AccountSession) -> JoinUi {
@@ -603,10 +600,8 @@ fn selected_join_ui(acc: &AccountSession) -> JoinUi {
         };
         return JoinUi::Joined { partner_number };
     }
-    let has_other_active = (1..=5u8).any(|l| {
-        l != acc.selected_line
-            && matches!(acc.lines.get((l - 1) as usize), Some(CallUiState::Active { .. }))
-    });
+    let has_other_active = (1..=5u8)
+        .any(|l| l != acc.selected_line && matches!(acc.lines.get((l - 1) as usize), Some(CallUiState::Active { .. })));
     if has_other_active {
         JoinUi::Available
     } else {
@@ -618,22 +613,18 @@ fn dialer_tab<'a>(app: &'a App, acc: &'a AccountSession, scale: f32) -> Element<
     let join_ui = selected_join_ui(acc);
     match acc.selected_call() {
         CallUiState::Idle => {
-            let has_last_outgoing = app
-                .call_history
-                .iter()
-                .any(|e| e.direction == CallDirection::Outgoing);
+            let has_last_outgoing = app.call_history.iter().any(|e| e.direction == CallDirection::Outgoing);
             idle_view(app, &app.dial_input, has_last_outgoing, scale)
         }
-        CallUiState::Incoming { caller, ringing_since, .. } => {
-            ease_in(incoming_view(&app.contacts, caller, scale), *ringing_since, scale)
-        }
+        CallUiState::Incoming {
+            caller, ringing_since, ..
+        } => ease_in(incoming_view(&app.contacts, caller, scale), *ringing_since, scale),
         // Outgoing and EarlyMedia intentionally share both `started_at` (set
         // once, when dialing begins — see `CoreEvent::OutgoingCallStarted`'s
         // handler) and this same view function, so early media arriving
         // doesn't reset/replay the entrance animation — only the initial
         // Idle → Outgoing transition should slide in.
-        CallUiState::Outgoing { number, started_at, .. }
-        | CallUiState::EarlyMedia { number, started_at, .. } => {
+        CallUiState::Outgoing { number, started_at, .. } | CallUiState::EarlyMedia { number, started_at, .. } => {
             ease_in(outgoing_view(&app.contacts, number, scale), *started_at, scale)
         }
         CallUiState::Active {
@@ -729,12 +720,9 @@ fn pill_call_button<'a>(
 ) -> button::Button<'a, Message> {
     button(
         container(
-            row![
-                icon.size(scaled(14.0, scale)),
-                text(label).size(scaled(15.0, scale)),
-            ]
-            .spacing(scaled(8.0, scale))
-            .align_y(Alignment::Center),
+            row![icon.size(scaled(14.0, scale)), text(label).size(scaled(15.0, scale)),]
+                .spacing(scaled(8.0, scale))
+                .align_y(Alignment::Center),
         )
         .width(Length::Fill)
         .align_x(Alignment::Center),
@@ -752,8 +740,12 @@ fn idle_view<'a>(app: &'a App, dial_input: &'a str, has_last_outgoing: bool, sca
         toolbar = toolbar.push(switcher);
     }
     toolbar = toolbar.push(with_tooltip(
-        circle_button(icon::person_lines_fill().size(gear_icon_size), gear_size, theme::circle(false))
-            .on_press(Message::OpenSipSettings),
+        circle_button(
+            icon::person_lines_fill().size(gear_icon_size),
+            gear_size,
+            theme::circle(false),
+        )
+        .on_press(Message::OpenSipSettings),
         "SIP account setup",
     ));
     toolbar = toolbar.push(with_tooltip(
@@ -778,7 +770,11 @@ fn idle_view<'a>(app: &'a App, dial_input: &'a str, has_last_outgoing: bool, sca
         .size(scaled(18.0, scale))
         .align_x(Alignment::Center);
 
-    let history_chevron = if app.dial_history_open { icon::chevron_up() } else { icon::chevron_down() };
+    let history_chevron = if app.dial_history_open {
+        icon::chevron_up()
+    } else {
+        icon::chevron_down()
+    };
     let history_toggle = with_tooltip(
         circle_button(
             history_chevron.size(scaled(13.0, scale)),
@@ -883,8 +879,10 @@ fn incoming_view<'a>(contacts: &[Contact], caller: &'a str, scale: f32) -> Eleme
         .width(Length::Fill)
         .align_x(Alignment::Center),
         row![
-            pill_call_button("Decline", theme::pill(Pill::Danger), icon::telephone_x_fill(), scale).on_press(Message::RejectPressed),
-            pill_call_button("Answer", theme::pill(Pill::Success), icon::telephone_fill(), scale).on_press(Message::AnswerPressed),
+            pill_call_button("Decline", theme::pill(Pill::Danger), icon::telephone_x_fill(), scale)
+                .on_press(Message::RejectPressed),
+            pill_call_button("Answer", theme::pill(Pill::Success), icon::telephone_fill(), scale)
+                .on_press(Message::AnswerPressed),
         ]
         .spacing(16),
     ]
@@ -976,7 +974,8 @@ fn outgoing_view<'a>(contacts: &'a [Contact], number: &'a str, scale: f32) -> El
     column![
         column![avatar].width(Length::Fill).align_x(Alignment::Center),
         info.spacing(4).width(Length::Fill).align_x(Alignment::Center),
-        pill_call_button("Hang Up", theme::pill(Pill::Danger), icon::telephone_x_fill(), scale).on_press(Message::HangUpPressed),
+        pill_call_button("Hang Up", theme::pill(Pill::Danger), icon::telephone_x_fill(), scale)
+            .on_press(Message::HangUpPressed),
     ]
     .spacing(22)
     .width(Length::Fill)
@@ -1081,8 +1080,12 @@ fn active_view<'a>(
         .style(avatar_style);
 
     let compact_toggle = with_tooltip(
-        circle_button(icon::dash_lg().size(scaled(14.0, scale)), scaled(28.0, scale), theme::circle(false))
-            .on_press(Message::CompactToggled),
+        circle_button(
+            icon::dash_lg().size(scaled(14.0, scale)),
+            scaled(28.0, scale),
+            theme::circle(false),
+        )
+        .on_press(Message::CompactToggled),
         "Shrink to compact call bar",
     );
 
@@ -1102,9 +1105,9 @@ fn active_view<'a>(
 
     let header = row![
         row![avatar, caller_info.spacing(2)]
-        .spacing(10)
-        .align_y(Alignment::Center)
-        .width(Length::Fill),
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
         compact_toggle,
     ]
     .align_y(Alignment::Center);
@@ -1121,35 +1124,33 @@ fn active_view<'a>(
 
     let join_button: Option<Element<'_, Message>> = match &join_ui {
         JoinUi::Hidden => None,
-        JoinUi::Available => Some(
-            with_tooltip(
-                circle_button(
-                    icon::diagram_three_fill().size(icon_size),
-                    toggle_size,
-                    theme::circle(false),
-                )
-                .on_press(Message::JoinCallsPressed),
-                "Bridge this call with another active line",
-            ),
-        ),
-        JoinUi::Pending => Some(
-            with_tooltip(
-                circle_button(text("TAP LINE").size(scaled(7.0, scale)), toggle_size, theme::circle(true))
-                    .on_press(Message::JoinCallsPressed),
-                "Tap another active line in the sidebar to join it — tap again to cancel",
-            ),
-        ),
-        JoinUi::Joined { .. } => Some(
-            with_tooltip(
-                circle_button(
-                    icon::arrow_left_right().size(icon_size),
-                    toggle_size,
-                    theme::circle(true),
-                )
-                .on_press(Message::SplitCallPressed),
-                "Split the joined call back into separate lines",
-            ),
-        ),
+        JoinUi::Available => Some(with_tooltip(
+            circle_button(
+                icon::diagram_three_fill().size(icon_size),
+                toggle_size,
+                theme::circle(false),
+            )
+            .on_press(Message::JoinCallsPressed),
+            "Bridge this call with another active line",
+        )),
+        JoinUi::Pending => Some(with_tooltip(
+            circle_button(
+                text("TAP LINE").size(scaled(7.0, scale)),
+                toggle_size,
+                theme::circle(true),
+            )
+            .on_press(Message::JoinCallsPressed),
+            "Tap another active line in the sidebar to join it — tap again to cancel",
+        )),
+        JoinUi::Joined { .. } => Some(with_tooltip(
+            circle_button(
+                icon::arrow_left_right().size(icon_size),
+                toggle_size,
+                theme::circle(true),
+            )
+            .on_press(Message::SplitCallPressed),
+            "Split the joined call back into separate lines",
+        )),
     };
 
     let mute_icon = if muted { icon::mic_mute_fill() } else { icon::mic_fill() };
@@ -1157,8 +1158,7 @@ fn active_view<'a>(
 
     let mut controls = row![
         with_tooltip(
-            circle_button(mute_icon.size(icon_size), toggle_size, theme::circle(muted))
-                .on_press(Message::MuteToggled),
+            circle_button(mute_icon.size(icon_size), toggle_size, theme::circle(muted)).on_press(Message::MuteToggled),
             if muted { "Unmute microphone" } else { "Mute microphone" },
         ),
         with_tooltip(
@@ -1194,8 +1194,7 @@ fn active_view<'a>(
                 .padding(8)
                 .width(Length::Fill),
             with_tooltip(
-                circle_button(text("SEND").size(9), 38.0, theme::circle(true))
-                    .on_press(Message::TransferConfirmed),
+                circle_button(text("SEND").size(9), 38.0, theme::circle(true)).on_press(Message::TransferConfirmed),
                 "Send transfer",
             ),
         ]
@@ -1216,15 +1215,14 @@ fn active_view<'a>(
         content = content.push(transfer_section);
     }
     if !digits.is_empty() {
-        content = content.push(
-            text(digits)
-                .size(16)
-                .color(theme::oxide_palette().primary),
-        );
+        content = content.push(text(digits).size(16).color(theme::oxide_palette().primary));
     }
 
     content = content.push(dialpad(scale, dialpad_flash));
-    content = content.push(pill_call_button("Hang Up", theme::pill(Pill::Danger), icon::telephone_x_fill(), scale).on_press(Message::HangUpPressed));
+    content = content.push(
+        pill_call_button("Hang Up", theme::pill(Pill::Danger), icon::telephone_x_fill(), scale)
+            .on_press(Message::HangUpPressed),
+    );
 
     content.into()
 }
@@ -1265,11 +1263,16 @@ fn meter_slider<'a>(
 
     let combined = stack![
         meter_track,
-        container(handle).height(Length::Fixed(height)).align_y(Alignment::Center),
+        container(handle)
+            .height(Length::Fixed(height))
+            .align_y(Alignment::Center),
     ];
 
     row![
-        text(label).size(scaled(12.0, scale)).width(scaled(34.0, scale)).color(muted_text()),
+        text(label)
+            .size(scaled(12.0, scale))
+            .width(scaled(34.0, scale))
+            .color(muted_text()),
         combined,
         text(format!("{:.0}%", value * 100.0))
             .size(scaled(12.0, scale))
@@ -1280,12 +1283,7 @@ fn meter_slider<'a>(
     .into()
 }
 
-const DIALPAD_KEYS: [[char; 3]; 4] = [
-    ['1', '2', '3'],
-    ['4', '5', '6'],
-    ['7', '8', '9'],
-    ['*', '0', '#'],
-];
+const DIALPAD_KEYS: [[char; 3]; 4] = [['1', '2', '3'], ['4', '5', '6'], ['7', '8', '9'], ['*', '0', '#']];
 
 fn dialpad_letters(key: char) -> &'static str {
     match key {
@@ -1332,8 +1330,7 @@ fn dialpad<'a>(scale: f32, flash: Option<(char, Instant)>) -> Element<'a, Messag
                 _ => 0.0,
             };
             r = r.push(
-                circle_button(label, key_size, theme::circle_flash(amount))
-                    .on_press(Message::DialpadPressed(key)),
+                circle_button(label, key_size, theme::circle_flash(amount)).on_press(Message::DialpadPressed(key)),
             );
         }
         rows = rows.push(r);
@@ -1352,8 +1349,12 @@ fn contacts_tab(app: &App, scale: f32) -> Element<'_, Message> {
         .padding(9)
         .width(Length::Fill);
     let add_button = with_tooltip(
-        circle_button(icon::plus_lg().size(scaled(15.0, scale)), scaled(38.0, scale), theme::circle(true))
-            .on_press(Message::AddContactPressed),
+        circle_button(
+            icon::plus_lg().size(scaled(15.0, scale)),
+            scaled(38.0, scale),
+            theme::circle(true),
+        )
+        .on_press(Message::AddContactPressed),
         "Add contact",
     );
     let sort_button = with_tooltip(
@@ -1370,11 +1371,7 @@ fn contacts_tab(app: &App, scale: f32) -> Element<'_, Message> {
         .contacts
         .iter()
         .enumerate()
-        .filter(|(_, c)| {
-            filter.is_empty()
-                || c.name.to_lowercase().contains(&filter)
-                || c.number.contains(&filter)
-        })
+        .filter(|(_, c)| filter.is_empty() || c.name.to_lowercase().contains(&filter) || c.number.contains(&filter))
         .collect();
     match app.contact_sort {
         ContactSort::NameAsc => matches.sort_by_key(|(_, c)| c.name.to_lowercase()),
@@ -1391,7 +1388,9 @@ fn contacts_tab(app: &App, scale: f32) -> Element<'_, Message> {
             (icon::search(), "No matches")
         };
         return column![
-            row![search, sort_button, add_button].spacing(10).align_y(Alignment::Center),
+            row![search, sort_button, add_button]
+                .spacing(10)
+                .align_y(Alignment::Center),
             empty_state(glyph, label),
             contacts_io_row(app),
         ]
@@ -1417,7 +1416,9 @@ fn contacts_tab(app: &App, scale: f32) -> Element<'_, Message> {
     let contacts_scrollbar = scrollable::Scrollbar::new().width(6).scroller_width(6).spacing(8);
 
     column![
-        row![search, sort_button, add_button].spacing(10).align_y(Alignment::Center),
+        row![search, sort_button, add_button]
+            .spacing(10)
+            .align_y(Alignment::Center),
         count_label,
         scrollable(list)
             .direction(scrollable::Direction::Vertical(contacts_scrollbar))
@@ -1512,8 +1513,12 @@ fn contact_row(index: usize, contact: &Contact) -> Element<'_, Message> {
                 "Edit contact",
             ),
             with_tooltip(
-                circle_button(icon::trash_fill().size(12).color(DANGER_TEXT), 32.0, theme::circle(false))
-                    .on_press(Message::DeleteContactPressed(index)),
+                circle_button(
+                    icon::trash_fill().size(12).color(DANGER_TEXT),
+                    32.0,
+                    theme::circle(false)
+                )
+                .on_press(Message::DeleteContactPressed(index)),
                 "Delete contact",
             ),
         ]
@@ -1594,8 +1599,12 @@ fn history_tab(app: &App, _scale: f32) -> Element<'_, Message> {
     let heading = row![
         text("Recent Calls").size(11).color(muted_text()).width(Length::Fill),
         with_tooltip(
-            circle_button(icon::trash_fill().size(11).color(DANGER_TEXT), 24.0, theme::circle(false))
-                .on_press(Message::ClearHistoryPressed),
+            circle_button(
+                icon::trash_fill().size(11).color(DANGER_TEXT),
+                24.0,
+                theme::circle(false)
+            )
+            .on_press(Message::ClearHistoryPressed),
             "Clear call history",
         ),
     ]
@@ -1748,11 +1757,9 @@ fn device_picker<'a>(
 
     field(
         label,
-        pick_list(options, selected, move |opt: DeviceOption| {
-            on_selected(opt.id)
-        })
-        .width(Length::Fill)
-        .padding(10),
+        pick_list(options, selected, move |opt: DeviceOption| on_selected(opt.id))
+            .width(Length::Fill)
+            .padding(10),
     )
 }
 
@@ -1787,8 +1794,12 @@ fn accounts_sidebar(app: &App) -> Element<'_, Message> {
                 .width(Length::Fill)
                 .on_press(Message::SelectAccountForEditing(index)),
             with_tooltip(
-                circle_button(icon::trash_fill().size(10).color(DANGER_TEXT), 24.0, theme::circle(false))
-                    .on_press(Message::DeleteAccountPressed(index)),
+                circle_button(
+                    icon::trash_fill().size(10).color(DANGER_TEXT),
+                    24.0,
+                    theme::circle(false)
+                )
+                .on_press(Message::DeleteAccountPressed(index)),
                 "Remove this account",
             ),
         ]
@@ -1909,7 +1920,9 @@ fn sip_settings_view<'a>(app: &'a App, form: &'a SipSettingsForm, error: Option<
     row![
         accounts_sidebar(app),
         rule::vertical(1),
-        scrollable(editor.padding(18).width(Length::Fill)).width(Length::Fill).height(Length::Fill),
+        scrollable(editor.padding(18).width(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill),
     ]
     .spacing(10)
     .height(Length::Fill)
@@ -1993,10 +2006,14 @@ fn audio_settings_view<'a>(
             )
             .size(theme::text_size::CAPTION)
             .color(muted_text()),
-            pick_list(DTMF_MODES.to_vec(), Some(form.dtmf_mode), Message::AudioSettingsDtmfModeChanged,)
-                .text_size(theme::text_size::BODY)
-                .width(Length::Fill)
-                .padding(theme::space::SM),
+            pick_list(
+                DTMF_MODES.to_vec(),
+                Some(form.dtmf_mode),
+                Message::AudioSettingsDtmfModeChanged,
+            )
+            .text_size(theme::text_size::BODY)
+            .width(Length::Fill)
+            .padding(theme::space::SM),
         ]
         .spacing(theme::space::XS + 2.0),
     );
@@ -2039,12 +2056,9 @@ fn toggle_row<'a>(
     on_toggle: impl Fn(bool) -> Message + 'a,
 ) -> Element<'a, Message> {
     row![
-        column![
-            text(title).size(13),
-            text(detail).size(11).color(muted_text()),
-        ]
-        .spacing(2)
-        .width(Length::Fill),
+        column![text(title).size(13), text(detail).size(11).color(muted_text()),]
+            .spacing(2)
+            .width(Length::Fill),
         toggler(value).on_toggle(on_toggle),
     ]
     .spacing(10)
@@ -2095,9 +2109,7 @@ fn secondary_output_picker<'a>(
         column![
             row![
                 pick_list(options, selected, |opt: DeviceOption| {
-                    Message::SettingsSecondaryOutputChanged(
-                        (opt.id != SYSTEM_DEFAULT_ID).then_some(opt.id),
-                    )
+                    Message::SettingsSecondaryOutputChanged((opt.id != SYSTEM_DEFAULT_ID).then_some(opt.id))
                 })
                 .width(Length::Fill)
                 .padding(10),
@@ -2157,9 +2169,7 @@ fn secondary_input_picker<'a>(
         column![
             row![
                 pick_list(options, selected, |opt: DeviceOption| {
-                    Message::SettingsSecondaryInputChanged(
-                        (opt.id != SYSTEM_DEFAULT_ID).then_some(opt.id),
-                    )
+                    Message::SettingsSecondaryInputChanged((opt.id != SYSTEM_DEFAULT_ID).then_some(opt.id))
                 })
                 .width(Length::Fill)
                 .padding(10),
@@ -2225,8 +2235,12 @@ fn settings_view<'a>(
             row![
                 text(entry.clone()).size(12).width(Length::Fill),
                 with_tooltip(
-                    circle_button(icon::trash_fill().size(10).color(DANGER_TEXT), 24.0, theme::circle(false))
-                        .on_press(Message::SettingsDenyListRemovePressed(index)),
+                    circle_button(
+                        icon::trash_fill().size(10).color(DANGER_TEXT),
+                        24.0,
+                        theme::circle(false)
+                    )
+                    .on_press(Message::SettingsDenyListRemovePressed(index)),
                     "Remove from deny list",
                 ),
             ]
@@ -2282,10 +2296,8 @@ fn settings_view<'a>(
     ]
     .spacing(12);
 
-    let secondary_output =
-        secondary_output_picker(output_devices, app_capture_streams, &form.secondary_output_target);
-    let secondary_input =
-        secondary_input_picker(input_devices, app_playback_streams, &form.secondary_input_target);
+    let secondary_output = secondary_output_picker(output_devices, app_capture_streams, &form.secondary_output_target);
+    let secondary_input = secondary_input_picker(input_devices, app_playback_streams, &form.secondary_input_target);
 
     let actions = row![
         button(text("Save").size(12))

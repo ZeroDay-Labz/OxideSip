@@ -44,15 +44,22 @@ pub enum CallState {
 
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
-    Registered { expires: u32, rtt_ms: u32 },
-    RegistrationFailed { reason: String },
+    Registered {
+        expires: u32,
+        rtt_ms: u32,
+    },
+    RegistrationFailed {
+        reason: String,
+    },
     /// The registration retry loop has given up entirely (repeated
     /// 401/407s, or an outright 403 Forbidden) rather than continuing to
     /// retry — see `registration.rs`'s circuit breaker. Distinct from
     /// `RegistrationFailed`, which still implies "will keep retrying":
     /// once this fires, no further REGISTER attempts happen until the
     /// account's config changes (e.g. re-saving SIP Settings).
-    RegistrationHalted { reason: String },
+    RegistrationHalted {
+        reason: String,
+    },
     IncomingCall {
         id: CallId,
         /// Which line (1-5) this call was assigned to — the first free line
@@ -61,34 +68,67 @@ pub enum CoreEvent {
         remote: String,
         offer: RemoteMediaInfo,
     },
-    OutgoingCallStarted { id: CallId, line: u8 },
-    CallStateChanged { id: CallId, state: CallState },
-    PlaceCallFailed { line: u8, reason: String },
-    DtmfResult { id: CallId, digit: char, ok: bool },
+    OutgoingCallStarted {
+        id: CallId,
+        line: u8,
+    },
+    CallStateChanged {
+        id: CallId,
+        state: CallState,
+    },
+    PlaceCallFailed {
+        line: u8,
+        reason: String,
+    },
+    DtmfResult {
+        id: CallId,
+        digit: char,
+        ok: bool,
+    },
     /// `ok` reflects only whether the REFER transaction itself was accepted
     /// by the server — rsipstack's `refer()` has no way to correlate the
     /// follow-up NOTIFY(sipfrag) that would report whether the transfer
     /// target actually answered, so this is *not* a "transfer completed"
     /// signal. `softphone-ui` deliberately words this as "requested," not
     /// "succeeded" (see README's Known limitations).
-    TransferResult { id: CallId, ok: bool },
+    TransferResult {
+        id: CallId,
+        ok: bool,
+    },
     /// A hold/resume re-INVITE failed at the transport/dialog level (e.g.
     /// the peer rejected it). Distinct from a silent no-op: without this,
     /// pressing Hold/Resume against a peer that rejects the re-INVITE left
     /// the UI's `on_hold` flag untouched with no indication anything went
     /// wrong.
-    HoldResumeFailed { id: CallId, hold: bool, reason: String },
+    HoldResumeFailed {
+        id: CallId,
+        hold: bool,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum CoreCommand {
-    PlaceCall { line: u8, callee: String, local_rtp_port: u16 },
-    AnswerCall { id: CallId, local_rtp_port: u16 },
+    PlaceCall {
+        line: u8,
+        callee: String,
+        local_rtp_port: u16,
+    },
+    AnswerCall {
+        id: CallId,
+        local_rtp_port: u16,
+    },
     RejectCall(CallId),
     HangUp(CallId),
-    SendDtmf { id: CallId, digit: char },
+    SendDtmf {
+        id: CallId,
+        digit: char,
+    },
     HoldCall(CallId),
     ResumeCall(CallId),
-    BlindTransfer { id: CallId, target: String },
+    BlindTransfer {
+        id: CallId,
+        target: String,
+    },
     Shutdown,
 }

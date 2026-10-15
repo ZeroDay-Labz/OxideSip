@@ -41,8 +41,7 @@ pub async fn build_transport_layer(
 
     match config.transport {
         SipTransport::Udp => {
-            let udp =
-                UdpConnection::create_connection(local_addr, None, Some(cancel_token)).await?;
+            let udp = UdpConnection::create_connection(local_addr, None, Some(cancel_token)).await?;
             transport_layer.add_transport(udp.into());
         }
         SipTransport::Tcp => {
@@ -52,20 +51,13 @@ pub async fn build_transport_layer(
             transport_layer.add_transport(listener.into());
         }
         SipTransport::Tls => {
-            let ca_cert_path = config.ca_cert_path.as_ref().ok_or_else(|| {
-                CoreError::Config("ca_cert_path is required for transport = \"tls\"".into())
-            })?;
+            let ca_cert_path = config
+                .ca_cert_path
+                .as_ref()
+                .ok_or_else(|| CoreError::Config("ca_cert_path is required for transport = \"tls\"".into()))?;
             let ca_certs = Some(std::fs::read(ca_cert_path)?);
-            let client_cert = config
-                .client_cert_path
-                .as_ref()
-                .map(std::fs::read)
-                .transpose()?;
-            let client_key = config
-                .client_key_path
-                .as_ref()
-                .map(std::fs::read)
-                .transpose()?;
+            let client_cert = config.client_cert_path.as_ref().map(std::fs::read).transpose()?;
+            let client_key = config.client_key_path.as_ref().map(std::fs::read).transpose()?;
 
             transport_layer.set_tls_config(TlsConfig {
                 cert: None,
@@ -99,10 +91,7 @@ pub fn build_endpoint(transport_layer: TransportLayer, cancel_token: Cancellatio
 /// `register()` fails with `EndpointError("not sipaddrs")` before it ever
 /// attempts a network connection. UDP/TCP don't need this: they bind a local
 /// listener in `build_transport_layer`, so `listens` is already non-empty.
-pub async fn warm_up_registrar_connection(
-    transport_layer: &TransportLayer,
-    registrar: &Uri,
-) -> Result<()> {
+pub async fn warm_up_registrar_connection(transport_layer: &TransportLayer, registrar: &Uri) -> Result<()> {
     let target = SipAddr::try_from(registrar)?;
     transport_layer.lookup(&target, None).await?;
     Ok(())

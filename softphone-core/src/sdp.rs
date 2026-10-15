@@ -44,13 +44,7 @@ pub struct MediaOffer {
     pub hold: bool,
 }
 
-pub fn generate_offer(
-    port: u16,
-    srtp: bool,
-    hold: bool,
-    payload_types: &[u8],
-    telephone_event: bool,
-) -> MediaOffer {
+pub fn generate_offer(port: u16, srtp: bool, hold: bool, payload_types: &[u8], telephone_event: bool) -> MediaOffer {
     let crypto_key = srtp.then(|| {
         let mut key_and_salt = [0u8; 30];
         rand::fill(&mut key_and_salt);
@@ -195,8 +189,8 @@ pub fn build_sdp(local_addr: IpAddr, offer: &MediaOffer) -> SessionDescription {
 /// A missing `a=crypto` line is not an error — it just means the peer offered
 /// plain RTP.
 pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
-    let sdp = SessionDescription::try_from(sdp_text)
-        .map_err(|e| CoreError::Sdp(format!("failed to parse SDP: {e}")))?;
+    let sdp =
+        SessionDescription::try_from(sdp_text).map_err(|e| CoreError::Sdp(format!("failed to parse SDP: {e}")))?;
 
     let media = sdp
         .media_descriptions
@@ -208,9 +202,7 @@ pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
     // before the audio-codec list below so RFC 4733 DTMF is never mistaken
     // for (and never accidentally decoded as) an audio codec.
     let telephone_event_pt = media.attributes.iter().find_map(|attr| match attr {
-        Attribute::Rtpmap(r) if r.encoding_name.eq_ignore_ascii_case("telephone-event") => {
-            Some(r.payload_type as u8)
-        }
+        Attribute::Rtpmap(r) if r.encoding_name.eq_ignore_ascii_case("telephone-event") => Some(r.payload_type as u8),
         _ => None,
     });
 

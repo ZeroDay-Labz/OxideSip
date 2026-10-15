@@ -233,7 +233,13 @@ const RINGBACK_ON_MS: u32 = 2000;
 const RINGBACK_OFF_MS: u32 = 4000;
 
 fn generate_ringback_cycle() -> Vec<i16> {
-    generate_cadence_tone(RINGBACK_FREQUENCIES, RINGBACK_FADE_SAMPLES, RINGBACK_ON_MS, RINGBACK_OFF_MS, 1)
+    generate_cadence_tone(
+        RINGBACK_FREQUENCIES,
+        RINGBACK_FADE_SAMPLES,
+        RINGBACK_ON_MS,
+        RINGBACK_OFF_MS,
+        1,
+    )
 }
 
 /// Local incoming-call ringtone — what the *callee* (this app) plays while
@@ -285,9 +291,7 @@ fn generate_dual_tone(f1: f32, f2: f32, duration_ms: u32, fade_samples: usize) -
     samples.extend(std::iter::repeat_n(0i16, PAD_SAMPLES));
     for i in 0..n {
         let t = i as f32 / SAMPLE_RATE as f32;
-        let value = ((2.0 * std::f32::consts::PI * f1 * t).sin()
-            + (2.0 * std::f32::consts::PI * f2 * t).sin())
-            * 0.22;
+        let value = ((2.0 * std::f32::consts::PI * f1 * t).sin() + (2.0 * std::f32::consts::PI * f2 * t).sin()) * 0.22;
         let fade = if i < fade_samples {
             0.5 * (1.0 - (std::f32::consts::PI * i as f32 / fade_samples as f32).cos())
         } else if i >= n.saturating_sub(fade_samples) {
@@ -302,9 +306,7 @@ fn generate_dual_tone(f1: f32, f2: f32, duration_ms: u32, fade_samples: usize) -
     samples
 }
 
-const DIGITS: [char; 12] = [
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#',
-];
+const DIGITS: [char; 12] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#'];
 
 enum QueuedSound {
     Digit(char),
@@ -533,9 +535,7 @@ impl DtmfTonePlayer {
                 };
 
                 let kind = match &sound {
-                    QueuedSound::DialTone | QueuedSound::BusyTone | QueuedSound::ReorderTone => {
-                        SoundKind::LineTone
-                    }
+                    QueuedSound::DialTone | QueuedSound::BusyTone | QueuedSound::ReorderTone => SoundKind::LineTone,
                     QueuedSound::Ringback(_) => SoundKind::Ringback,
                     QueuedSound::IncomingRing(_) => SoundKind::IncomingRing,
                     QueuedSound::Digit(_) | QueuedSound::Disconnect => SoundKind::Other,
@@ -557,9 +557,7 @@ impl DtmfTonePlayer {
                 let mut aborted = false;
                 'chunks: for chunk in bytes.chunks(CHUNK_SAMPLES * 2) {
                     let cancel = match (kind, &sound) {
-                        (SoundKind::LineTone, _) => {
-                            *worker_line_tone_epoch.lock().unwrap() != started_line_epoch
-                        }
+                        (SoundKind::LineTone, _) => *worker_line_tone_epoch.lock().unwrap() != started_line_epoch,
                         (SoundKind::Ringback, QueuedSound::Ringback(epoch)) => {
                             *worker_ringback_epoch.lock().unwrap() != *epoch
                         }
@@ -588,9 +586,7 @@ impl DtmfTonePlayer {
                         QueuedSound::Ringback(epoch) if *worker_ringback_epoch.lock().unwrap() == epoch => {
                             let _ = worker_requeue_tx.send(QueuedSound::Ringback(epoch));
                         }
-                        QueuedSound::IncomingRing(epoch)
-                            if *worker_incoming_ring_epoch.lock().unwrap() == epoch =>
-                        {
+                        QueuedSound::IncomingRing(epoch) if *worker_incoming_ring_epoch.lock().unwrap() == epoch => {
                             let _ = worker_requeue_tx.send(QueuedSound::IncomingRing(epoch));
                         }
                         _ => {}

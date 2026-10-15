@@ -249,8 +249,10 @@ impl RawConfig {
             self.client_key_path = Some(v.into());
         }
         if let Ok(v) = std::env::var("OXIDESIP_PREFERRED_CODECS") {
-            let codecs: Vec<PreferredCodec> =
-                v.split(',').filter_map(|s| PreferredCodec::parse_env(s.trim())).collect();
+            let codecs: Vec<PreferredCodec> = v
+                .split(',')
+                .filter_map(|s| PreferredCodec::parse_env(s.trim()))
+                .collect();
             if !codecs.is_empty() {
                 self.preferred_codecs = Some(codecs);
             }
@@ -268,12 +270,13 @@ impl RawConfig {
             SipTransport::Tls => 5061,
             SipTransport::Udp | SipTransport::Tcp => 5060,
         });
-        let ca_cert_path = match transport {
-            SipTransport::Tls => Some(self.ca_cert_path.ok_or_else(|| {
-                CoreError::Config("missing ca_cert_path (required for transport = \"tls\")".into())
-            })?),
-            SipTransport::Udp | SipTransport::Tcp => self.ca_cert_path,
-        };
+        let ca_cert_path =
+            match transport {
+                SipTransport::Tls => Some(self.ca_cert_path.ok_or_else(|| {
+                    CoreError::Config("missing ca_cert_path (required for transport = \"tls\")".into())
+                })?),
+                SipTransport::Udp | SipTransport::Tcp => self.ca_cert_path,
+            };
 
         Ok(SipAccountConfig {
             name: self.name.unwrap_or_default(),
@@ -307,8 +310,7 @@ impl RawConfig {
 /// Load config from a TOML file, then apply `OXIDESIP_*` env var overrides.
 pub fn load_config(path: &Path) -> Result<SipAccountConfig> {
     let text = std::fs::read_to_string(path)?;
-    let mut raw: RawConfig =
-        toml::from_str(&text).map_err(|e| CoreError::Config(e.to_string()))?;
+    let mut raw: RawConfig = toml::from_str(&text).map_err(|e| CoreError::Config(e.to_string()))?;
     raw.apply_env_overrides();
     raw.into_config()
 }

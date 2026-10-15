@@ -198,9 +198,7 @@ pub fn spawn(
             shutdown: shutdown_tx,
         }),
         Ok(Err(e)) => Err(MediaError::PipeWire(e)),
-        Err(_) => Err(MediaError::PipeWire(
-            "pipewire thread exited before starting".into(),
-        )),
+        Err(_) => Err(MediaError::PipeWire("pipewire thread exited before starting".into())),
     }
 }
 
@@ -244,9 +242,7 @@ pub fn spawn_playback(
             shutdown: shutdown_tx,
         }),
         Ok(Err(e)) => Err(MediaError::PipeWire(e)),
-        Err(_) => Err(MediaError::PipeWire(
-            "pipewire thread exited before starting".into(),
-        )),
+        Err(_) => Err(MediaError::PipeWire("pipewire thread exited before starting".into())),
     }
 }
 
@@ -265,8 +261,8 @@ fn run_playback_only(
 ) -> Result<(), MediaError> {
     // SAFETY: `pw::init()` has already been called via `ensure_init()` in
     // `spawn_playback()`, before this function runs.
-    let thread_loop = unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io-secondary"), None) }
-        .map_err(pw_err)?;
+    let thread_loop =
+        unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io-secondary"), None) }.map_err(pw_err)?;
     let context_props = properties! { *pw::keys::CONFIG_NAME => "client.conf" };
     let context = pw::context::ContextRc::new(&thread_loop, Some(context_props)).map_err(pw_err)?;
     let core = context.connect_rc(None).map_err(pw_err)?;
@@ -347,8 +343,9 @@ fn run_playback_only(
         .map_err(pw_err)?;
 
     let playback_format = audio_format_pod()?;
-    let mut playback_params = [Pod::from_bytes(&playback_format)
-        .ok_or_else(|| MediaError::PipeWire("invalid playback format pod".into()))?];
+    let mut playback_params =
+        [Pod::from_bytes(&playback_format)
+            .ok_or_else(|| MediaError::PipeWire("invalid playback format pod".into()))?];
     playback_stream
         .connect(
             spa::utils::Direction::Output,
@@ -380,11 +377,7 @@ struct SecondaryCaptureUserData {
 /// would loop our own injected audio back on itself) into what gets sent as
 /// RTP. `target` (a PipeWire node's `node.name`) pins the stream to that
 /// app's playback node; `None` follows the system default capture device.
-pub fn spawn_capture(
-    prod: HeapProd<i16>,
-    target: Option<String>,
-    label: String,
-) -> Result<PwThreadHandle, MediaError> {
+pub fn spawn_capture(prod: HeapProd<i16>, target: Option<String>, label: String) -> Result<PwThreadHandle, MediaError> {
     ensure_init();
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<PwCommand>();
@@ -405,9 +398,7 @@ pub fn spawn_capture(
             shutdown: shutdown_tx,
         }),
         Ok(Err(e)) => Err(MediaError::PipeWire(e)),
-        Err(_) => Err(MediaError::PipeWire(
-            "pipewire thread exited before starting".into(),
-        )),
+        Err(_) => Err(MediaError::PipeWire("pipewire thread exited before starting".into())),
     }
 }
 
@@ -424,8 +415,8 @@ fn run_capture_only(
 ) -> Result<(), MediaError> {
     // SAFETY: `pw::init()` has already been called via `ensure_init()` in
     // `spawn_capture()`, before this function runs.
-    let thread_loop = unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io-secondary-in"), None) }
-        .map_err(pw_err)?;
+    let thread_loop =
+        unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io-secondary-in"), None) }.map_err(pw_err)?;
     let context_props = properties! { *pw::keys::CONFIG_NAME => "client.conf" };
     let context = pw::context::ContextRc::new(&thread_loop, Some(context_props)).map_err(pw_err)?;
     let core = context.connect_rc(None).map_err(pw_err)?;
@@ -464,8 +455,9 @@ fn run_capture_only(
         .map_err(pw_err)?;
 
     let capture_format = audio_format_pod()?;
-    let mut capture_params = [Pod::from_bytes(&capture_format)
-        .ok_or_else(|| MediaError::PipeWire("invalid capture format pod".into()))?];
+    let mut capture_params = [
+        Pod::from_bytes(&capture_format).ok_or_else(|| MediaError::PipeWire("invalid capture format pod".into()))?
+    ];
     capture_stream
         .connect(
             spa::utils::Direction::Input,
@@ -508,11 +500,7 @@ fn audio_format_pod() -> Result<Vec<u8>, MediaError> {
     .map_err(|_| MediaError::PipeWire("failed to serialize audio format pod".into()))
 }
 
-fn stream_properties(
-    media_category: &str,
-    target: Option<&str>,
-    label: &str,
-) -> pw::properties::PropertiesBox {
+fn stream_properties(media_category: &str, target: Option<&str>, label: &str) -> pw::properties::PropertiesBox {
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => media_category,
@@ -576,8 +564,7 @@ fn run(
 
     // SAFETY: `pw::init()` has already been called via `ensure_init()` in
     // `spawn()`, before this function runs.
-    let thread_loop = unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io"), None) }
-        .map_err(pw_err)?;
+    let thread_loop = unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io"), None) }.map_err(pw_err)?;
     // A bare `pw_context_new` with no config loads no modules at all — in
     // particular not `libpipewire-module-rt`, which is what actually talks
     // to rtkit to grant the processing thread realtime scheduling. Normal
@@ -640,17 +627,16 @@ fn run(
             });
             user_data.prod.push_iter(iter);
             let level = peak as f32 / i16::MAX as f32;
-            user_data
-                .input_level_bits
-                .store(level.to_bits(), Ordering::Relaxed);
+            user_data.input_level_bits.store(level.to_bits(), Ordering::Relaxed);
             user_data.notify.notify_one();
         })
         .register()
         .map_err(pw_err)?;
 
     let capture_format = audio_format_pod()?;
-    let mut capture_params = [Pod::from_bytes(&capture_format)
-        .ok_or_else(|| MediaError::PipeWire("invalid capture format pod".into()))?];
+    let mut capture_params = [
+        Pod::from_bytes(&capture_format).ok_or_else(|| MediaError::PipeWire("invalid capture format pod".into()))?
+    ];
     capture_stream
         .connect(
             spa::utils::Direction::Input,
@@ -745,9 +731,7 @@ fn run(
                     written += want;
                 }
                 let level = peak as f32 / i16::MAX as f32;
-                user_data
-                    .output_level_bits
-                    .store(level.to_bits(), Ordering::Relaxed);
+                user_data.output_level_bits.store(level.to_bits(), Ordering::Relaxed);
                 user_data.callback_count += 1;
                 if user_data.callback_count.is_multiple_of(10) {
                     // This system's real callback cadence is ~1.5s, not the
@@ -774,8 +758,9 @@ fn run(
         .map_err(pw_err)?;
 
     let playback_format = audio_format_pod()?;
-    let mut playback_params = [Pod::from_bytes(&playback_format)
-        .ok_or_else(|| MediaError::PipeWire("invalid playback format pod".into()))?];
+    let mut playback_params =
+        [Pod::from_bytes(&playback_format)
+            .ok_or_else(|| MediaError::PipeWire("invalid playback format pod".into()))?];
     playback_stream
         .connect(
             spa::utils::Direction::Output,

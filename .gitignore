@@ -1,19 +1,14 @@
+# Build output
 /target
-accounts.toml
-audio_devices.toml
-call_history.toml
-contacts.toml
-oxidesip.toml
-settings.toml
-.claude
-# Local configuration and state files
-*.toml
-!Cargo.toml
-!config.example.toml
+/flatpak/.flatpak-builder/
+*.flatpak
 
-# AI context
+# IDE / tooling state
+.idea/
 .claude/
 
-# Rust build artifacts
-/target/
-
+# Local runtime config (secrets). Tracked TOML is whitelisted below.
+*.toml
+!Cargo.toml
+!rustfmt.toml
+!config.example.toml

@@ -102,19 +102,13 @@ mod tests {
 
     #[test]
     fn rejects_short_buffer() {
-        assert!(matches!(
-            RtpHeader::decode(&[0u8; 11]),
-            Err(MediaError::RtpTooShort)
-        ));
+        assert!(matches!(RtpHeader::decode(&[0u8; 11]), Err(MediaError::RtpTooShort)));
     }
 
     #[test]
     fn rejects_bad_version() {
         let mut packet = sample_header().encode().to_vec();
         packet[0] = 0x00; // version 0
-        assert!(matches!(
-            RtpHeader::decode(&packet),
-            Err(MediaError::RtpBadVersion(0))
-        ));
+        assert!(matches!(RtpHeader::decode(&packet), Err(MediaError::RtpBadVersion(0))));
     }
 }

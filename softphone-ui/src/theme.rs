@@ -3,7 +3,7 @@
 //! one palette instead of hand-rolled colors scattered across `view.rs`.
 
 use iced::widget::{button, container, slider};
-use iced::{color, Background, Border, Color, Radians, Shadow, Theme};
+use iced::{Background, Border, Color, Radians, Shadow, Theme, color};
 
 pub fn oxide_palette() -> iced::theme::Palette {
     iced::theme::Palette {
@@ -188,9 +188,9 @@ pub fn led(fill: Color) -> impl Fn(&Theme) -> container::Style {
 /// from its display name/number so the same person always gets the same
 /// color without needing to persist one.
 pub fn avatar_color(seed: &str) -> Color {
-    let hash = seed.bytes().fold(5381u32, |h, b| {
-        h.wrapping_mul(33).wrapping_add(b as u32)
-    });
+    let hash = seed
+        .bytes()
+        .fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32));
     let hue = (hash % 360) as f32;
     hsl_to_rgb(hue, 0.55, 0.5)
 }
@@ -541,4 +541,3 @@ pub fn meter_slider(theme: &Theme, _status: slider::Status) -> slider::Style {
         },
     }
 }
-

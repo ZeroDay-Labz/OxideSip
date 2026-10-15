@@ -3,8 +3,8 @@ use crate::audio_devices::{self, AudioDeviceConfig};
 use crate::contacts::{self, Contact};
 use crate::history;
 use crate::{bridge, icon, view};
-use iced::{window, Element, Subscription, Task};
-use softphone_core::config::{DtmfMode, PreferredCodec, SipAccountConfig, SipTransport, PREFERRED_CODECS};
+use iced::{Element, Subscription, Task, window};
+use softphone_core::config::{DtmfMode, PREFERRED_CODECS, PreferredCodec, SipAccountConfig, SipTransport};
 use softphone_core::events::{CallId, CallState, CoreCommand, CoreEvent, RemoteMediaInfo};
 use softphone_media::{AudioDevice, DtmfTonePlayer, MediaSession, ReservedSocket};
 use std::collections::{HashMap, VecDeque};
@@ -30,13 +30,17 @@ pub enum RegistrationStatus {
         /// specific to the playback path, not SIP signaling.
         rtt_ms: u32,
     },
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     /// The core's registration loop has given up entirely (repeated 401/407s
     /// or an outright 403) rather than continuing to retry — distinct from
     /// `Failed`, which still implies "reconnecting." Re-saving SIP Settings
     /// (see `handle_sip_settings_save`'s `reg_epoch` bump) is the only way
     /// to trigger a fresh attempt from here.
-    Halted { reason: String },
+    Halted {
+        reason: String,
+    },
 }
 
 pub enum CallUiState {
@@ -127,9 +131,7 @@ impl CallUiState {
     /// `if let` twice.
     fn media_slot(&mut self) -> Option<(&CallId, &mut Option<MediaSession>)> {
         match self {
-            CallUiState::Active { id, media, .. } | CallUiState::EarlyMedia { id, media, .. } => {
-                Some((id, media))
-            }
+            CallUiState::Active { id, media, .. } | CallUiState::EarlyMedia { id, media, .. } => Some((id, media)),
             _ => None,
         }
     }
@@ -441,7 +443,9 @@ impl AccountSession {
             return;
         };
         let sent_via_rtp = self.config.dtmf_mode != DtmfMode::InfoOnly
-            && media.as_ref().is_some_and(|m| m.send_dtmf(digit, DTMF_EVENT_DURATION_MS));
+            && media
+                .as_ref()
+                .is_some_and(|m| m.send_dtmf(digit, DTMF_EVENT_DURATION_MS));
         if !sent_via_rtp && self.config.dtmf_mode != DtmfMode::Rfc4733Only {
             self.send_command(CoreCommand::SendDtmf { id: id.clone(), digit });
         }
@@ -489,7 +493,10 @@ impl AccountSession {
     fn unjoin_line(&mut self, idx: usize) {
         if let Some(partner_line) = self.joined[idx].take() {
             let partner_idx = line_idx(partner_line);
-            if let CallUiState::Active { media: Some(session), .. } = &self.lines[partner_idx] {
+            if let CallUiState::Active {
+                media: Some(session), ..
+            } = &self.lines[partner_idx]
+            {
                 session.unjoin();
             }
             self.joined[partner_idx] = None;
@@ -505,10 +512,16 @@ impl AccountSession {
         if a_idx == b_idx {
             return None;
         }
-        let CallUiState::Active { media: Some(a_media), .. } = &self.lines[a_idx] else {
+        let CallUiState::Active {
+            media: Some(a_media), ..
+        } = &self.lines[a_idx]
+        else {
             return None;
         };
-        let CallUiState::Active { media: Some(b_media), .. } = &self.lines[b_idx] else {
+        let CallUiState::Active {
+            media: Some(b_media), ..
+        } = &self.lines[b_idx]
+        else {
             return None;
         };
         Some((a_media, b_media))
@@ -933,7 +946,11 @@ impl App {
         else {
             return None;
         };
-        Some(if modifiers.shift() { Message::FocusPrevious } else { Message::FocusNext })
+        Some(if modifiers.shift() {
+            Message::FocusPrevious
+        } else {
+            Message::FocusNext
+        })
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -1027,7 +1044,15 @@ impl App {
                 Task::none()
             }
 
-            Message::Core(account, CoreEvent::IncomingCall { id, line, remote, offer }) => {
+            Message::Core(
+                account,
+                CoreEvent::IncomingCall {
+                    id,
+                    line,
+                    remote,
+                    offer,
+                },
+            ) => {
                 let idx = line_idx(line);
                 // DND and the deny list are both checked *before* the line
                 // ever shows as ringing — this call never occupies a line
@@ -1328,16 +1353,14 @@ impl App {
                 self.audio_settings_window = Some(id);
                 let device_task = Task::future(async {
                     let (inputs, outputs) = tokio::task::spawn_blocking(|| {
-                        let inputs = softphone_media::devices::list_input_devices()
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(%e, "failed to list input devices");
-                                Vec::new()
-                            });
-                        let outputs = softphone_media::devices::list_output_devices()
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(%e, "failed to list output devices");
-                                Vec::new()
-                            });
+                        let inputs = softphone_media::devices::list_input_devices().unwrap_or_else(|e| {
+                            tracing::warn!(%e, "failed to list input devices");
+                            Vec::new()
+                        });
+                        let outputs = softphone_media::devices::list_output_devices().unwrap_or_else(|e| {
+                            tracing::warn!(%e, "failed to list output devices");
+                            Vec::new()
+                        });
                         (inputs, outputs)
                     })
                     .await
@@ -1758,9 +1781,7 @@ impl App {
                 if let Some(acc) = self.selected_mut() {
                     let idx = acc.selected_idx();
                     if let CallUiState::Active {
-                        media,
-                        input_volume,
-                        ..
+                        media, input_volume, ..
                     } = &mut acc.lines[idx]
                     {
                         *input_volume = gain;
@@ -1778,7 +1799,9 @@ impl App {
                 Task::none()
             }
             Message::DialNumber(number) => {
-                let Some(acc) = self.selected() else { return Task::none() };
+                let Some(acc) = self.selected() else {
+                    return Task::none();
+                };
                 let idx = acc.selected_idx();
                 if !matches!(acc.lines[idx], CallUiState::Idle) {
                     self.error = Some("selected line is busy — pick a free line first".to_string());
@@ -1846,9 +1869,7 @@ impl App {
             Message::TransferConfirmed => {
                 if let Some(acc) = self.selected_mut() {
                     let idx = acc.selected_idx();
-                    if let CallUiState::Active {
-                        id, transfer_input, ..
-                    } = &mut acc.lines[idx]
+                    if let CallUiState::Active { id, transfer_input, .. } = &mut acc.lines[idx]
                         && let Some(target) = transfer_input.take()
                     {
                         let target = target.trim().to_string();
@@ -1872,9 +1893,7 @@ impl App {
                     return Task::none();
                 };
                 let step = if let CallUiState::Active { post_dial, .. } = &mut acc.lines[idx] {
-                    post_dial
-                        .pop_front()
-                        .map(|next| (next, !post_dial.is_empty()))
+                    post_dial.pop_front().map(|next| (next, !post_dial.is_empty()))
                 } else {
                     None
                 };
@@ -1930,7 +1949,9 @@ impl App {
             }
             Message::LineSelected(line) => self.select_line(line),
             Message::JoinCallsPressed => {
-                let Some(acc) = self.selected_mut() else { return Task::none() };
+                let Some(acc) = self.selected_mut() else {
+                    return Task::none();
+                };
                 if acc.pending_join.is_some() {
                     acc.pending_join = None;
                     return Task::none();
@@ -1940,9 +1961,8 @@ impl App {
                     return Task::none();
                 }
                 let selected_line = acc.selected_line;
-                let has_other_active = (1..=LINE_COUNT as u8).any(|l| {
-                    l != selected_line && matches!(acc.lines[line_idx(l)], CallUiState::Active { .. })
-                });
+                let has_other_active = (1..=LINE_COUNT as u8)
+                    .any(|l| l != selected_line && matches!(acc.lines[line_idx(l)], CallUiState::Active { .. }));
                 if has_other_active {
                     acc.pending_join = Some(selected_line);
                     self.error = None;
@@ -1966,11 +1986,12 @@ impl App {
                 Task::none()
             }
             Message::AddCallPressed => {
-                let Some(acc) = self.selected() else { return Task::none() };
+                let Some(acc) = self.selected() else {
+                    return Task::none();
+                };
                 let selected_line = acc.selected_line;
-                let free = (1..=LINE_COUNT as u8).find(|&l| {
-                    l != selected_line && matches!(acc.lines[line_idx(l)], CallUiState::Idle)
-                });
+                let free = (1..=LINE_COUNT as u8)
+                    .find(|&l| l != selected_line && matches!(acc.lines[line_idx(l)], CallUiState::Idle));
                 match free {
                     Some(line) => {
                         self.error = None;
@@ -2052,8 +2073,11 @@ impl App {
                 Task::none()
             }
             Message::HistoryContextMenuToggled(index) => {
-                self.history_context_menu =
-                    if self.history_context_menu == Some(index) { None } else { Some(index) };
+                self.history_context_menu = if self.history_context_menu == Some(index) {
+                    None
+                } else {
+                    Some(index)
+                };
                 Task::none()
             }
             Message::AddHistoryEntryToContacts(index) => {
@@ -2108,9 +2132,7 @@ impl App {
                         .add_filter("JSON", &["json"])
                         .pick_file()
                         .await;
-                    Message::ContactsIoPathChanged(
-                        file.map(|f| f.path().display().to_string()).unwrap_or(current),
-                    )
+                    Message::ContactsIoPathChanged(file.map(|f| f.path().display().to_string()).unwrap_or(current))
                 })
             }
             Message::BrowseContactsExportPressed => {
@@ -2122,9 +2144,7 @@ impl App {
                         .set_file_name("contacts_export.json")
                         .save_file()
                         .await;
-                    Message::ContactsIoPathChanged(
-                        file.map(|f| f.path().display().to_string()).unwrap_or(current),
-                    )
+                    Message::ContactsIoPathChanged(file.map(|f| f.path().display().to_string()).unwrap_or(current))
                 })
             }
 
@@ -2240,7 +2260,9 @@ impl App {
     }
 
     fn complete_join_selected(&mut self, a: u8, b: u8) -> Task<Message> {
-        let Some(acc) = self.selected_mut() else { return Task::none() };
+        let Some(acc) = self.selected_mut() else {
+            return Task::none();
+        };
         match acc.complete_join(a, b) {
             Ok(()) => self.error = None,
             Err(e) => self.error = Some(e.to_string()),
@@ -2306,12 +2328,7 @@ impl App {
     /// ({mm}m{ss}s) {unix_secs}.wav"` — number and duration for easy
     /// recognition per the ask, plus a timestamp so calling the same number
     /// twice doesn't overwrite the first recording.
-    fn save_recording_if_any(
-        settings: &AppSettings,
-        session: Option<&MediaSession>,
-        number: &str,
-        duration: Duration,
-    ) {
+    fn save_recording_if_any(settings: &AppSettings, session: Option<&MediaSession>, number: &str, duration: Duration) {
         let Some(session) = session else { return };
         let Some(samples) = session.stop_recording() else {
             return;
@@ -2327,7 +2344,11 @@ impl App {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '-')
             .collect();
-        let safe_number = if safe_number.is_empty() { "unknown".to_string() } else { safe_number };
+        let safe_number = if safe_number.is_empty() {
+            "unknown".to_string()
+        } else {
+            safe_number
+        };
         let secs = duration.as_secs();
         let filename = format!(
             "{safe_number} ({}m{:02}s) {}.wav",
@@ -2359,15 +2380,17 @@ impl App {
                 return;
             }
         };
-        if self.sip_settings_form.host.trim().is_empty()
-            || self.sip_settings_form.username.trim().is_empty()
-        {
+        if self.sip_settings_form.host.trim().is_empty() || self.sip_settings_form.username.trim().is_empty() {
             self.error = Some("server and username are required".to_string());
             return;
         }
         let name = self.sip_settings_form.name.trim();
         let name = if name.is_empty() {
-            format!("{}@{}", self.sip_settings_form.username.trim(), self.sip_settings_form.host.trim())
+            format!(
+                "{}@{}",
+                self.sip_settings_form.username.trim(),
+                self.sip_settings_form.host.trim()
+            )
         } else {
             name.to_string()
         };
@@ -2593,8 +2616,7 @@ impl App {
                         // the only path that avoids a pointless rebuild of a
                         // session that may already be carrying real audio.
                         let post_dial: VecDeque<char> = acc.pending_post_dials[idx].drain(..).collect();
-                        let avatar_glow =
-                            iced::Animation::new(avatar_live(media.is_some(), false)).quick();
+                        let avatar_glow = iced::Animation::new(avatar_live(media.is_some(), false)).quick();
                         acc.lines[idx] = CallUiState::Active {
                             id: id.clone(),
                             number,
@@ -2626,7 +2648,11 @@ impl App {
                     // socket since `EarlyMedia` already consumed the
                     // original one from `pending_sockets`.
                     drop(media);
-                    acc.lines[idx] = CallUiState::Outgoing { id: id.clone(), number, started_at };
+                    acc.lines[idx] = CallUiState::Outgoing {
+                        id: id.clone(),
+                        number,
+                        started_at,
+                    };
                     match ReservedSocket::reserve() {
                         Ok(reserved) => acc.pending_sockets[idx] = Some(reserved),
                         Err(e) => {
@@ -2642,12 +2668,8 @@ impl App {
                     return Task::none();
                 };
                 let (number, direction) = match &acc.lines[idx] {
-                    CallUiState::Outgoing { number, .. } => {
-                        (number.clone(), history::CallDirection::Outgoing)
-                    }
-                    CallUiState::Incoming { caller, .. } => {
-                        (caller.clone(), history::CallDirection::Incoming)
-                    }
+                    CallUiState::Outgoing { number, .. } => (number.clone(), history::CallDirection::Outgoing),
+                    CallUiState::Incoming { caller, .. } => (caller.clone(), history::CallDirection::Incoming),
                     _ => (String::new(), history::CallDirection::Outgoing),
                 };
                 let post_dial: VecDeque<char> = acc.pending_post_dials[idx].drain(..).collect();
@@ -2876,7 +2898,9 @@ impl App {
     }
 
     fn handle_dialpad(&mut self, digit: char) -> Task<Message> {
-        let Some(acc) = self.selected_mut() else { return Task::none() };
+        let Some(acc) = self.selected_mut() else {
+            return Task::none();
+        };
         let idx = acc.selected_idx();
         match &mut acc.lines[idx] {
             CallUiState::Idle => {
@@ -2991,9 +3015,9 @@ impl App {
         };
         let idx = acc.selected_idx();
         let id = match &acc.lines[idx] {
-            CallUiState::Active { id, .. }
-            | CallUiState::Outgoing { id, .. }
-            | CallUiState::EarlyMedia { id, .. } => Some(id.clone()),
+            CallUiState::Active { id, .. } | CallUiState::Outgoing { id, .. } | CallUiState::EarlyMedia { id, .. } => {
+                Some(id.clone())
+            }
             _ => None,
         };
         let Some(id) = id else { return Task::none() };
@@ -3029,7 +3053,9 @@ impl App {
             }
             _ => {}
         }
-        let Some(acc) = self.selected_mut() else { return Task::none() };
+        let Some(acc) = self.selected_mut() else {
+            return Task::none();
+        };
         let idx = acc.selected_idx();
         acc.lines[idx] = CallUiState::Idle;
         acc.pending_sockets[idx] = None;
@@ -3057,9 +3083,7 @@ fn sanitize_dial_chars(input: &str, allow_leading_plus: bool) -> String {
     input
         .chars()
         .enumerate()
-        .filter(|(i, c)| {
-            c.is_ascii_digit() || *c == '*' || *c == '#' || (allow_leading_plus && *c == '+' && *i == 0)
-        })
+        .filter(|(i, c)| c.is_ascii_digit() || *c == '*' || *c == '#' || (allow_leading_plus && *c == '+' && *i == 0))
         .map(|(_, c)| c)
         .collect()
 }

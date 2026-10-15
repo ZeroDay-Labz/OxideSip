@@ -1,6 +1,6 @@
+use softphone_core::SoftphoneCore;
 use softphone_core::config;
 use softphone_core::events::{CoreCommand, CoreEvent};
-use softphone_core::SoftphoneCore;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -11,9 +11,7 @@ async fn main() {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "oxidesip.toml".to_string());
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "oxidesip.toml".to_string());
     let cfg = if PathBuf::from(&config_path).exists() {
         config::load_config(Path::new(&config_path)).expect("failed to load config file")
     } else {

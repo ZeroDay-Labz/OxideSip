@@ -29,8 +29,7 @@ impl SoftphoneCore {
         command_rx: mpsc::Receiver<CoreCommand>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let transport_layer =
-            transport::build_transport_layer(&config, cancel.child_token()).await?;
+        let transport_layer = transport::build_transport_layer(&config, cancel.child_token()).await?;
         let endpoint = transport::build_endpoint(transport_layer.clone(), cancel.child_token());
 
         let registrar = transport::registrar_uri(&config)?;

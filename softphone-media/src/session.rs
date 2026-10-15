@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 // A few hundred ms is plenty for the bridge relay — it only needs to smooth
@@ -163,8 +163,7 @@ impl RecordMixer {
         }
         for (i, &s) in chunk.iter().enumerate() {
             let idx = start + i;
-            self.samples[idx] =
-                (self.samples[idx] as i32 + s as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            self.samples[idx] = (self.samples[idx] as i32 + s as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
         *pos = end;
     }
@@ -374,10 +373,8 @@ impl MediaSession {
     /// playback needs no special handling here: both lines' playback streams
     /// already mix naturally in PipeWire as long as neither is on hold.
     pub fn join_with(&self, other: &MediaSession) {
-        let (prod_self_to_other, cons_self_to_other) =
-            HeapRb::<i16>::new(BRIDGE_RING_CAPACITY).split();
-        let (prod_other_to_self, cons_other_to_self) =
-            HeapRb::<i16>::new(BRIDGE_RING_CAPACITY).split();
+        let (prod_self_to_other, cons_self_to_other) = HeapRb::<i16>::new(BRIDGE_RING_CAPACITY).split();
+        let (prod_other_to_self, cons_other_to_self) = HeapRb::<i16>::new(BRIDGE_RING_CAPACITY).split();
 
         if let Ok(mut relay) = self.bridge_relay_out.lock() {
             *relay = Some(prod_self_to_other);
@@ -886,8 +883,7 @@ impl ReorderBuffer {
         }
 
         self.pending.push((seq, samples));
-        self.pending
-            .sort_unstable_by_key(|(s, _)| s.wrapping_sub(expected));
+        self.pending.sort_unstable_by_key(|(s, _)| s.wrapping_sub(expected));
 
         if self.pending.len() > REORDER_WINDOW {
             // Real loss, not just reordering: force the window forward to
@@ -903,11 +899,7 @@ impl ReorderBuffer {
         }
 
         let mut out = Vec::new();
-        while let Some(pos) = self
-            .pending
-            .iter()
-            .position(|(s, _)| *s == self.expected.unwrap())
-        {
+        while let Some(pos) = self.pending.iter().position(|(s, _)| *s == self.expected.unwrap()) {
             let (_, samples) = self.pending.remove(pos);
             out.extend(samples);
             self.expected = Some(self.expected.unwrap().wrapping_add(1));
@@ -995,7 +987,10 @@ mod tests {
     #[tokio::test]
     async fn dtmf_event_marker_only_on_first_packet() {
         let mut state = DtmfEventState::new(
-            DtmfSend { digit: '5', duration_ms: 250 },
+            DtmfSend {
+                digit: '5',
+                duration_ms: 250,
+            },
             1000,
         );
         let results = drive_event(&mut state, 3).await;
@@ -1007,7 +1002,10 @@ mod tests {
     #[tokio::test]
     async fn dtmf_event_timestamp_stays_frozen_across_packets() {
         let mut state = DtmfEventState::new(
-            DtmfSend { digit: '5', duration_ms: 250 },
+            DtmfSend {
+                digit: '5',
+                duration_ms: 250,
+            },
             42_000,
         );
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1024,7 +1022,10 @@ mod tests {
         // 250ms @ 8kHz = 2000 ticks = ceil(2000/160) = 13 packets to reach
         // the end, then 3 total end-marked packets (this one plus 2 more).
         let mut state = DtmfEventState::new(
-            DtmfSend { digit: '5', duration_ms: 250 },
+            DtmfSend {
+                digit: '5',
+                duration_ms: 250,
+            },
             0,
         );
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1046,7 +1047,13 @@ mod tests {
     async fn dtmf_event_zero_duration_still_completes() {
         // A degenerate very-short digit still produces a valid marker+end
         // packet train rather than looping forever.
-        let mut state = DtmfEventState::new(DtmfSend { digit: '1', duration_ms: 0 }, 0);
+        let mut state = DtmfEventState::new(
+            DtmfSend {
+                digit: '1',
+                duration_ms: 0,
+            },
+            0,
+        );
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let remote_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut seq = 0u16;
