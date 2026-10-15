@@ -6,6 +6,7 @@ mod bridge;
 mod contacts;
 mod history;
 mod icon;
+mod number;
 mod paths;
 mod theme;
 mod view;

@@ -1,11 +1,14 @@
 use crate::config::{DtmfMode, SipAccountConfig};
-use crate::events::{CallId, CallState, CoreCommand, CoreEvent, LocalMediaInfo, RemoteMediaInfo};
+use crate::events::{
+    CallId, CallState, CoreCommand, CoreEvent, LocalMediaInfo, RejectReason, RemoteMediaInfo, RemoteParty,
+};
 use crate::sdp;
 use rsipstack::dialog::DialogId;
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog::{Dialog, DialogState, TerminatedReason};
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
+use rsipstack::sip::ToTypedHeader;
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{Header, Method, StatusCode, StatusCodeKind, Uri};
 use rsipstack::transaction::TransactionReceiver;
@@ -222,7 +225,7 @@ async fn handle_dialog_state(
                 },
             );
 
-            let remote = initial_request.from_header().map(|h| h.to_string()).unwrap_or_default();
+            let remote = remote_party(&initial_request);
             event_tx
                 .send(CoreEvent::IncomingCall {
                     id: call_id,
@@ -340,6 +343,50 @@ async fn handle_dialog_state(
         }
         _ => {}
     }
+}
+
+/// Builds the UI-facing caller identity for an INVITE. Prefers the typed
+/// `From` parse; a `P-Asserted-Identity` display name (what FreePBX/Asterisk
+/// put the caller-ID name in for trunk calls) wins over `From`'s when the
+/// latter is missing. Falls back to a lenient text parse so an oddly
+/// formatted header still yields *something* instead of an empty caller.
+fn remote_party(request: &rsipstack::sip::Request) -> RemoteParty {
+    let from_value = request.from_header().map(|h| h.value().to_string()).unwrap_or_default();
+    let mut party = match request.from_header().ok().and_then(|h| h.typed().ok()) {
+        Some(typed) => {
+            let mut uri = typed.uri.clone();
+            uri.params.clear();
+            uri.headers.clear();
+            let user = uri
+                .user()
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| uri.host().to_string());
+            RemoteParty {
+                display_name: typed
+                    .display_name
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty()),
+                user,
+                uri: uri.to_string(),
+            }
+        }
+        None => RemoteParty::from_header_value(&from_value),
+    };
+    if party.display_name.is_none() {
+        let pai = request.headers.iter().find_map(|h| match h {
+            Header::Other(name, value)
+                if name.eq_ignore_ascii_case("P-Asserted-Identity") || name.eq_ignore_ascii_case("Remote-Party-ID") =>
+            {
+                Some(RemoteParty::from_header_value(value))
+            }
+            _ => None,
+        });
+        if let Some(pai) = pai {
+            party.display_name = pai.display_name;
+        }
+    }
+    party
 }
 
 /// Short, human-readable label for why a call ended — surfaced to the UI
@@ -690,13 +737,17 @@ async fn handle_command(
             }
             event_tx.send(CoreEvent::TransferResult { id, ok }).await.ok();
         }
-        CoreCommand::RejectCall(id) => {
+        CoreCommand::RejectCall { id, reason } => {
             let Some(current) = tracker.find(&id) else {
                 return;
             };
             let dialog_id = current.dialog_id.clone();
             if let Some(Dialog::ServerInvite(dlg)) = dialog_layer.get_dialog(&dialog_id) {
-                dlg.reject(Some(StatusCode::BusyHere), Some("Busy here".into())).ok();
+                let (code, phrase) = match reason {
+                    RejectReason::Busy => (StatusCode::BusyHere, "Busy here"),
+                    RejectReason::Decline => (StatusCode::Decline, "Decline"),
+                };
+                dlg.reject(Some(code), Some(phrase.into())).ok();
             }
             event_tx
                 .send(CoreEvent::CallStateChanged {

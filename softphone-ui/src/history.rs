@@ -24,6 +24,11 @@ pub enum CallOutcome {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HistoryEntry {
     pub number: String,
+    /// The caller/callee's display name as the network reported it (SIP
+    /// display name), if any. Contacts are matched by `number` at render
+    /// time, so this is only the fallback when no contact matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub direction: CallDirection,
     pub outcome: CallOutcome,
     pub unix_secs: i64,
@@ -49,6 +54,26 @@ pub fn load() -> Vec<HistoryEntry> {
         .and_then(|text| toml::from_str::<HistoryFile>(&text).ok())
         .map(|f| f.entries)
         .unwrap_or_default()
+        .into_iter()
+        .map(repair_legacy_entry)
+        .collect()
+}
+
+/// Versions before 0.2.0 stored the raw SIP `From` header as the number for
+/// incoming calls (`From: "Alice" <sip:1001@pbx>;tag=…`). Split such entries
+/// into a proper number + name once, on load; the next save writes the
+/// repaired form.
+fn repair_legacy_entry(mut entry: HistoryEntry) -> HistoryEntry {
+    let looks_raw =
+        entry.number.starts_with("From:") || entry.number.contains("<sip:") || entry.number.contains("sip:");
+    if looks_raw {
+        let party = softphone_core::events::RemoteParty::from_header_value(&entry.number);
+        entry.number = party.user;
+        if entry.name.is_none() {
+            entry.name = party.display_name;
+        }
+    }
+    entry
 }
 
 /// Persists `entries`, keeping only the most recent `MAX_ENTRIES` (oldest

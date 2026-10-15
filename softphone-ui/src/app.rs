@@ -2,10 +2,10 @@ use crate::app_settings::{self, AppSettings};
 use crate::audio_devices::{self, AudioDeviceConfig};
 use crate::contacts::{self, Contact};
 use crate::history;
-use crate::{branding, bridge, icon, view};
+use crate::{branding, bridge, icon, number, view};
 use iced::{Element, Subscription, Task, window};
 use softphone_core::config::{DtmfMode, PREFERRED_CODECS, PreferredCodec, SipAccountConfig, SipTransport};
-use softphone_core::events::{CallId, CallState, CoreCommand, CoreEvent, RemoteMediaInfo};
+use softphone_core::events::{CallId, CallState, CoreCommand, CoreEvent, RejectReason, RemoteMediaInfo, RemoteParty};
 use softphone_media::{AudioDevice, DtmfTonePlayer, MediaSession, ReservedSocket};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -47,7 +47,7 @@ pub enum CallUiState {
     Idle,
     Incoming {
         id: CallId,
-        caller: String,
+        caller: RemoteParty,
         #[allow(dead_code)] // kept for parity with the negotiated offer; not read by the view yet
         offer: RemoteMediaInfo,
         /// When this call started ringing — drives the footer's live
@@ -79,6 +79,9 @@ pub enum CallUiState {
     Active {
         id: CallId,
         number: String,
+        /// The far end's SIP display name (incoming calls only) — shown when
+        /// no saved contact matches `number`.
+        remote_name: Option<String>,
         direction: history::CallDirection,
         media: Option<MediaSession>,
         dtmf_feedback: Vec<char>,
@@ -1056,18 +1059,23 @@ impl App {
                 // or shows up as "missed," it's rejected outright, same as
                 // a real phone's call-blocking behaves.
                 let denied = self.settings.dnd
-                    || self
-                        .settings
-                        .deny_list
-                        .iter()
-                        .any(|entry| !entry.trim().is_empty() && remote.contains(entry.trim()));
+                    || number::denied(
+                        &self.settings.deny_list,
+                        remote.display_name.as_deref(),
+                        &remote.user,
+                        &remote.uri,
+                    );
                 if denied {
                     if let Some(acc) = self.accounts.get(account) {
-                        acc.send_command(CoreCommand::RejectCall(id));
+                        acc.send_command(CoreCommand::RejectCall {
+                            id,
+                            reason: RejectReason::Busy,
+                        });
                     }
-                    Self::push_history(
+                    Self::push_history_named(
                         &mut self.call_history,
-                        remote,
+                        remote.user.clone(),
+                        remote.display_name.clone(),
                         history::CallDirection::Incoming,
                         history::CallOutcome::Rejected,
                         None,
@@ -1220,7 +1228,10 @@ impl App {
                     let idx = acc.selected_idx();
                     if let CallUiState::Incoming { id, .. } = &acc.lines[idx] {
                         let id = id.clone();
-                        acc.send_command(CoreCommand::RejectCall(id.clone()));
+                        acc.send_command(CoreCommand::RejectCall {
+                            id: id.clone(),
+                            reason: RejectReason::Decline,
+                        });
                         Some(id)
                     } else {
                         None
@@ -1243,7 +1254,10 @@ impl App {
             Message::RejectIncomingCall(account, id) => {
                 let close_task = self.close_incoming_popup(&id);
                 if let Some(acc) = self.accounts.get(account) {
-                    acc.send_command(CoreCommand::RejectCall(id));
+                    acc.send_command(CoreCommand::RejectCall {
+                        id,
+                        reason: RejectReason::Decline,
+                    });
                 }
                 close_task
             }
@@ -1418,7 +1432,10 @@ impl App {
                     for line in &acc.lines {
                         match line {
                             CallUiState::Incoming { id, .. } => {
-                                acc.send_command(CoreCommand::RejectCall(id.clone()));
+                                acc.send_command(CoreCommand::RejectCall {
+                                    id: id.clone(),
+                                    reason: RejectReason::Decline,
+                                });
                             }
                             CallUiState::Outgoing { id, .. }
                             | CallUiState::EarlyMedia { id, .. }
@@ -1656,7 +1673,10 @@ impl App {
                     // popup directly, which we treat the same as pressing
                     // Decline.
                     if let Some(acc) = self.accounts.get(account) {
-                        acc.send_command(CoreCommand::RejectCall(call_id));
+                        acc.send_command(CoreCommand::RejectCall {
+                            id: call_id,
+                            reason: RejectReason::Decline,
+                        });
                     }
                     Task::none()
                 } else if Some(id) == self.sip_settings_window {
@@ -2290,8 +2310,20 @@ impl App {
         outcome: history::CallOutcome,
         duration: Option<Duration>,
     ) {
+        Self::push_history_named(call_history, number, None, direction, outcome, duration);
+    }
+
+    fn push_history_named(
+        call_history: &mut Vec<history::HistoryEntry>,
+        number: String,
+        name: Option<String>,
+        direction: history::CallDirection,
+        outcome: history::CallOutcome,
+        duration: Option<Duration>,
+    ) {
         let entry = history::HistoryEntry {
             number,
+            name,
             direction,
             outcome,
             unix_secs: history::now_unix(),
@@ -2606,6 +2638,7 @@ impl App {
                         acc.lines[idx] = CallUiState::Active {
                             id: id.clone(),
                             number,
+                            remote_name: None,
                             direction: history::CallDirection::Outgoing,
                             media,
                             dtmf_feedback: Vec::new(),
@@ -2653,16 +2686,21 @@ impl App {
                     tracing::warn!("call answered with no reserved local socket");
                     return Task::none();
                 };
-                let (number, direction) = match &acc.lines[idx] {
-                    CallUiState::Outgoing { number, .. } => (number.clone(), history::CallDirection::Outgoing),
-                    CallUiState::Incoming { caller, .. } => (caller.clone(), history::CallDirection::Incoming),
-                    _ => (String::new(), history::CallDirection::Outgoing),
+                let (number, remote_name, direction) = match &acc.lines[idx] {
+                    CallUiState::Outgoing { number, .. } => (number.clone(), None, history::CallDirection::Outgoing),
+                    CallUiState::Incoming { caller, .. } => (
+                        caller.user.clone(),
+                        caller.display_name.clone(),
+                        history::CallDirection::Incoming,
+                    ),
+                    _ => (String::new(), None, history::CallDirection::Outgoing),
                 };
                 let post_dial: VecDeque<char> = acc.pending_post_dials[idx].drain(..).collect();
                 let has_post_dial = !post_dial.is_empty();
                 acc.lines[idx] = CallUiState::Active {
                     id: id.clone(),
                     number,
+                    remote_name,
                     direction,
                     media: None,
                     dtmf_feedback: Vec::new(),
@@ -2737,9 +2775,10 @@ impl App {
             CallState::Rejected => {
                 if let Some(idx) = acc.line_index_for_call(&id) {
                     if let CallUiState::Incoming { caller, .. } = &acc.lines[idx] {
-                        Self::push_history(
+                        Self::push_history_named(
                             &mut self.call_history,
-                            caller.clone(),
+                            caller.user.clone(),
+                            caller.display_name.clone(),
                             history::CallDirection::Incoming,
                             history::CallOutcome::Rejected,
                             None,
@@ -2794,9 +2833,10 @@ impl App {
                 acc.last_call_status[idx] = (!reason.is_empty()).then_some(reason);
                 match &acc.lines[idx] {
                     CallUiState::Incoming { caller, .. } => {
-                        Self::push_history(
+                        Self::push_history_named(
                             &mut self.call_history,
-                            caller.clone(),
+                            caller.user.clone(),
+                            caller.display_name.clone(),
                             history::CallDirection::Incoming,
                             history::CallOutcome::Missed,
                             None,

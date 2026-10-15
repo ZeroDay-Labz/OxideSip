@@ -60,7 +60,10 @@ async fn main() {
                     // audio pipeline, so it doesn't reserve a real RTP port -- the real
                     // UI reserves one via softphone-media before sending AnswerCall.
                     "a" => { command_tx.send(CoreCommand::AnswerCall { id, local_rtp_port: 40000 }).await.ok(); }
-                    "r" => { command_tx.send(CoreCommand::RejectCall(id)).await.ok(); }
+                    "r" => { command_tx.send(CoreCommand::RejectCall {
+                    id,
+                    reason: softphone_core::events::RejectReason::Busy,
+                }).await.ok(); }
                     _ => {}
                 }
             }

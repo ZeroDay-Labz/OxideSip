@@ -5,6 +5,7 @@ use crate::app::{
 use crate::contacts::Contact;
 use crate::history::{self, CallDirection, CallOutcome, HistoryEntry};
 use crate::icon;
+use crate::number;
 use crate::theme::{self, Pill};
 use iced::widget::{
     button, column, container, mouse_area, pick_list, row, rule, scrollable, slider, stack, text, text_input, toggler,
@@ -13,6 +14,7 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length};
 use softphone_core::config::{DTMF_MODES, SIP_TRANSPORTS, SipTransport};
 use softphone_core::events::CallId;
+use softphone_core::events::RemoteParty;
 use std::time::Instant;
 
 const DANGER_TEXT: Color = Color {
@@ -179,7 +181,7 @@ fn line_sidebar(acc: &AccountSession, scale: f32, secondary_input_configured: bo
         let armed_idle = selected && acc.line_open && matches!(call, CallUiState::Idle);
         let (fill, sub_label) = match call {
             CallUiState::Idle => (None, String::new()),
-            CallUiState::Incoming { caller, .. } => (Some(theme::oxide_palette().warning), short_label(caller)),
+            CallUiState::Incoming { caller, .. } => (Some(theme::oxide_palette().warning), short_label(caller.label())),
             CallUiState::Outgoing { number, .. } => (Some(theme::oxide_palette().primary), short_label(number)),
             CallUiState::EarlyMedia { number, .. } => (Some(theme::oxide_palette().primary), short_label(number)),
             CallUiState::Active { number, .. } => {
@@ -629,6 +631,7 @@ fn dialer_tab<'a>(app: &'a App, acc: &'a AccountSession, scale: f32) -> Element<
         }
         CallUiState::Active {
             number,
+            remote_name,
             media,
             dtmf_feedback,
             answered_at,
@@ -645,6 +648,7 @@ fn dialer_tab<'a>(app: &'a App, acc: &'a AccountSession, scale: f32) -> Element<
             active_view(
                 &app.contacts,
                 number,
+                remote_name.as_deref(),
                 media.is_some(),
                 avatar_glow.interpolate(0.0_f32, 1.0_f32, Instant::now()),
                 *answered_at,
@@ -861,23 +865,28 @@ fn dial_history_panel(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-fn incoming_view<'a>(contacts: &[Contact], caller: &'a str, scale: f32) -> Element<'a, Message> {
-    let avatar = container(text(call_avatar_label(contacts, caller)).size(scaled(20.0, scale)))
+fn incoming_view<'a>(contacts: &'a [Contact], caller: &'a RemoteParty, scale: f32) -> Element<'a, Message> {
+    let avatar_seed = party_name(contacts, caller).unwrap_or(&caller.user);
+    let avatar = container(text(call_avatar_label_for(contacts, caller)).size(scaled(20.0, scale)))
         .width(Length::Fixed(scaled(78.0, scale)))
         .height(Length::Fixed(scaled(78.0, scale)))
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
-        .style(theme::avatar_state(theme::avatar_color(caller), 1.0));
+        .style(theme::avatar_state(theme::avatar_color(avatar_seed), 1.0));
+
+    let mut identity = column![text("Incoming call").size(13).color(muted_text())];
+    match party_name(contacts, caller) {
+        Some(name) => {
+            identity = identity
+                .push(text(name).size(20))
+                .push(text(caller.user.as_str()).size(13).color(muted_text()));
+        }
+        None => identity = identity.push(text(caller.user.as_str()).size(20)),
+    }
 
     column![
         column![avatar].width(Length::Fill).align_x(Alignment::Center),
-        column![
-            text("Incoming call").size(13).color(muted_text()),
-            text(caller).size(20),
-        ]
-        .spacing(4)
-        .width(Length::Fill)
-        .align_x(Alignment::Center),
+        identity.spacing(4).width(Length::Fill).align_x(Alignment::Center),
         row![
             pill_call_button("Decline", theme::pill(Pill::Danger), icon::telephone_x_fill(), scale)
                 .on_press(Message::RejectPressed),
@@ -901,33 +910,44 @@ fn incoming_view<'a>(contacts: &[Contact], caller: &'a str, scale: f32) -> Eleme
 /// full-window centering container, since — unlike `incoming_view` — this
 /// is the popup's entire content, not one screen embedded in the larger
 /// dialer layout.
+static UNKNOWN_CALLER: std::sync::LazyLock<RemoteParty> = std::sync::LazyLock::new(|| RemoteParty {
+    user: "Unknown caller".to_string(),
+    ..RemoteParty::default()
+});
+
 pub fn incoming_call_popup_view<'a>(app: &'a App, account: usize, call_id: &CallId) -> Element<'a, Message> {
-    let caller = app
+    let caller: &RemoteParty = app
         .accounts
         .get(account)
         .and_then(|acc| acc.line_index_for_call(call_id))
         .and_then(|idx| match &app.accounts[account].lines[idx] {
-            CallUiState::Incoming { caller, .. } => Some(caller.as_str()),
+            CallUiState::Incoming { caller, .. } => Some(caller),
             _ => None,
         })
-        .unwrap_or("Unknown caller");
+        .unwrap_or(&UNKNOWN_CALLER);
 
-    let avatar = container(text(call_avatar_label(&app.contacts, caller)).size(24.0))
+    let name = party_name(&app.contacts, caller);
+    let avatar_seed = name.unwrap_or(&caller.user);
+    let avatar = container(text(call_avatar_label_for(&app.contacts, caller)).size(24.0))
         .width(Length::Fixed(84.0))
         .height(Length::Fixed(84.0))
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
-        .style(theme::avatar_state(theme::avatar_color(caller), 1.0));
+        .style(theme::avatar_state(theme::avatar_color(avatar_seed), 1.0));
+
+    let mut identity = column![text("Incoming call").size(13).color(muted_text())];
+    match name {
+        Some(name) => {
+            identity = identity
+                .push(text(name).size(18))
+                .push(text(caller.user.as_str()).size(13).color(muted_text()));
+        }
+        None => identity = identity.push(text(caller.user.as_str()).size(18)),
+    }
 
     let content = column![
         column![avatar].width(Length::Fill).align_x(Alignment::Center),
-        column![
-            text("Incoming call").size(13).color(muted_text()),
-            text(caller).size(18),
-        ]
-        .spacing(4)
-        .width(Length::Fill)
-        .align_x(Alignment::Center),
+        identity.spacing(4).width(Length::Fill).align_x(Alignment::Center),
         row![
             pill_call_button("Decline", theme::pill(Pill::Danger), icon::telephone_x_fill(), 1.0)
                 .on_press(Message::RejectIncomingCall(account, call_id.clone())),
@@ -1004,8 +1024,8 @@ fn initial(label: &str) -> String {
 /// *last* two digits — more identifying in practice (e.g. a PBX
 /// extension's own number) than an arbitrary leading one.
 fn call_avatar_label(contacts: &[Contact], raw: &str) -> String {
-    if let Some(contact) = contacts.iter().find(|c| c.number == raw) {
-        return contact_initials(&contact.name);
+    if let Some(name) = contact_name_for(contacts, raw) {
+        return contact_initials(name);
     }
     let digits: String = raw.chars().rev().filter(|c| c.is_ascii_digit()).take(2).collect();
     if digits.is_empty() {
@@ -1020,7 +1040,26 @@ fn call_avatar_label(contacts: &[Contact], raw: &str) -> String {
 /// uses for the avatar initials, just returning the full name instead of
 /// just the initials, for display on the outgoing/active call screens.
 fn contact_name_for<'a>(contacts: &'a [Contact], raw: &str) -> Option<&'a str> {
-    contacts.iter().find(|c| c.number == raw).map(|c| c.name.as_str())
+    contacts
+        .iter()
+        .find(|c| number::matches(&c.number, raw))
+        .map(|c| c.name.as_str())
+}
+
+/// The name to show for a remote party: a saved contact's name wins, then
+/// the SIP display name the network sent, else nothing (the caller shows the
+/// bare number).
+fn party_name<'a>(contacts: &'a [Contact], party: &'a RemoteParty) -> Option<&'a str> {
+    contact_name_for(contacts, &party.user).or(party.display_name.as_deref())
+}
+
+/// `call_avatar_label` for a `RemoteParty`: initials of the contact or SIP
+/// display name when there is one, else the number's trailing digits.
+fn call_avatar_label_for(contacts: &[Contact], party: &RemoteParty) -> String {
+    match party_name(contacts, party) {
+        Some(name) => contact_initials(name),
+        None => call_avatar_label(contacts, &party.user),
+    }
 }
 
 fn contact_initials(name: &str) -> String {
@@ -1036,6 +1075,7 @@ fn contact_initials(name: &str) -> String {
 fn active_view<'a>(
     contacts: &'a [Contact],
     number: &'a str,
+    remote_name: Option<&'a str>,
     media_ready: bool,
     avatar_live_amount: f32,
     answered_at: Instant,
@@ -1095,7 +1135,7 @@ fn active_view<'a>(
     // than everything else here, instead of reading at the same weight as
     // the secondary number/status lines underneath it.
     let mut caller_info = column![];
-    if let Some(name) = contact_name_for(contacts, number) {
+    if let Some(name) = contact_name_for(contacts, number).or(remote_name) {
         caller_info = caller_info.push(text(name).size(scaled(20.0, scale)));
         caller_info = caller_info.push(text(number).size(scaled(13.0, scale)).color(muted_text()));
     } else {
@@ -1594,7 +1634,13 @@ fn history_tab(app: &App, _scale: f32) -> Element<'_, Message> {
     let now = history::now_unix();
     let mut list = column![].spacing(8);
     for (index, entry) in app.call_history.iter().enumerate().rev() {
-        list = list.push(history_row(now, index, entry, app.history_context_menu == Some(index)));
+        list = list.push(history_row(
+            &app.contacts,
+            now,
+            index,
+            entry,
+            app.history_context_menu == Some(index),
+        ));
     }
     let heading = row![
         text("Recent Calls").size(11).color(muted_text()).width(Length::Fill),
@@ -1620,7 +1666,13 @@ fn history_tab(app: &App, _scale: f32) -> Element<'_, Message> {
     .into()
 }
 
-fn history_row(now: i64, index: usize, entry: &HistoryEntry, menu_open: bool) -> Element<'_, Message> {
+fn history_row<'a>(
+    contacts: &'a [Contact],
+    now: i64,
+    index: usize,
+    entry: &'a HistoryEntry,
+    menu_open: bool,
+) -> Element<'a, Message> {
     let palette = theme::oxide_palette();
     let (direction_icon, glyph_color) = match (entry.direction, entry.outcome) {
         (_, CallOutcome::Missed) => (icon::telephone_x(), palette.danger),
@@ -1643,8 +1695,20 @@ fn history_row(now: i64, index: usize, entry: &HistoryEntry, menu_open: bool) ->
             avatar_small(&entry.number),
             direction_icon.color(glyph_color).size(13),
             column![
-                text(entry.number.clone()).size(14),
-                text(detail).size(11).color(muted_text()),
+                text(
+                    contact_name_for(contacts, &entry.number)
+                        .or(entry.name.as_deref())
+                        .unwrap_or(&entry.number)
+                )
+                .size(14),
+                text(
+                    match contact_name_for(contacts, &entry.number).or(entry.name.as_deref()) {
+                        Some(_) => format!("{} · {detail}", entry.number),
+                        None => detail,
+                    }
+                )
+                .size(11)
+                .color(muted_text()),
             ]
             .spacing(2),
         ]

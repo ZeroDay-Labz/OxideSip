@@ -42,6 +42,100 @@ pub enum CallState {
     Terminated(String),
 }
 
+/// Who is calling, parsed out of the INVITE's `From` header (or
+/// `P-Asserted-Identity` when a PBX supplies one) — the UI never has to see
+/// raw SIP header syntax.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteParty {
+    /// The quoted display name, if the caller sent one ("Alice Nguyen").
+    /// `None` when absent or empty.
+    pub display_name: Option<String>,
+    /// The URI's user part — an extension or phone number ("1001",
+    /// "+15551234567"). Falls back to the host when the URI has no user
+    /// part (e.g. `sip:pbx.lan`), so it is never empty for a valid URI.
+    pub user: String,
+    /// The bare URI without header parameters ("sip:1001@pbx.lan").
+    pub uri: String,
+}
+
+impl RemoteParty {
+    /// The most human-friendly single string: display name, else user part.
+    pub fn label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.user)
+    }
+
+    /// The host part of `uri` ("pbx.lan"), or "" if it can't be found.
+    pub fn host(&self) -> &str {
+        let uri = self.uri.split(';').next().unwrap_or(&self.uri);
+        let after_scheme = uri.split_once(':').map(|(_, rest)| rest).unwrap_or(uri);
+        after_scheme
+            .rsplit_once('@')
+            .map(|(_, host)| host)
+            .unwrap_or(after_scheme)
+    }
+
+    /// Best-effort parse of a raw `From`/`PAI` header *value* — anything of
+    /// the form `"Name" <sip:user@host;p=1>;tag=x`, `<sip:user@host>`,
+    /// `sip:user@host;tag=x`, or `tel:+1555…`. Used as the fallback when the
+    /// stack's typed parser rejects an unusual header, and to repair history
+    /// entries written by older versions that stored the raw header.
+    pub fn from_header_value(raw: &str) -> Self {
+        let raw = raw.trim();
+        let raw = raw.strip_prefix("From:").map(str::trim).unwrap_or(raw);
+
+        let (display_name, rest) = if let Some(stripped) = raw.strip_prefix('"') {
+            match stripped.split_once('"') {
+                Some((name, rest)) => (Some(name.trim().to_string()), rest.trim()),
+                None => (None, raw),
+            }
+        } else if let Some(idx) = raw.find('<') {
+            let name = raw[..idx].trim();
+            ((!name.is_empty()).then(|| name.to_string()), &raw[idx..])
+        } else {
+            (None, raw)
+        };
+
+        let uri = match (rest.find('<'), rest.find('>')) {
+            (Some(open), Some(close)) if close > open => &rest[open + 1..close],
+            _ => rest.split(';').next().unwrap_or(rest),
+        };
+        let uri = uri.split(';').next().unwrap_or(uri).trim();
+        let uri = uri.split('?').next().unwrap_or(uri);
+
+        let after_scheme = uri.split_once(':').map(|(_, rest)| rest).unwrap_or(uri);
+        let user = after_scheme
+            .rsplit_once('@')
+            .map(|(user, _)| user)
+            .unwrap_or(after_scheme)
+            .to_string();
+
+        Self {
+            display_name: display_name.filter(|n| !n.is_empty()),
+            user,
+            uri: uri.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteParty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.display_name {
+            Some(name) if name != &self.user => write!(f, "{name} ({})", self.user),
+            _ => f.write_str(&self.user),
+        }
+    }
+}
+
+/// Why an incoming call is being refused — picks the SIP response code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// 486 Busy Here: no free line, Do Not Disturb, deny list, timeout.
+    Busy,
+    /// 603 Decline: the user pressed Decline. Lets the PBX distinguish an
+    /// explicit refusal from "busy" (e.g. for voicemail greeting selection).
+    Decline,
+}
+
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
     Registered {
@@ -65,7 +159,7 @@ pub enum CoreEvent {
         /// Which line (1-5) this call was assigned to — the first free line
         /// at the time it arrived, or rejected with Busy if none was free.
         line: u8,
-        remote: String,
+        remote: RemoteParty,
         offer: RemoteMediaInfo,
     },
     OutgoingCallStarted {
@@ -118,7 +212,10 @@ pub enum CoreCommand {
         id: CallId,
         local_rtp_port: u16,
     },
-    RejectCall(CallId),
+    RejectCall {
+        id: CallId,
+        reason: RejectReason,
+    },
     HangUp(CallId),
     SendDtmf {
         id: CallId,
