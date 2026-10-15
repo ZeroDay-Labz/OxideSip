@@ -2,7 +2,8 @@ use crate::app_settings::{self, AppSettings};
 use crate::audio_devices::{self, AudioDeviceConfig};
 use crate::contacts::{self, Contact};
 use crate::history;
-use crate::{branding, bridge, icon, number, view};
+use crate::{branding, bridge, icon, incoming, notify, number, view};
+use iced::keyboard::{self, Key, Modifiers};
 use iced::{Element, Subscription, Task, window};
 use softphone_core::config::{DtmfMode, PREFERRED_CODECS, PreferredCodec, SipAccountConfig, SipTransport};
 use softphone_core::events::{CallId, CallState, CoreCommand, CoreEvent, RejectReason, RemoteMediaInfo, RemoteParty};
@@ -271,6 +272,7 @@ pub struct SettingsForm {
     pub forwarding_number: String,
     pub deny_list: Vec<String>,
     pub deny_list_input: String,
+    pub notify_incoming: bool,
     pub recording_enabled: bool,
     pub recording_path: String,
     pub secondary_output_target: Option<String>,
@@ -286,6 +288,7 @@ impl SettingsForm {
             forwarding_number: settings.forwarding_number.clone(),
             deny_list: settings.deny_list.clone(),
             deny_list_input: String::new(),
+            notify_incoming: settings.notify_incoming,
             recording_enabled: settings.recording_enabled,
             recording_path: settings.recording_path.clone(),
             secondary_output_target: settings.secondary_output_target.clone(),
@@ -611,15 +614,22 @@ pub struct App {
     sip_settings_window: Option<window::Id>,
     audio_settings_window: Option<window::Id>,
     settings_window: Option<window::Id>,
-    /// One small popup window per currently-ringing incoming call (keyed by
-    /// call id, since — unlike the singleton settings windows above —
-    /// multiple simultaneous incoming calls across lines/accounts each get
-    /// their own), plus the reverse lookup so `Message::WindowClosed` (which
-    /// only ever gets a bare `window::Id`) can find which call a closed
-    /// popup belonged to. Both entries for a call are always inserted and
-    /// removed together — see `close_incoming_popup`.
-    incoming_call_windows: HashMap<CallId, (usize, window::Id)>,
-    incoming_call_window_ids: HashMap<window::Id, (usize, CallId)>,
+    /// The single always-on-top incoming-call window (see `incoming.rs`),
+    /// open while at least one line is ringing. Its content is derived from
+    /// `accounts[*].lines` every render, so it needs no per-call bookkeeping;
+    /// `sync_incoming_ui` opens/resizes/closes it after every update.
+    incoming_popup: Option<window::Id>,
+    /// How many cards the popup was last sized for — resized when it changes.
+    incoming_popup_cards: usize,
+    /// Whether `tone_player.play_incoming_ringtone()` is currently looping;
+    /// stopped by `sync_incoming_ui` once nothing is ringing, or by Silence.
+    ringtone_playing: bool,
+    /// When the popup last asked the compositor for attention — re-issued
+    /// every few seconds while ringing so the task-bar pulse persists.
+    last_attention: Option<Instant>,
+    /// Desktop notification ids by call, so each can be dismissed once its
+    /// call stops ringing (answered, declined, cancelled or timed out).
+    notifications: HashMap<CallId, u32>,
     pub(crate) settings: AppSettings,
     pub(crate) settings_form: SettingsForm,
     pub(crate) call_history: Vec<history::HistoryEntry>,
@@ -687,6 +697,12 @@ pub enum Message {
     /// regardless of what's currently selected.
     AnswerIncomingCall(usize, CallId),
     RejectIncomingCall(usize, CallId),
+    /// Stop the ringtone without answering or declining anything.
+    SilenceRingtone,
+    /// A key press nothing else consumed, tagged with the window it landed in.
+    KeyPressed(window::Id, Key, Modifiers),
+    /// Lifecycle of the desktop notification shown for a ringing call.
+    Notification(CallId, notify::Event),
     HangUpPressed,
     MediaReady(usize, CallId, Result<Arc<Mutex<Option<MediaSession>>>, String>),
     OpenSipSettings,
@@ -719,6 +735,7 @@ pub enum Message {
     OpenSettings,
     SettingsDndToggled(bool),
     SettingsAutoAnswerToggled(bool),
+    SettingsNotifyToggled(bool),
     SettingsForwardingToggled(bool),
     SettingsForwardingNumberChanged(String),
     SettingsDenyListInputChanged(String),
@@ -746,8 +763,6 @@ pub enum Message {
     /// widget — cycles keyboard focus forward/backward among this window's
     /// text fields (the only widgets iced itself supports focusing; see
     /// `subscription()`'s doc comment for the rest of the story).
-    FocusNext,
-    FocusPrevious,
     Tick,
     MuteToggled,
     /// Toggles mixing the Settings-configured secondary input (e.g.
@@ -888,8 +903,11 @@ impl App {
             sip_settings_window: None,
             audio_settings_window: None,
             settings_window: None,
-            incoming_call_windows: HashMap::new(),
-            incoming_call_window_ids: HashMap::new(),
+            incoming_popup: None,
+            incoming_popup_cards: 0,
+            ringtone_playing: false,
+            last_attention: None,
+            notifications: HashMap::new(),
             settings_form: SettingsForm::from_settings(&settings),
             settings,
             call_history: history::load(),
@@ -934,23 +952,16 @@ impl App {
     /// keyboard navigation, but building one from scratch (a custom focus
     /// ring plus Enter/Space activation for every button-like widget) is a
     /// much larger, riskier change than this — flagged rather than faked.
-    fn tab_navigation(event: iced::Event, status: iced::event::Status, _window: window::Id) -> Option<Message> {
+    fn global_keys(event: iced::Event, status: iced::event::Status, window: window::Id) -> Option<Message> {
         if status != iced::event::Status::Ignored {
             return None;
         }
-        let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
-            modifiers,
-            ..
-        }) = event
-        else {
-            return None;
-        };
-        Some(if modifiers.shift() {
-            Message::FocusPrevious
-        } else {
-            Message::FocusNext
-        })
+        match event {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                Some(Message::KeyPressed(window, key, modifiers))
+            }
+            _ => None,
+        }
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -960,7 +971,7 @@ impl App {
             iced::time::every(TICK_INTERVAL).map(|_| Message::Tick),
             window::close_events().map(Message::WindowClosed),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
-            iced::event::listen_with(Self::tab_navigation),
+            iced::event::listen_with(Self::global_keys),
         ])
     }
 
@@ -981,8 +992,8 @@ impl App {
     }
 
     pub fn view(&self, window: window::Id) -> Element<'_, Message> {
-        if let Some((account, id)) = self.incoming_call_window_ids.get(&window) {
-            view::incoming_call_popup_view(self, *account, id)
+        if Some(window) == self.incoming_popup {
+            incoming::window_view(self)
         } else if Some(window) == self.sip_settings_window {
             view::sip_settings_window_view(self)
         } else if Some(window) == self.audio_settings_window {
@@ -995,8 +1006,8 @@ impl App {
     }
 
     pub fn title(&self, window: window::Id) -> String {
-        if self.incoming_call_window_ids.contains_key(&window) {
-            format!("{} — Incoming Call", branding::APP_NAME)
+        if Some(window) == self.incoming_popup {
+            incoming::title(self)
         } else if Some(window) == self.sip_settings_window {
             format!("{} — SIP Setup", branding::APP_NAME)
         } else if Some(window) == self.audio_settings_window {
@@ -1013,6 +1024,11 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_inner(message);
+        Task::batch([task, self.sync_incoming_ui()])
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::CoreConnected(account, tx) => {
                 if let Some(acc) = self.accounts.get_mut(account) {
@@ -1082,6 +1098,7 @@ impl App {
                     );
                     return Task::none();
                 }
+                let remote_for_notify = remote.clone();
                 if let Some(acc) = self.accounts.get_mut(account)
                     && matches!(acc.lines[idx], CallUiState::Idle)
                 {
@@ -1097,22 +1114,38 @@ impl App {
                     }
                     if let Some(player) = &self.tone_player {
                         player.play_incoming_ringtone();
+                        self.ringtone_playing = true;
                     }
-                    // A small always-on-top popup with its own Answer/
-                    // Decline — the sidebar's colored LED alone was easy to
-                    // miss entirely unless the Dialer tab happened to be
-                    // showing this exact line. One per ringing call (keyed
-                    // by call id), so simultaneous incoming calls across
-                    // lines/accounts each get their own.
-                    let (win_id, open_task) = window::open(window::Settings {
-                        resizable: false,
-                        level: window::Level::AlwaysOnTop,
-                        ..branding::window_settings(iced::Size::new(380.0, 300.0), None)
-                    });
-                    self.incoming_call_windows.insert(id.clone(), (account, win_id));
-                    self.incoming_call_window_ids.insert(win_id, (account, id));
-                    return open_task.discard();
+                    // The incoming-call window itself is opened/resized by
+                    // `sync_incoming_ui` (run after every update). What is
+                    // started here is the desktop notification, the one
+                    // channel that reliably reaches the user even when the
+                    // compositor refuses to raise a new window.
+                    if self.settings.notify_incoming {
+                        let (summary, body) = self.notification_text(account, &remote_for_notify);
+                        return Task::stream(notify::incoming_call(id, summary, body))
+                            .map(|(id, event)| Message::Notification(id, event));
+                    }
+                    return Task::none();
                 }
+                // Every line is busy (or this line is mid-call): the core
+                // only assigns free lines, so this is a race with a call
+                // that just started — refuse politely instead of leaving
+                // the far end ringing into nothing.
+                if let Some(acc) = self.accounts.get(account) {
+                    acc.send_command(CoreCommand::RejectCall {
+                        id,
+                        reason: RejectReason::Busy,
+                    });
+                }
+                Self::push_history_named(
+                    &mut self.call_history,
+                    remote_for_notify.user.clone(),
+                    remote_for_notify.display_name.clone(),
+                    history::CallDirection::Incoming,
+                    history::CallOutcome::Missed,
+                    None,
+                );
                 Task::none()
             }
             Message::Core(account, CoreEvent::OutgoingCallStarted { id, line }) => {
@@ -1239,27 +1272,49 @@ impl App {
                 } else {
                     None
                 };
-                id.map(|id| self.close_incoming_popup(&id)).unwrap_or(Task::none())
+                if id.is_some() {
+                    self.stop_ringtone();
+                }
+                Task::none()
             }
             Message::AnswerIncomingCall(account, id) => {
-                let close_task = self.close_incoming_popup(&id);
                 let Some(acc) = self.accounts.get(account) else {
-                    return close_task;
+                    return Task::none();
                 };
                 let Some(idx) = acc.line_index_for_call(&id) else {
-                    return close_task;
+                    return Task::none();
                 };
-                Task::batch([close_task, self.answer_line(account, idx)])
+                self.answer_line(account, idx)
             }
-            Message::RejectIncomingCall(account, id) => {
-                let close_task = self.close_incoming_popup(&id);
-                if let Some(acc) = self.accounts.get(account) {
-                    acc.send_command(CoreCommand::RejectCall {
-                        id,
-                        reason: RejectReason::Decline,
-                    });
+            Message::RejectIncomingCall(account, id) => self.decline_call(account, id),
+            Message::SilenceRingtone => {
+                self.stop_ringtone();
+                Task::none()
+            }
+            Message::KeyPressed(window, key, modifiers) => self.handle_key(window, key, modifiers),
+            Message::Notification(call_id, event) => {
+                match event {
+                    notify::Event::Shown(id) => {
+                        // Only remember it while the call is still ringing;
+                        // otherwise it is already stale — dismiss right away.
+                        if self.is_ringing(&call_id) {
+                            self.notifications.insert(call_id, id);
+                        } else {
+                            notify::dismiss(id);
+                        }
+                    }
+                    notify::Event::Action(action) => {
+                        self.notifications.remove(&call_id);
+                        let owner = self.account_for_call(&call_id);
+                        match (action.as_str(), owner) {
+                            ("answer", Some((account, idx))) => return self.answer_line(account, idx),
+                            ("decline", Some((account, _))) => return self.decline_call(account, call_id),
+                            _ => {}
+                        }
+                    }
+                    notify::Event::Failed(reason) => tracing::warn!(%reason, "desktop notification failed"),
                 }
-                close_task
+                Task::none()
             }
             Message::HangUpPressed => self.handle_hang_up_pressed(),
 
@@ -1565,6 +1620,10 @@ impl App {
                 self.settings_form.dnd = enabled;
                 Task::none()
             }
+            Message::SettingsNotifyToggled(enabled) => {
+                self.settings_form.notify_incoming = enabled;
+                Task::none()
+            }
             Message::SettingsAutoAnswerToggled(enabled) => {
                 self.settings_form.auto_answer = enabled;
                 Task::none()
@@ -1632,6 +1691,7 @@ impl App {
                     forwarding_enabled: self.settings_form.forwarding_enabled,
                     forwarding_number: self.settings_form.forwarding_number.trim().to_string(),
                     deny_list: self.settings_form.deny_list.clone(),
+                    notify_incoming: self.settings_form.notify_incoming,
                     recording_enabled: self.settings_form.recording_enabled,
                     recording_path: self.settings_form.recording_path.trim().to_string(),
                     secondary_output_target: self.settings_form.secondary_output_target.clone(),
@@ -1659,26 +1719,22 @@ impl App {
                 Task::none()
             }
             Message::WindowClosed(id) => {
-                if let Some((account, call_id)) = self.incoming_call_window_ids.remove(&id) {
-                    self.incoming_call_windows.remove(&call_id);
-                    // Only reached for a genuine native close-button click:
-                    // every other path that ends this call's `Incoming`
-                    // state (both popup buttons, main-window Answer/
-                    // Decline, or the call ending on its own) already calls
-                    // `close_incoming_popup`, which removes both map entries
-                    // *before* issuing `window::close` — so by the time
-                    // iced fires this event for those paths, the `remove`
-                    // above would have returned `None` and we'd never reach
-                    // here. Reaching here means the user dismissed the
-                    // popup directly, which we treat the same as pressing
-                    // Decline.
-                    if let Some(acc) = self.accounts.get(account) {
-                        acc.send_command(CoreCommand::RejectCall {
-                            id: call_id,
-                            reason: RejectReason::Decline,
-                        });
-                    }
-                    Task::none()
+                if Some(id) == self.incoming_popup {
+                    // `sync_incoming_ui` clears `incoming_popup` *before*
+                    // issuing its own `window::close`, so reaching here with
+                    // it still set means the user hit the native close
+                    // button — treat that as declining everything that rings.
+                    self.incoming_popup = None;
+                    self.incoming_popup_cards = 0;
+                    let ringing: Vec<(usize, CallId)> = incoming::ringing_calls(self)
+                        .iter()
+                        .map(|c| (c.account, c.id.clone()))
+                        .collect();
+                    let tasks: Vec<Task<Message>> = ringing
+                        .into_iter()
+                        .map(|(account, call_id)| self.decline_call(account, call_id))
+                        .collect();
+                    Task::batch(tasks)
                 } else if Some(id) == self.sip_settings_window {
                     self.sip_settings_window = None;
                     Task::none()
@@ -1700,8 +1756,6 @@ impl App {
                 }
                 Task::none()
             }
-            Message::FocusNext => iced::widget::operation::focus_next(),
-            Message::FocusPrevious => iced::widget::operation::focus_previous(),
 
             Message::Tick => {
                 if let Some(acc) = self.selected_mut() {
@@ -2788,13 +2842,8 @@ impl App {
                     acc.pending_sockets[idx] = None;
                     acc.last_call_status[idx] = Some("declined".to_string());
                     if let Some(player) = &self.tone_player {
-                        player.stop_incoming_ringtone();
                         player.play_disconnect_tone();
                     }
-                }
-                if let Some((_, window_id)) = self.incoming_call_windows.remove(&id) {
-                    self.incoming_call_window_ids.remove(&window_id);
-                    return window::close(window_id);
                 }
                 Task::none()
             }
@@ -2876,22 +2925,13 @@ impl App {
                 // MediaSession::stop's docs).
                 acc.lines[idx] = CallUiState::Idle;
                 acc.pending_sockets[idx] = None;
-                // Closes an incoming-call popup if this call ended before
-                // ever being answered from it (e.g. the caller hung up
-                // while we were still ringing) — a no-op if there wasn't
-                // one (this call was never `Incoming`, or it already
-                // closed via Answer/Decline).
-                let close_task = if let Some((_, window_id)) = self.incoming_call_windows.remove(&id) {
-                    self.incoming_call_window_ids.remove(&window_id);
-                    window::close(window_id)
-                } else {
-                    Task::none()
-                };
+                // (If this call was still ringing — the caller hung up —
+                // `sync_incoming_ui` drops its card and closes the window.)
                 if self.compact_mode && account == self.selected_account && idx == acc.selected_idx() {
                     self.compact_mode = false;
-                    return Task::batch([close_task, self.resize_for_compact(false)]);
+                    return self.resize_for_compact(false);
                 }
-                close_task
+                Task::none()
             }
         }
     }
@@ -2982,20 +3022,196 @@ impl App {
         self.answer_line(account, idx)
     }
 
-    /// Closes and forgets the incoming-call popup for `id`, if one exists —
-    /// a no-op `Task::none()` otherwise. Called from every path that ends a
-    /// call's `Incoming` state (both popup buttons, the main window's
-    /// Answer/Decline, and the `Rejected`/`Terminated` events), always
-    /// *before* the popup's `window::close` is actually issued — that
-    /// ordering is what lets `Message::WindowClosed`'s own decline-on-close
-    /// branch tell an explicit close (map entry already gone) apart from a
-    /// bare OS close-button click (entry still present).
-    fn close_incoming_popup(&mut self, id: &CallId) -> Task<Message> {
-        if let Some((_, window_id)) = self.incoming_call_windows.remove(id) {
-            self.incoming_call_window_ids.remove(&window_id);
-            return window::close(window_id);
+    /// Declines `id` (603) and stops the ringtone if nothing else rings.
+    fn decline_call(&mut self, account: usize, id: CallId) -> Task<Message> {
+        if let Some(acc) = self.accounts.get(account) {
+            acc.send_command(CoreCommand::RejectCall {
+                id,
+                reason: RejectReason::Decline,
+            });
+        }
+        // Stop ringing right away rather than on the core's `Rejected` echo
+        // — unless another line is still ringing.
+        if incoming::ringing_calls(self).len() <= 1 {
+            self.stop_ringtone();
         }
         Task::none()
+    }
+
+    fn stop_ringtone(&mut self) {
+        if self.ringtone_playing
+            && let Some(player) = &self.tone_player
+        {
+            player.stop_incoming_ringtone();
+        }
+        self.ringtone_playing = false;
+    }
+
+    fn is_ringing(&self, call_id: &CallId) -> bool {
+        incoming::ringing_calls(self).iter().any(|c| c.id == call_id)
+    }
+
+    /// `(account, line index)` of the call with this id, in any state.
+    fn account_for_call(&self, call_id: &CallId) -> Option<(usize, usize)> {
+        self.accounts
+            .iter()
+            .enumerate()
+            .find_map(|(account, acc)| acc.line_index_for_call(call_id).map(|idx| (account, idx)))
+    }
+
+    fn notification_text(&self, account: usize, remote: &RemoteParty) -> (String, String) {
+        let name = view::party_name(&self.contacts, remote)
+            .unwrap_or(&remote.user)
+            .to_string();
+        let account_name = self
+            .accounts
+            .get(account)
+            .map(|a| {
+                if a.config.name.trim().is_empty() {
+                    a.config.username.clone()
+                } else {
+                    a.config.name.clone()
+                }
+            })
+            .unwrap_or_default();
+        let body = if name == remote.user {
+            format!("Incoming call · {account_name}")
+        } else {
+            format!("{} · {account_name}", remote.user)
+        };
+        (name, body)
+    }
+
+    /// Keyboard shortcuts that no focused widget consumed. In the incoming
+    /// window: Enter / A answer the newest call, Esc / D decline it, S
+    /// silences the ringtone. Everywhere: Tab cycles text-input focus.
+    fn handle_key(&mut self, window: window::Id, key: Key, modifiers: Modifiers) -> Task<Message> {
+        use iced::keyboard::key::Named;
+        if let Key::Named(Named::Tab) = key {
+            return if modifiers.shift() {
+                iced::widget::operation::focus_previous()
+            } else {
+                iced::widget::operation::focus_next()
+            };
+        }
+        if Some(window) == self.incoming_popup && !modifiers.command() && !modifiers.alt() {
+            let newest = incoming::ringing_calls(self)
+                .first()
+                .map(|c| (c.account, c.line_idx, c.id.clone()));
+            let Some((account, idx, id)) = newest else {
+                return Task::none();
+            };
+            let lower = key.as_ref();
+            return match lower {
+                Key::Named(Named::Enter) | Key::Character("a") | Key::Character("A") => self.answer_line(account, idx),
+                Key::Named(Named::Escape) | Key::Character("d") | Key::Character("D") => self.decline_call(account, id),
+                Key::Character("s") | Key::Character("S") => {
+                    self.stop_ringtone();
+                    Task::none()
+                }
+                _ => Task::none(),
+            };
+        }
+        Task::none()
+    }
+
+    /// How long a call may ring unanswered before it is refused as busy and
+    /// logged as missed — guards against an INVITE whose CANCEL never
+    /// reached us ringing forever.
+    const RING_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Reconciles the incoming-call window, ringtone, attention requests
+    /// and desktop notifications with what is actually ringing. Idempotent
+    /// and cheap, so it runs after *every* `update` (including each 80 ms
+    /// tick, which is what drives the ring timeout and re-asserted
+    /// attention).
+    fn sync_incoming_ui(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+
+        // Ring timeout.
+        let expired: Vec<(usize, usize, CallId)> = incoming::ringing_calls(self)
+            .iter()
+            .filter(|c| c.ringing_since.elapsed() >= Self::RING_TIMEOUT)
+            .map(|c| (c.account, c.line_idx, c.id.clone()))
+            .collect();
+        for (account, idx, id) in expired {
+            if let Some(acc) = self.accounts.get_mut(account) {
+                if let CallUiState::Incoming { caller, .. } = &acc.lines[idx] {
+                    Self::push_history_named(
+                        &mut self.call_history,
+                        caller.user.clone(),
+                        caller.display_name.clone(),
+                        history::CallDirection::Incoming,
+                        history::CallOutcome::Missed,
+                        None,
+                    );
+                }
+                acc.send_command(CoreCommand::RejectCall {
+                    id,
+                    reason: RejectReason::Busy,
+                });
+                acc.lines[idx] = CallUiState::Idle;
+                acc.last_call_status[idx] = Some("missed — no answer".to_string());
+            }
+        }
+
+        let ringing: Vec<CallId> = incoming::ringing_calls(self).iter().map(|c| c.id.clone()).collect();
+
+        // Notifications for calls that stopped ringing.
+        let stale: Vec<CallId> = self
+            .notifications
+            .keys()
+            .filter(|id| !ringing.contains(id))
+            .cloned()
+            .collect();
+        for id in stale {
+            if let Some(nid) = self.notifications.remove(&id) {
+                notify::dismiss(nid);
+            }
+        }
+
+        if ringing.is_empty() {
+            self.stop_ringtone();
+            self.last_attention = None;
+            self.incoming_popup_cards = 0;
+            if let Some(id) = self.incoming_popup.take() {
+                tasks.push(window::close(id));
+            }
+            return Task::batch(tasks);
+        }
+
+        let cards = ringing.len();
+        match self.incoming_popup {
+            None => {
+                let (id, open) = window::open(incoming::window_settings(cards));
+                self.incoming_popup = Some(id);
+                self.incoming_popup_cards = cards;
+                self.last_attention = Some(Instant::now());
+                tasks.push(open.discard());
+                tasks.push(window::gain_focus(id));
+                tasks.push(window::request_user_attention(
+                    id,
+                    Some(window::UserAttention::Critical),
+                ));
+            }
+            Some(id) => {
+                if cards != self.incoming_popup_cards {
+                    self.incoming_popup_cards = cards;
+                    tasks.push(window::resize(id, incoming::window_size(cards)));
+                }
+                let stale = self
+                    .last_attention
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(4));
+                if stale {
+                    self.last_attention = Some(Instant::now());
+                    tasks.push(window::request_user_attention(
+                        id,
+                        Some(window::UserAttention::Critical),
+                    ));
+                }
+            }
+        }
+        Task::batch(tasks)
     }
 
     /// Reserves a socket and sends `AnswerCall` for line `idx` on `account`

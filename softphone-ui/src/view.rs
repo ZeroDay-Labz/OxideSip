@@ -13,7 +13,6 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Length};
 use softphone_core::config::{DTMF_MODES, SIP_TRANSPORTS, SipTransport};
-use softphone_core::events::CallId;
 use softphone_core::events::RemoteParty;
 use std::time::Instant;
 
@@ -510,7 +509,7 @@ fn line_status_label(acc: &AccountSession) -> Option<String> {
     }
 }
 
-fn format_elapsed(d: std::time::Duration) -> String {
+pub(crate) fn format_elapsed(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
 }
@@ -716,7 +715,7 @@ fn circle_button<'a>(
 /// used for the primary call actions (Call/Answer/Decline/Hang Up), where a
 /// phone icon alongside the label is the universal "this is a call action"
 /// cue (every mainstream phone UI pairs one with these exact four actions).
-fn pill_call_button<'a>(
+pub(crate) fn pill_call_button<'a>(
     label: &'a str,
     style: impl Fn(&iced::Theme, button::Status) -> button::Style + 'a,
     icon: iced::widget::Text<'a>,
@@ -901,74 +900,6 @@ fn incoming_view<'a>(contacts: &'a [Contact], caller: &'a RemoteParty, scale: f3
     .into()
 }
 
-/// The small always-on-top popup window spawned per ringing incoming call
-/// (see `app.rs`'s `incoming_call_windows`) — reuses `incoming_view`'s exact
-/// avatar/label/button visual language, but wired to the call-scoped
-/// `AnswerIncomingCall`/`RejectIncomingCall` messages (rather than the
-/// unscoped `AnswerPressed`/`RejectPressed`, which act on whichever line is
-/// currently selected in the main window) and wrapped in its own
-/// full-window centering container, since — unlike `incoming_view` — this
-/// is the popup's entire content, not one screen embedded in the larger
-/// dialer layout.
-static UNKNOWN_CALLER: std::sync::LazyLock<RemoteParty> = std::sync::LazyLock::new(|| RemoteParty {
-    user: "Unknown caller".to_string(),
-    ..RemoteParty::default()
-});
-
-pub fn incoming_call_popup_view<'a>(app: &'a App, account: usize, call_id: &CallId) -> Element<'a, Message> {
-    let caller: &RemoteParty = app
-        .accounts
-        .get(account)
-        .and_then(|acc| acc.line_index_for_call(call_id))
-        .and_then(|idx| match &app.accounts[account].lines[idx] {
-            CallUiState::Incoming { caller, .. } => Some(caller),
-            _ => None,
-        })
-        .unwrap_or(&UNKNOWN_CALLER);
-
-    let name = party_name(&app.contacts, caller);
-    let avatar_seed = name.unwrap_or(&caller.user);
-    let avatar = container(text(call_avatar_label_for(&app.contacts, caller)).size(24.0))
-        .width(Length::Fixed(84.0))
-        .height(Length::Fixed(84.0))
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .style(theme::avatar_state(theme::avatar_color(avatar_seed), 1.0));
-
-    let mut identity = column![text("Incoming call").size(13).color(muted_text())];
-    match name {
-        Some(name) => {
-            identity = identity
-                .push(text(name).size(18))
-                .push(text(caller.user.as_str()).size(13).color(muted_text()));
-        }
-        None => identity = identity.push(text(caller.user.as_str()).size(18)),
-    }
-
-    let content = column![
-        column![avatar].width(Length::Fill).align_x(Alignment::Center),
-        identity.spacing(4).width(Length::Fill).align_x(Alignment::Center),
-        row![
-            pill_call_button("Decline", theme::pill(Pill::Danger), icon::telephone_x_fill(), 1.0)
-                .on_press(Message::RejectIncomingCall(account, call_id.clone())),
-            pill_call_button("Answer", theme::pill(Pill::Success), icon::telephone_fill(), 1.0)
-                .on_press(Message::AnswerIncomingCall(account, call_id.clone())),
-        ]
-        .spacing(16),
-    ]
-    .spacing(18)
-    .width(Length::Fill)
-    .align_x(Alignment::Center);
-
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .padding(20)
-        .into()
-}
-
 /// The dialing-out screen — between pressing Call and the far end actually
 /// answering. Previously just static "Calling..." text with no way to back
 /// out of it, so canceling a call before it was answered meant waiting for
@@ -1049,13 +980,13 @@ fn contact_name_for<'a>(contacts: &'a [Contact], raw: &str) -> Option<&'a str> {
 /// The name to show for a remote party: a saved contact's name wins, then
 /// the SIP display name the network sent, else nothing (the caller shows the
 /// bare number).
-fn party_name<'a>(contacts: &'a [Contact], party: &'a RemoteParty) -> Option<&'a str> {
+pub(crate) fn party_name<'a>(contacts: &'a [Contact], party: &'a RemoteParty) -> Option<&'a str> {
     contact_name_for(contacts, &party.user).or(party.display_name.as_deref())
 }
 
 /// `call_avatar_label` for a `RemoteParty`: initials of the contact or SIP
 /// display name when there is one, else the number's trailing digits.
-fn call_avatar_label_for(contacts: &[Contact], party: &RemoteParty) -> String {
+pub(crate) fn call_avatar_label_for(contacts: &[Contact], party: &RemoteParty) -> String {
     match party_name(contacts, party) {
         Some(name) => contact_initials(name),
         None => call_avatar_label(contacts, &party.user),
@@ -1766,7 +1697,7 @@ impl std::fmt::Display for DeviceOption {
 /// variant to `Option<String>`.
 const SYSTEM_DEFAULT_ID: &str = "";
 
-fn muted_text() -> Color {
+pub(crate) fn muted_text() -> Color {
     Color {
         a: 0.55,
         ..theme::oxide_palette().text
@@ -2272,6 +2203,12 @@ fn settings_view<'a>(
             "Automatically accept every incoming call.",
             form.auto_answer,
             Message::SettingsAutoAnswerToggled,
+        ),
+        toggle_row(
+            "Desktop notifications",
+            "Also announce incoming calls through the desktop's notification center, with Answer and Decline buttons",
+            form.notify_incoming,
+            Message::SettingsNotifyToggled,
         ),
     ]
     .spacing(14);

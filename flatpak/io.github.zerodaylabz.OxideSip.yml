@@ -34,6 +34,8 @@ finish-args:
   - --socket=fallback-x11
   - --device=dri
   - --filesystem=xdg-run/pipewire-0
+  # Incoming-call desktop notifications (with Answer/Decline actions).
+  - --talk-name=org.freedesktop.Notifications
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin

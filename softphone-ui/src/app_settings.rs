@@ -5,7 +5,7 @@
 
 const SETTINGS_FILENAME: &str = "settings.toml";
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
     /// Auto-reject every incoming call while enabled.
     #[serde(default)]
@@ -25,6 +25,10 @@ pub struct AppSettings {
     /// comparison, so a partial number or a domain both work as entries.
     #[serde(default)]
     pub deny_list: Vec<String>,
+    /// Show a desktop notification (with Answer/Decline actions) for each
+    /// incoming call, in addition to the always-on-top window.
+    #[serde(default = "default_true")]
+    pub notify_incoming: bool,
     #[serde(default)]
     pub recording_enabled: bool,
     #[serde(default)]
@@ -54,6 +58,27 @@ pub struct AppSettings {
     /// off for every new call regardless of this setting.
     #[serde(default)]
     pub secondary_input_target: Option<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        AppSettings {
+            dnd: false,
+            auto_answer: false,
+            forwarding_enabled: false,
+            forwarding_number: String::new(),
+            deny_list: Vec::new(),
+            notify_incoming: true,
+            recording_enabled: false,
+            recording_path: String::new(),
+            secondary_output_target: None,
+            secondary_input_target: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn load() -> AppSettings {
