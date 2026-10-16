@@ -1,176 +1,232 @@
-# OxideSip
+<p align="center">
+  <img src="packaging/io.github.zerodaylabz.OxideSip.svg" width="96" alt="">
+</p>
 
-A professional-grade SIP softphone for Linux, built in Rust. Native PipeWire audio, a custom
-`iced`-based UI, and a multi-line, multi-account calling core — aimed at Fedora/KDE/Wayland
-desktops, targeting the kind of experience you'd expect from MicroSIP or a Cisco desk phone rather
-than a bare-bones reference client.
+<h1 align="center">OxideSip</h1>
 
-> Early-stage, actively developed. Expect rough edges; see [Known limitations](#known-limitations)
-> below for what's genuinely not done yet.
+<p align="center">
+  A native Linux SIP softphone with PipeWire audio. Multiple accounts, five lines each,
+  hold / transfer / join, a real incoming-call window, and call audio you can route
+  into Discord or any other app.
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/ZeroDay-Labz/OxideSip/releases/latest"><img src="https://img.shields.io/github/v/release/ZeroDay-Labz/OxideSip?color=ff7a3d" alt="Latest release"></a>
+  <a href="https://github.com/ZeroDay-Labz/OxideSip/actions/workflows/ci.yml"><img src="https://github.com/ZeroDay-Labz/OxideSip/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/ZeroDay-Labz/OxideSip/releases"><img src="https://img.shields.io/github/downloads/ZeroDay-Labz/OxideSip/total?color=3ec9a7" alt="Downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/ZeroDay-Labz/OxideSip?color=969eac" alt="MIT license"></a>
+</p>
 
-- **Multiple SIP accounts, registered simultaneously** — each with its own set of 5 call lines,
-  switchable from the main window without losing state on the others.
-- **Full call handling** — place/answer/reject/hang up, hold & resume, blind transfer, mute, join
-  two lines into a local 3-way conference, and a compact "mini" window mode.
-- **DTMF over RFC 4733 (RTP telephone-event) by default**, automatically falling back to SIP INFO
-  for peers that don't negotiate it — override per-account to force one or the other (interop
-  troubleshooting) in Audio & Codecs settings.
-- **Do Not Disturb, Auto-Answer, and a deny list** — checked before an incoming call ever rings.
-- **Call recording** — WAV, both directions mixed into one file per call, saved to a folder you
-  pick with a native file dialog.
-- **Ordered codec priority list** — reorder which G.711 variant (µ-law/A-law) is preferred per
-  account; negotiation walks your priority list against whatever the other side offers, both when
-  placing and answering calls.
-- **Secondary audio output** — stream the other party's voice to a second PipeWire target: an
-  ordinary sink, *or* a live application capture stream (e.g. Discord's own voice-engine node while
-  you're in a voice channel), so the other side of a phone call can be heard in a voice chat.
-- **Contacts** with JSON import/export (tolerant of other softphones' export formats) and a native
-  file picker.
-- **Dial-history dropdown**, redial, and per-line call history.
-- **SDES-SRTP** media encryption (opt-in) alongside plain RTP, and UDP/TCP/TLS SIP transports.
-- **A real icon-based UI** — every call-control, list, and settings action uses a bundled Bootstrap
-  Icons glyph (not a system font dependency, so it renders identically everywhere) instead of
-  small-caps text labels, plus a live-animated call glow via `iced`'s native animation support.
-  Caller name lookup shows a saved contact's name (not just their number) while dialing and once
-  connected.
+<p align="center">
+  <img src="docs/screenshots/phone-active.png" alt="An active call: the dial card, the five lines, and the call card with meters and controls" width="820">
+</p>
 
-## Requirements
+## What is it?
 
-- **Rust** 1.85+ (edition 2024) — install via [rustup](https://rustup.rs).
-- **PipeWire** ≥ 0.3.44, running as your session's audio server (the Fedora/KDE/Wayland default).
-- Build-time system packages (headers for `pipewire-sys`'s bindgen, plus `pkg-config`):
+OxideSip registers your SIP extensions with a PBX (FreePBX, Asterisk, 3CX, anything standard)
+and behaves like a desk phone on your desktop. It is written in Rust, draws its own interface
+with [iced](https://github.com/iced-rs/iced), and talks to PipeWire directly — no PulseAudio
+layer, no browser engine.
 
-  ```bash
-  # Fedora
-  sudo dnf install pipewire-devel clang-devel pkgconf-pkg-config
+- **Multiple accounts, five lines each.** Every account registers on its own. Hold, resume,
+  blind transfer, start a second call, and join two lines into a local three-way call.
+- **Incoming calls you cannot miss.** A small always-on-top window with big Answer / Decline
+  buttons (Enter / Esc), plus a desktop notification with the same two actions. Simultaneous
+  calls stack in the same window.
+- **Caller ID done right.** The caller's name and number come from the SIP headers and are
+  matched against your contacts by number, so "+1 555 123 4567" finds the contact you saved
+  as "5551234567".
+- **Route the call anywhere.** Send the other party's voice into another app's live input
+  (Discord's voice engine, OBS, a virtual sink) or mix another app's audio into what the far
+  end hears — per call, with one button.
+- **Standards you expect.** RFC 4733 DTMF with SIP INFO fallback, an ordered codec priority
+  list (G.711 µ-law / A-law), optional SDES-SRTP, UDP / TCP / TLS transports.
+- **The rest of a phone.** Contacts with JSON import/export, call history with filters and
+  missed-call badge, Do Not Disturb, auto-answer, a deny list, WAV call recording, a compact
+  floating call bar, keyboard shortcuts, dark and light themes that follow the desktop.
 
-  # Debian/Ubuntu
-  sudo apt install libpipewire-0.3-dev libclang-dev pkg-config
+<p align="center">
+  <img src="docs/screenshots/incoming.png" alt="The incoming-call window: caller name and number, account, Decline and Answer" width="49%">
+  <img src="docs/screenshots/history.png" alt="Call history grouped by day with Missed / Incoming / Outgoing filters" width="49%">
+</p>
+<p align="center">
+  <img src="docs/screenshots/contacts.png" alt="Contacts: search, sort, call / edit / delete per row, JSON import and export" width="49%">
+  <img src="docs/screenshots/settings-accounts.png" alt="Settings: accounts list and the account form" width="49%">
+</p>
 
-  # Arch
-  sudo pacman -S pipewire clang pkgconf
-  ```
+## Install
 
-- A SIP account/extension on a PBX (FreePBX, Asterisk, etc.) to register against.
+| | |
+|---|---|
+| **Fedora, openSUSE, RHEL family** | Download the `.rpm` from the [latest release](https://github.com/ZeroDay-Labz/OxideSip/releases/latest), then `sudo dnf install ./oxidesip-*.rpm` |
+| **Debian, Ubuntu, Mint, Pop!_OS** | Download the `.deb`, then `sudo apt install ./oxidesip_*.deb` |
+| **Any Linux** | Download `oxidesip-x86_64.flatpak`, then `flatpak install --user ./oxidesip-x86_64.flatpak`; or unpack `oxidesip-linux-x86_64.tar.gz` and run `./oxidesip` |
+| **From source** | See [Building](#building) |
+
+The packages install the app, its launcher and icons, and declare their shared-library
+dependencies (PipeWire and friends) from the binary itself. A `SHA256SUMS` file sits next to
+every release asset.
+
+### Requirements
+
+| | |
+|---|---|
+| Sound server | **PipeWire** 0.3.44 or newer as the session's audio server (the Fedora / KDE / GNOME default) |
+| Desktop | Wayland or X11. Any GPU; virtual machines fall back to software rendering |
+| Account | A SIP extension on a PBX you can reach — on the LAN or over a VPN (no STUN / ICE yet) |
+
+## Using it
+
+1. Start **OxideSip** from your launcher (or run `oxidesip`). The first run opens
+   **Settings ▸ Accounts** — enter the server, extension and password and press
+   **Add account**. The pill at the bottom of the sidebar turns green when you are registered.
+2. **Phone** page: type a number or use the keypad, press **Call** or Enter. Pick a contact or a
+   history entry to call it directly. Each of the five lines shows who is on it and for how long.
+3. When a call comes in, the incoming window appears on top of everything. **Enter** or **A**
+   answers, **Esc** or **D** declines, **S** silences the ringtone. The desktop notification has
+   the same Answer / Decline buttons.
+4. During a call: mute, hold, transfer (type a number or SIP URI), open the in-call keypad for
+   DTMF, start another call on a free line with **+**, and **Join** two active lines. The
+   shrink button in the top bar (or **Ctrl+Shift+C**) turns the window into a small floating
+   call bar.
+
+| Page | What is there |
+|---|---|
+| **Phone** | Dial card, the five lines with live state, the selected line's call card |
+| **Contacts** | Search, sort, call / edit / delete, JSON import and export (also reads MicroSIP-style exports) |
+| **History** | All / Missed / Incoming / Outgoing, grouped by day, call back or add to contacts |
+| **Settings** | Accounts · Audio & codecs · Calls (DND, auto-answer, notifications, deny list, recording, secondary audio) · Appearance · About |
+
+### Routing a call into Discord (or any other app)
+
+Open **Settings ▸ Calls ▸ Secondary audio** while you are in the voice channel, press the
+refresh button, and pick the app's entry (prefixed `App:`). *Also send the other party's voice
+to* links the far end straight into that app's live input stream, the same way `qpwgraph` or
+`helvum` would patch one client into another. *Mix into what the other party hears, from*
+does the reverse, and is switched on per call with the wave button in the Lines card. If the
+app is not listed it is not currently listening for audio; a virtual sink of your own works too.
+
+### Keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Enter` | Call the typed number, or answer a ringing call |
+| `Esc` | Decline a ringing call · press twice to hang up |
+| `0–9` `*` `#` | Dial, or send DTMF during a call |
+| `Backspace` | Delete the last digit |
+| `Ctrl+1` … `Ctrl+4` | Phone, Contacts, History, Settings |
+| `Ctrl+K` | Focus the number field (or the contact search) |
+| `Ctrl+M` / `Ctrl+H` / `Ctrl+T` | Mute / hold / transfer the current call |
+| `Ctrl+Shift+C` | Compact call bar |
+| `Ctrl+B` | Collapse the sidebar |
+| `Ctrl+,` | Settings |
+| `Ctrl+Q` | Quit (asks first if a call is up) |
+| `A` / `D` / `S` | Answer / Decline / Silence, in the incoming-call window |
+
+### From the terminal
+
+```sh
+oxidesip                        # the app
+oxidesip sip:1001@pbx.lan       # start with a number in the dial field (also tel: URIs)
+oxidesip --demo                 # the real UI on a scripted backend: no SIP, no audio, nothing saved
+oxidesip --screenshot docs/shots --page all   # render the documentation screenshots and exit
+oxidesip --help
+```
+
+The `.desktop` entry registers OxideSip as a handler for `sip:` and `tel:` links, so a phone
+number clicked in a browser can open here.
+
+## Troubleshooting
+
+- **The sidebar pill stays "Connecting…".** The server or port is wrong, or the PBX is not
+  reachable from this network. **"Stopped"** means the PBX refused the credentials (403, or
+  repeated 401/407); fix the account and press **Save & re-register**.
+- **TLS does not connect.** A CA certificate path is required for TLS; set it in the account
+  file (see [Where your stuff is kept](#where-your-stuff-is-kept)). Client certificates are
+  optional.
+- **No audio, or the wrong device.** Pick the microphone and speaker under
+  **Settings ▸ Audio & codecs**. Device changes apply to the next call; the ringtone and dial
+  tones follow after a restart. `pw-top` shows whether the `OxideSip` streams are running.
+- **No taskbar icon on Wayland.** The icon comes from the installed `.desktop` entry matched by
+  app id (`io.github.zerodaylabz.OxideSip`). If you run a tarball binary, install
+  `packaging/io.github.zerodaylabz.OxideSip.desktop` and the SVG icon into
+  `~/.local/share/applications/` and `~/.local/share/icons/hicolor/scalable/apps/`.
+- **The incoming window does not come to the front.** KDE and GNOME may refuse to raise a new
+  window over a full-screen app; the task-bar entry pulses instead and the desktop notification
+  carries Answer / Decline. Make sure *Desktop notifications* is on under **Settings ▸ Calls**.
+- **Blank or very slow window in a VM.** Run with `ICED_BACKEND=tiny-skia oxidesip` (software
+  rendering).
+- **One-way audio or no audio behind NAT.** OxideSip has no STUN / ICE yet; use it on the LAN
+  or over a VPN to the PBX.
+
+## Where your stuff is kept
+
+| | |
+|---|---|
+| Accounts | `~/.config/oxidesip/accounts.toml` |
+| Call-handling settings, theme | `~/.config/oxidesip/settings.toml` |
+| Audio devices | `~/.config/oxidesip/audio_devices.toml` |
+| Contacts, call history | `~/.config/oxidesip/contacts.toml`, `call_history.toml` |
+| Window size, page, filters | `~/.config/oxidesip/ui_state.toml` |
+| Recordings | The folder you pick under **Settings ▸ Calls ▸ Recording** |
+
+Inside the Flatpak the same files live under `~/.var/app/io.github.zerodaylabz.OxideSip/config/oxidesip/`.
+**Settings ▸ About ▸ Open config folder** takes you there. Nothing is written in `--demo` mode.
+
+To seed an account without the UI, copy
+[`softphone-core/config.example.toml`](softphone-core/config.example.toml) into
+`accounts.toml` as an `[[accounts]]` entry, or set `OXIDESIP_*` environment variables
+(`OXIDESIP_SIP_SERVER_HOST`, `OXIDESIP_SIP_SERVER_PORT`, `OXIDESIP_TRANSPORT`,
+`OXIDESIP_USERNAME`, `OXIDESIP_PASSWORD`, `OXIDESIP_REGISTER_EXPIRES`, `OXIDESIP_LOCAL_PORT`,
+`OXIDESIP_SRTP`, `OXIDESIP_CA_CERT_PATH`, `OXIDESIP_CLIENT_CERT_PATH`, `OXIDESIP_CLIENT_KEY_PATH`,
+`OXIDESIP_PREFERRED_CODECS`) for the first run; they are migrated into `accounts.toml`.
 
 ## Building
 
-```bash
-git clone https://github.com/ZeroDay-Labz/OxideSip.git
-cd OxideSip
-cargo build --release
-```
+```sh
+# Fedora
+sudo dnf install pipewire-devel clang-devel pkgconf-pkg-config libxkbcommon-devel wayland-devel
+# Debian / Ubuntu
+sudo apt install libpipewire-0.3-dev libclang-dev pkg-config libxkbcommon-dev libwayland-dev
+# Arch
+sudo pacman -S pipewire clang pkgconf libxkbcommon wayland
 
-The workspace has three crates:
-
-| Crate             | What it is                                                             |
-|--------------------|-------------------------------------------------------------------------|
-| `softphone-core`  | SIP signaling (via [`rsipstack`](https://crates.io/crates/rsipstack)), SDP negotiation, registration — no UI or audio code. |
-| `softphone-media` | PipeWire capture/playback, RTP send/recv (incl. RFC 4733 DTMF events), dial tones, call recording, codec en/decoding. |
-| `softphone-ui`    | The [`iced`](https://github.com/iced-rs/iced) 0.14 desktop app tying both together. |
-
-### Prebuilt releases
-
-Tagged pushes (`v*`, e.g. `v0.1.0`) trigger [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which builds and publishes four artifacts to the repo's
-[Releases](https://github.com/ZeroDay-Labz/OxideSip/releases) page:
-
-- `softphone-ui-linux-x86_64.tar.gz` — a plain binary tarball. Your system needs PipeWire ≥ 0.3.44
-  already installed (true by default on Fedora/KDE); nothing else is bundled.
-- an RPM, installable with `sudo dnf install ./oxidesip-*.rpm` on Fedora and other RPM-based
-  distros — its runtime dependencies (PipeWire, etc.) are declared automatically from the binary's
-  actual shared-library links, so `dnf` will pull in anything missing.
-- a `.deb`, installable with `sudo apt install ./oxidesip_*.deb` on Debian/Ubuntu and derivatives —
-  same auto-detected-dependency approach as the RPM.
-- a Flatpak bundle (`oxidesip-x86_64.flatpak`), installable with
-  `flatpak install ./oxidesip-x86_64.flatpak` — sandboxed, distro-independent, built from the
-  manifest in [`flatpak/`](flatpak/).
-
-To cut a release yourself: bump `version` in the root `Cargo.toml`, then
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-## Running
-
-```bash
+git clone https://github.com/ZeroDay-Labz/OxideSip && cd OxideSip
 cargo run --release -p softphone-ui
 ```
 
-On first launch with no configuration, the app opens straight to account setup — no config file
-needs to exist beforehand.
+Rust 1.88 or newer. `cargo test --workspace` runs the SIP, SDP and codec tests;
+`cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` must stay
+clean (CI enforces both). `scripts/render-icons.sh` regenerates the icon PNGs from the SVG,
+`scripts/screenshots.sh` regenerates `docs/screenshots/` with the app's own `--screenshot` mode.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-### Configuration
+| Crate | Purpose |
+|---|---|
+| `softphone-core` | SIP signalling via [`rsipstack`](https://crates.io/crates/rsipstack): registration, dialogs, SDP negotiation, structured caller identity. No UI or audio code. |
+| `softphone-media` | PipeWire capture and playback, RTP send/receive with RFC 4733 events, tones, WAV recording, G.711 codecs, secondary-stream routing. |
+| `softphone-ui` | The iced desktop app: theme, pages, incoming-call window, notifications, demo and screenshot modes, packaging metadata. |
 
-All persistent state — accounts, call-handling settings, audio device selection, contacts, call
-history — lives under `$XDG_CONFIG_HOME/oxidesip/` (typically `~/.config/oxidesip/`), regardless of
-where the binary is installed or what directory it's launched from. Accounts specifically are in
-`accounts.toml` there, created/edited from the app's SIP Settings screen — you don't need to
-hand-edit it. If an old CWD-relative copy of any of these files exists from a previous version of
-this app (which used to store them next to the binary), it's migrated into the XDG location
-automatically the first time it's needed.
-
-If you're upgrading from a version of this app that only supported one account, an existing
-single-account `./oxidesip.toml` (in the directory you launch from) or `OXIDESIP_*` environment
-variables are migrated into `accounts.toml` automatically on first run.
-
-To seed a first account non-interactively, copy the example config and adjust it, or set
-`OXIDESIP_*` environment variables directly:
-
-```bash
-cp softphone-core/config.example.toml oxidesip.toml
-$EDITOR oxidesip.toml
-```
-
-Recognized environment variables (override the legacy single-account config; only ever seed the
-*first* migrated account, not a way to configure multiple accounts):
-`OXIDESIP_SIP_SERVER_HOST`, `OXIDESIP_SIP_SERVER_PORT`, `OXIDESIP_TRANSPORT` (`udp`/`tcp`/`tls`),
-`OXIDESIP_USERNAME`, `OXIDESIP_PASSWORD`, `OXIDESIP_REGISTER_EXPIRES`, `OXIDESIP_LOCAL_PORT`,
-`OXIDESIP_SRTP`, `OXIDESIP_CA_CERT_PATH`, `OXIDESIP_CLIENT_CERT_PATH`, `OXIDESIP_CLIENT_KEY_PATH`,
-`OXIDESIP_PREFERRED_CODECS` (comma-separated, e.g. `ulaw,alaw`).
-
-### Routing a call into Discord (or another voice app)
-
-Open **Settings → Secondary Output**, hit **Refresh** while you're actually in the target app's
-voice channel, and pick its entry from the dropdown (prefixed `App:`) — e.g. Discord's own
-`WEBRTC VoiceEngine [recStream]` node only exists in the PipeWire graph while you're connected to a
-voice channel. Selecting it links the far end's voice straight into that app's live input stream,
-the same way tools like `qpwgraph`/`helvum` patch one client directly into another. If the app you
-want isn't listed, it's either not currently listening for audio, or you'll need to route through a
-virtual sink of your own instead (also selectable from the same dropdown).
+Tagged pushes (`v*`) run [`release.yml`](.github/workflows/release.yml), which builds the
+tarball, RPM, deb and Flatpak bundle and attaches them to the GitHub release.
 
 ## Known limitations
 
-- **Call Forwarding** has a toggle and number field in Settings, but doesn't yet redirect calls —
-  `rsipstack`'s dialog-reject API doesn't currently expose a way to send a proper SIP 3xx redirect.
-  This is disclosed, not silently faked.
-- **Blind transfer can't confirm the target actually answered.** A transfer is reported as
-  "requested," not "succeeded" — `rsipstack`'s REFER support only reports whether the server
-  accepted the REFER itself, with no way to correlate the follow-up NOTIFY(sipfrag) that would
-  carry the real outcome. Our leg is dropped once the REFER is accepted either way, matching how a
-  real deskphone hands off a blind transfer.
-- **No echo cancellation** yet — a real AEC integration is planned but not implemented.
-- **No STUN/ICE** — works well on a LAN or over a VPN to the PBX; NAT traversal beyond basic
-  registration isn't handled yet.
-- Some PipeWire configurations exhibit high playback-callback latency for client streams; the app
-  includes buffering/catch-up logic to keep audio continuous, but very high-latency setups may
-  still feel sluggish on call answer.
-- **Keyboard navigation is partial.** Tab/Shift+Tab cycles focus between text fields (in the
-  Settings/SIP/Audio windows and the dial pad), and fields wired to submit-on-Enter do. Buttons,
-  toggles, and dropdowns aren't keyboard-focusable or activatable — this is a limitation of the
-  `iced` GUI toolkit itself (only text inputs support focus in the version this app uses), not
-  something toggled off; supporting it fully would mean building a custom focus/activation system
-  for every button-like widget.
+- **No STUN / ICE.** Works on a LAN or over a VPN to the PBX; NAT traversal is not handled.
+- **No echo cancellation.** Use a headset, or rely on the PBX / the other side's AEC.
+- **Blind transfer reports "requested", not "completed".** `rsipstack` exposes whether the REFER
+  was accepted but not the follow-up NOTIFY that would say whether the target answered.
+- **Call forwarding is not implemented** (the stack cannot send a SIP 3xx yet); the old toggle
+  has been removed from Settings.
+- **Keyboard focus** reaches text fields and the shortcuts above; buttons and toggles are not
+  Tab-focusable in this version of iced.
 
-## Contributing
+## Credits
 
-Issues and PRs welcome. This is a young project with an actively evolving feature set — if you're
-planning a larger change, opening an issue first to discuss scope is a good idea.
+Built with [iced](https://github.com/iced-rs/iced), [rsipstack](https://github.com/restsend/rsipstack)
+and [PipeWire](https://pipewire.org). UI font: [Inter](https://rsms.me/inter/) (SIL OFL 1.1).
+Icons: [Lucide](https://lucide.dev) (ISC).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
