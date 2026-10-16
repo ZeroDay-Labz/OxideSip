@@ -5,13 +5,15 @@ mod branding;
 mod bridge;
 mod contacts;
 mod history;
-mod icon;
+mod icons;
 mod incoming;
 mod notify;
 mod number;
 mod paths;
 mod theme;
-mod view;
+mod toast;
+mod ui;
+mod ui_state;
 
 use app::App;
 use std::path::Path;
@@ -60,5 +62,10 @@ pub fn main() -> iced::Result {
         .title(App::title)
         .subscription(App::subscription)
         .theme(App::theme)
+        // Bundled UI font so every desktop renders identically (Inter, OFL).
+        .font(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice())
+        .default_font(branding::UI_FONT)
         .run()
 }

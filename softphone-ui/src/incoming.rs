@@ -6,10 +6,10 @@
 
 use crate::app::{AccountSession, App, CallUiState, Message, RegistrationStatus};
 use crate::theme::{self, Pill};
-use crate::view::{call_avatar_label_for, format_elapsed, muted_text, party_name, pill_call_button};
-use crate::{branding, icon};
+use crate::ui::components::{self, avatar, call_avatar_label_for, format_elapsed, muted, party_name, pill_call_button};
+use crate::{branding, icons};
 use iced::widget::{button, column, container, row, rule, text};
-use iced::{Alignment, Element, Length, window};
+use iced::{Alignment, Color, Element, Length, window};
 use softphone_core::events::{CallId, RemoteParty};
 use std::time::Instant;
 
@@ -53,9 +53,9 @@ pub fn ringing_calls(app: &App) -> Vec<Ringing<'_>> {
     calls
 }
 
-pub const WINDOW_WIDTH: f32 = 420.0;
-const FIRST_CARD_HEIGHT: f32 = 296.0;
-const EXTRA_CARD_HEIGHT: f32 = 236.0;
+pub const WINDOW_WIDTH: f32 = 440.0;
+const FIRST_CARD_HEIGHT: f32 = 300.0;
+const EXTRA_CARD_HEIGHT: f32 = 240.0;
 
 /// The window is content-sized (not resizable), so it grows with the
 /// number of ringing calls instead of clipping anything.
@@ -87,13 +87,14 @@ pub fn title(app: &App) -> String {
 }
 
 pub fn window_view(app: &App) -> Element<'_, Message> {
+    let t = theme::tokens(app.mode());
     let calls = ringing_calls(app);
     let mut stack = column![].spacing(0).width(Length::Fill);
     for (i, call) in calls.iter().enumerate() {
         if i > 0 {
-            stack = stack.push(rule::horizontal(1));
+            stack = stack.push(rule::horizontal(1).style(theme::rule_style));
         }
-        stack = stack.push(card(app, call, i == 0));
+        stack = stack.push(card(app, &t, call, i == 0));
     }
     container(stack)
         .width(Length::Fill)
@@ -104,91 +105,113 @@ pub fn window_view(app: &App) -> Element<'_, Message> {
 
 /// One ringing call. `primary` marks the newest card, the one the keyboard
 /// shortcuts act on (its button captions say so).
-pub fn card<'a>(app: &'a App, call: &Ringing<'a>, primary: bool) -> Element<'a, Message> {
-    let palette = theme::oxide_palette();
+fn card<'a>(app: &'a App, t: &theme::Tokens, call: &Ringing<'a>, primary: bool) -> Element<'a, Message> {
     let acc: &AccountSession = &app.accounts[call.account];
     let contacts = &app.contacts;
     let caller = call.caller;
     let name = party_name(contacts, caller);
-    let avatar_seed = name.unwrap_or(&caller.user);
+    let seed = name.unwrap_or(&caller.user);
 
     let reg_color = match &acc.registration {
-        RegistrationStatus::Registered { .. } => palette.success,
-        RegistrationStatus::Connecting => palette.warning,
-        RegistrationStatus::Failed { .. } | RegistrationStatus::Halted { .. } => palette.danger,
+        RegistrationStatus::Registered { .. } => t.success,
+        RegistrationStatus::Connecting => t.warning,
+        RegistrationStatus::Failed { .. } | RegistrationStatus::Halted { .. } => t.danger,
     };
-    let account_chip = container(
-        row![
-            container(text("")).width(8).height(8).style(theme::led(reg_color)),
-            text(if acc.config.name.trim().is_empty() {
-                acc.config.username.clone()
-            } else {
-                acc.config.name.clone()
-            })
-            .size(12),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
-    )
-    .padding([4, 10])
-    .style(theme::chip);
+    let account_name = if acc.config.name.trim().is_empty() {
+        acc.config.username.clone()
+    } else {
+        acc.config.name.clone()
+    };
 
     let header = row![
-        icon::telephone_inbound_fill().size(14).color(palette.warning),
-        text("Incoming call").size(13).color(muted_text()),
+        icons::bell_ring(16.0, t.warning),
+        text("Incoming call").size(theme::text_size::BODY).color(muted(t)),
         text(format_elapsed(call.ringing_since.elapsed()))
-            .size(13)
+            .size(theme::text_size::BODY)
             .font(iced::Font::MONOSPACE)
-            .color(muted_text()),
+            .color(muted(t)),
         container(text("")).width(Length::Fill),
-        account_chip,
+        components::status_chip(reg_color, account_name),
     ]
-    .spacing(8)
+    .spacing(theme::space::SM)
     .align_y(Alignment::Center);
-
-    let avatar = container(text(call_avatar_label_for(contacts, caller)).size(22))
-        .width(Length::Fixed(64.0))
-        .height(Length::Fixed(64.0))
-        .align_x(Alignment::Center)
-        .align_y(Alignment::Center)
-        .style(theme::avatar_state(theme::avatar_color(avatar_seed), 1.0));
 
     let mut identity = column![].spacing(2);
     match name {
         Some(name) => {
             identity = identity
-                .push(text(name).size(22))
-                .push(text(caller.user.as_str()).size(14).color(muted_text()));
+                .push(
+                    text(name)
+                        .size(theme::text_size::TITLE + 2.0)
+                        .font(branding::UI_FONT_SEMIBOLD),
+                )
+                .push(
+                    text(caller.user.as_str())
+                        .size(theme::text_size::SUBHEAD)
+                        .color(muted(t)),
+                );
         }
-        None => identity = identity.push(text(caller.user.as_str()).size(22)),
+        None => {
+            identity = identity.push(
+                text(caller.user.as_str())
+                    .size(theme::text_size::TITLE + 2.0)
+                    .font(branding::UI_FONT_SEMIBOLD),
+            )
+        }
     }
     let host = caller.host();
     if !host.is_empty() {
-        identity = identity.push(text(host.to_string()).size(11).color(muted_text()));
+        identity = identity.push(text(host.to_string()).size(theme::text_size::CAPTION).color(muted(t)));
     }
+    let who = row![
+        avatar(seed, call_avatar_label_for(contacts, caller), 64.0, 1.0),
+        identity
+    ]
+    .spacing(theme::space::LG)
+    .align_y(Alignment::Center);
 
-    let who = row![avatar, identity].spacing(14).align_y(Alignment::Center);
-
-    let decline = pill_call_button("Decline", theme::pill(Pill::Danger), icon::telephone_x_fill(), 1.15)
-        .on_press(Message::RejectIncomingCall(call.account, call.id.clone()));
-    let answer = pill_call_button("Answer", theme::pill(Pill::Success), icon::telephone_fill(), 1.15)
-        .on_press(Message::AnswerIncomingCall(call.account, call.id.clone()));
+    let answer_fg = if t.mode == theme::Mode::Dark {
+        iced::color!(0x06201a)
+    } else {
+        Color::WHITE
+    };
+    let decline = pill_call_button(
+        "Decline",
+        theme::pill(Pill::Danger),
+        icons::phone_off(18.0, Color::WHITE),
+    )
+    .on_press(Message::RejectIncomingCall(call.account, call.id.clone()))
+    .padding([theme::space::LG, theme::space::XL]);
+    let answer = pill_call_button("Answer", theme::pill(Pill::Success), icons::phone(18.0, answer_fg))
+        .on_press(Message::AnswerIncomingCall(call.account, call.id.clone()))
+        .padding([theme::space::LG, theme::space::XL]);
     let caption = |label: &'static str| -> Element<'a, Message> {
-        container(text(if primary { label } else { "" }).size(11).color(muted_text()))
-            .width(Length::Fill)
-            .align_x(Alignment::Center)
-            .into()
+        container(
+            text(if primary { label } else { "" })
+                .size(theme::text_size::CAPTION)
+                .color(muted(t)),
+        )
+        .width(Length::Fill)
+        .align_x(Alignment::Center)
+        .into()
     };
     let actions = column![
-        row![decline, answer].spacing(12),
-        row![caption("Esc"), caption("Enter")].spacing(12),
+        row![decline, answer].spacing(theme::space::MD),
+        row![caption("Esc"), caption("Enter")].spacing(theme::space::MD),
     ]
-    .spacing(4);
+    .spacing(theme::space::XS);
 
-    let silence = button(text("Silence ringtone").size(12))
-        .style(theme::pill(Pill::Neutral))
-        .padding([6, 12])
-        .on_press(Message::SilenceRingtone);
+    let silence = button(
+        row![
+            icons::bell_off(13.0, muted(t)),
+            text("Silence ringtone").size(theme::text_size::CAPTION + 1.0)
+        ]
+        .spacing(theme::space::SM)
+        .align_y(Alignment::Center),
+    )
+    .style(theme::button_ghost)
+    .padding([theme::space::XS + 2.0, theme::space::MD])
+    .on_press(Message::SilenceRingtone);
 
     column![
         header,
@@ -196,8 +219,8 @@ pub fn card<'a>(app: &'a App, call: &Ringing<'a>, primary: bool) -> Element<'a, 
         actions,
         container(silence).width(Length::Fill).align_x(Alignment::Center),
     ]
-    .spacing(16)
-    .padding([18, 22])
+    .spacing(theme::space::LG)
+    .padding([theme::space::LG + 2.0, theme::space::XL])
     .width(Length::Fill)
     .into()
 }

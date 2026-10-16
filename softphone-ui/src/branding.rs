@@ -15,6 +15,17 @@ pub const APP_NAME: &str = "OxideSip";
 /// and the icon name under `hicolor/`.
 pub const APP_ID: &str = "io.github.zerodaylabz.OxideSip";
 
+/// The bundled UI typeface (see `main.rs`'s `.font(...)` calls).
+pub const UI_FONT: iced::Font = iced::Font::with_name("Inter");
+pub const UI_FONT_MEDIUM: iced::Font = iced::Font {
+    weight: iced::font::Weight::Medium,
+    ..UI_FONT
+};
+pub const UI_FONT_SEMIBOLD: iced::Font = iced::Font {
+    weight: iced::font::Weight::Semibold,
+    ..UI_FONT
+};
+
 const ICON_PNG: &[u8] = include_bytes!("../../packaging/icons/128.png");
 
 /// The embedded app icon decoded for winit. `None` only if the compiled-in

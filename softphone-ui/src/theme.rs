@@ -1,45 +1,164 @@
-//! The "OxideSip" visual identity: a single custom `iced::Theme` plus a
-//! small set of reusable style closures, so every screen/window pulls from
-//! one palette instead of hand-rolled colors scattered across `view.rs`.
+//! The OxideSip design system: colour tokens for a dark and a light mode,
+//! the `iced::Theme` built from them, and the catalogue of widget styles
+//! every screen draws from — so no screen invents its own colours.
+//!
+//! Pattern: style functions take `&Theme`, resolve the current `Mode` from
+//! it (`mode_of`) and read the matching `Tokens`. That keeps both modes in
+//! one place and lets `App::theme` switch at runtime (System / Dark / Light).
 
-use iced::widget::{button, container, slider};
-use iced::{Background, Border, Color, Radians, Shadow, Theme, color};
+use iced::widget::{button, container, pick_list, rule, scrollable, slider, text_input, toggler};
+use iced::{Background, Border, Color, Radians, Shadow, Theme, border, color};
 
-pub fn oxide_palette() -> iced::theme::Palette {
-    iced::theme::Palette {
-        background: color!(0x14161b),
-        text: color!(0xe8e6e1),
-        primary: color!(0xff7a3d),
-        success: color!(0x33d17a),
-        warning: color!(0xffb648),
-        danger: color!(0xff5c5c),
+/// Resolved colour mode (what is actually on screen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Dark,
+    Light,
+}
+
+/// The user's preference, persisted in settings. `System` follows the
+/// desktop's colour scheme (xdg-desktop-portal), resolved by `App::theme`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeSetting {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemeSetting {
+    pub const ALL: [ThemeSetting; 3] = [ThemeSetting::System, ThemeSetting::Dark, ThemeSetting::Light];
+}
+
+impl std::fmt::Display for ThemeSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ThemeSetting::System => "Follow system",
+            ThemeSetting::Dark => "Dark",
+            ThemeSetting::Light => "Light",
+        })
     }
 }
 
-pub fn theme() -> Theme {
-    Theme::custom("OxideSip".to_string(), oxide_palette())
+/// Brand colours shared by both modes (slightly re-tuned for light).
+pub const ACCENT: Color = color!(0xff7a3d); // copper — the "oxide"
+pub const ACCENT_LIGHT: Color = color!(0xe5602a);
+pub const VERDIGRIS: Color = color!(0x3ec9a7); // patina green: registered / answer
+pub const VERDIGRIS_LIGHT: Color = color!(0x1f9f7f);
+pub const AMBER: Color = color!(0xffb648); // ringing / warnings
+pub const AMBER_LIGHT: Color = color!(0xc98a12);
+pub const CORAL: Color = color!(0xff5c5c); // decline / hang up / errors
+pub const CORAL_LIGHT: Color = color!(0xd64545);
+pub const SKY: Color = color!(0x5ec4f5); // transfer / info
+pub const SKY_LIGHT: Color = color!(0x2a8fc9);
+
+#[derive(Debug, Clone, Copy)]
+pub struct Tokens {
+    pub mode: Mode,
+    pub bg: Color,
+    pub sidebar: Color,
+    pub panel: Color,
+    pub raised: Color,
+    pub raised_hover: Color,
+    pub line: Color,
+    pub text: Color,
+    pub text_dim: Color,
+    pub meter_bg: Color,
+    pub accent: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub danger: Color,
+    pub info: Color,
 }
 
-/// A shared spacing scale, so `.spacing()`/`.padding()` calls across
-/// `view.rs` pick from one small vocabulary instead of arbitrary per-call-site
-/// pixel values. Existing screens still use hand-picked literals in most
-/// places (all of them run through `scaled()` for responsive sizing anyway,
-/// so a token here is just `scaled(space::MD, scale)` at the call site) —
-/// this scale is meant to be adopted incrementally, screen by screen, not as
-/// a single mechanical find-replace across the whole file.
-#[allow(dead_code)] // adopted incrementally screen-by-screen, see module doc above
+pub fn tokens(mode: Mode) -> Tokens {
+    match mode {
+        Mode::Dark => Tokens {
+            mode,
+            bg: color!(0x111318),
+            sidebar: color!(0x0d0f13),
+            panel: color!(0x1a1d24),
+            raised: color!(0x262a34),
+            raised_hover: color!(0x343a48),
+            line: Color::from_rgba8(255, 255, 255, 0.07),
+            text: color!(0xecf0f4),
+            text_dim: color!(0x969eac),
+            meter_bg: color!(0x0a0b0e),
+            accent: ACCENT,
+            success: VERDIGRIS,
+            warning: AMBER,
+            danger: CORAL,
+            info: SKY,
+        },
+        Mode::Light => Tokens {
+            mode,
+            bg: color!(0xf4f5f8),
+            sidebar: color!(0xeceef3),
+            panel: Color::WHITE,
+            raised: color!(0xeef0f5),
+            raised_hover: color!(0xe3e6ee),
+            line: Color::from_rgba8(0, 0, 0, 0.08),
+            text: color!(0x1b1f27),
+            text_dim: color!(0x5f6878),
+            meter_bg: color!(0xdfe3ea),
+            accent: ACCENT_LIGHT,
+            success: VERDIGRIS_LIGHT,
+            warning: AMBER_LIGHT,
+            danger: CORAL_LIGHT,
+            info: SKY_LIGHT,
+        },
+    }
+}
+
+/// A translucent tint of `c`.
+pub const fn tint(c: Color, a: f32) -> Color {
+    Color { a, ..c }
+}
+
+pub fn theme(mode: Mode) -> Theme {
+    let t = tokens(mode);
+    Theme::custom(
+        match mode {
+            Mode::Dark => "OxideSip Dark".to_string(),
+            Mode::Light => "OxideSip Light".to_string(),
+        },
+        iced::theme::Palette {
+            background: t.bg,
+            text: t.text,
+            primary: t.accent,
+            success: t.success,
+            warning: t.warning,
+            danger: t.danger,
+        },
+    )
+}
+
+pub fn mode_of(theme: &Theme) -> Mode {
+    let b = theme.palette().background;
+    if 0.2126 * b.r + 0.7152 * b.g + 0.0722 * b.b > 0.5 {
+        Mode::Light
+    } else {
+        Mode::Dark
+    }
+}
+
+/// Tokens for the theme currently being rendered.
+pub fn t(theme: &Theme) -> Tokens {
+    tokens(mode_of(theme))
+}
+
+/// Spacing scale (px). Every `.spacing()`/`.padding()` picks from here.
 pub mod space {
     pub const XS: f32 = 4.0;
     pub const SM: f32 = 8.0;
     pub const MD: f32 = 12.0;
     pub const LG: f32 = 16.0;
     pub const XL: f32 = 24.0;
-    pub const XXL: f32 = 32.0;
 }
 
-/// A shared type scale, same intent as `space` above — covers the ~6-28px
-/// range of `.size()` calls already in use across `view.rs`.
-#[allow(dead_code)] // adopted incrementally screen-by-screen, see module doc above
+/// Type scale (px). Nothing renders below `CAPTION`.
 pub mod text_size {
     pub const CAPTION: f32 = 11.0;
     pub const BODY: f32 = 13.0;
@@ -48,32 +167,38 @@ pub mod text_size {
     pub const DISPLAY: f32 = 28.0;
 }
 
-/// Slightly lighter than the app background, used for card-like panels
-/// (rows, footers, forms) so they read as distinct surfaces.
-const SURFACE: Color = color!(0x1c1f26);
-const SURFACE_BORDER: Color = Color {
-    r: 1.0,
-    g: 1.0,
-    b: 1.0,
-    a: 0.06,
-};
-/// A step lighter than `SURFACE` — list rows (contacts, call history) sit on
-/// top of a `card`-styled panel that's already `SURFACE`-colored, so a row
-/// using that same tone would be invisible against its own container. This
-/// keeps the same background/panel/row "elevation" progression instead.
-const ROW_SURFACE: Color = color!(0x242a35);
-const ROW_SURFACE_HOVER: Color = color!(0x2c3340);
+/// Corner radii.
+pub mod radius {
+    pub const MD: f32 = 10.0;
+    pub const LG: f32 = 14.0;
+    pub const PILL: f32 = 999.0;
+}
 
-/// A soft top-lit vertical gradient from `base`, a touch lighter, into
-/// `base` itself — used on filled buttons/active fills so they read as
-/// gently glossy/raised instead of a flat block of color. Deliberately
-/// subtle (a 10% lightness step): enough to add depth, not enough to look
-/// like a skeuomorphic bevel.
+pub fn rounded(r: f32) -> Border {
+    Border {
+        radius: border::radius(r),
+        ..Border::default()
+    }
+}
+
+/// Linear interpolation between two colours, channel-wise.
+pub fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+/// A soft top-lit gradient from `base` (a touch lighter at the top) into
+/// `base` — filled buttons read as gently raised instead of flat.
 fn top_lit(base: Color) -> Background {
     let lighter = Color {
-        r: (base.r + 0.10).min(1.0),
-        g: (base.g + 0.10).min(1.0),
-        b: (base.b + 0.10).min(1.0),
+        r: (base.r + 0.08).min(1.0),
+        g: (base.g + 0.08).min(1.0),
+        b: (base.b + 0.08).min(1.0),
         a: base.a,
     };
     Background::Gradient(
@@ -84,115 +209,206 @@ fn top_lit(base: Color) -> Background {
     )
 }
 
-pub fn card(_theme: &Theme) -> container::Style {
-    container::Style {
-        text_color: None,
-        background: Some(Background::Color(SURFACE)),
-        border: Border {
-            color: SURFACE_BORDER,
-            width: 1.0,
-            radius: 18.0.into(),
-        },
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.3),
-            offset: iced::Vector::new(0.0, 3.0),
-            blur_radius: 16.0,
-        },
-        ..container::Style::default()
-    }
-}
+// ------------------------------------------------------------------ containers
 
-/// The whole main window's backdrop, behind the tab bar/panel/footer —
-/// without this, `main_view`'s outermost container has no explicit style at
-/// all, so the window just shows the theme's flat `palette.background`
-/// solid color. A very subtle top-lit gradient (barely darker than
-/// `background` at the very top, easing to it) instead, so the app doesn't
-/// read as one flat matte block behind the cards floating on it.
+/// The window backdrop: a very subtle top-lit gradient over `bg`.
 pub fn app_background(theme: &Theme) -> container::Style {
-    let palette = theme.palette();
+    let t = t(theme);
     let top = Color {
-        r: (palette.background.r + 0.02).min(1.0),
-        g: (palette.background.g + 0.02).min(1.0),
-        b: (palette.background.b + 0.03).min(1.0),
-        a: palette.background.a,
+        r: (t.bg.r + 0.02).min(1.0),
+        g: (t.bg.g + 0.02).min(1.0),
+        b: (t.bg.b + 0.03).min(1.0),
+        a: 1.0,
     };
     container::Style {
-        text_color: None,
+        text_color: Some(t.text),
         background: Some(Background::Gradient(
             iced::gradient::Linear::new(Radians(std::f32::consts::FRAC_PI_2))
                 .add_stop(0.0, top)
-                .add_stop(1.0, palette.background)
+                .add_stop(1.0, t.bg)
                 .into(),
         )),
         ..container::Style::default()
     }
 }
 
-/// Small inline "chip" background — same surface/border tone as `card` but
-/// a touch less round and with no drop shadow, since this is meant for
-/// small inline footer badges (the call-status label, the registration
-/// LED) rather than an elevated panel.
-pub fn chip(_theme: &Theme) -> container::Style {
+pub fn sidebar(theme: &Theme) -> container::Style {
+    let t = t(theme);
     container::Style {
-        text_color: None,
-        background: Some(Background::Color(SURFACE)),
+        background: Some(t.sidebar.into()),
+        text_color: Some(t.text),
+        ..Default::default()
+    }
+}
+
+/// A content panel: `panel` fill, hairline border, 14 px corners.
+pub fn panel(theme: &Theme) -> container::Style {
+    let t = t(theme);
+    container::Style {
+        background: Some(t.panel.into()),
         border: Border {
-            color: SURFACE_BORDER,
+            radius: border::radius(radius::LG),
             width: 1.0,
-            radius: 14.0.into(),
+            color: t.line,
         },
-        ..container::Style::default()
+        ..Default::default()
     }
 }
 
-/// Faint inset "track" container behind the Dialer/Contacts/History tab
-/// pills — gives them a modern segmented-control look (the active tab's
-/// filled pill standing out against a subtly recessed background) instead
-/// of three buttons floating directly on the page background.
-pub fn tab_track(_theme: &Theme) -> container::Style {
+/// `panel` with a coloured edge — the one that is live/selected/ringing.
+pub fn panel_accent(accent: Color) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let t = t(theme);
+        container::Style {
+            background: Some(t.panel.into()),
+            border: Border {
+                radius: border::radius(radius::LG),
+                width: 1.0,
+                color: tint(accent, 0.45),
+            },
+            shadow: Shadow {
+                color: tint(accent, 0.18),
+                offset: iced::Vector::new(0.0, 0.0),
+                blur_radius: 18.0,
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// A step above `panel`: rows, inputs' housing, grouped controls.
+pub fn raised(theme: &Theme) -> container::Style {
+    let t = t(theme);
     container::Style {
-        text_color: None,
-        background: Some(Background::Color(Color {
-            a: 0.05,
-            ..Color::WHITE
-        })),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 16.0.into(),
-        },
-        ..container::Style::default()
+        background: Some(t.raised.into()),
+        border: rounded(radius::MD),
+        ..Default::default()
     }
 }
 
-/// Fully round container used for the registration status LED.
+/// Small rounded label (status readouts, account tags).
+pub fn chip(theme: &Theme) -> container::Style {
+    let t = t(theme);
+    container::Style {
+        background: Some(t.raised.into()),
+        border: rounded(radius::PILL),
+        text_color: Some(t.text_dim),
+        ..Default::default()
+    }
+}
+
+/// Chip tinted with a state colour (registered / ringing / failed).
+pub fn chip_tinted(accent: Color) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let t = t(theme);
+        container::Style {
+            background: Some(tint(accent, if t.mode == Mode::Dark { 0.16 } else { 0.14 }).into()),
+            border: rounded(radius::PILL),
+            text_color: Some(if t.mode == Mode::Dark {
+                accent
+            } else {
+                lerp_color(accent, t.text, 0.3)
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+/// Housing for the segmented tab/filter pills.
+pub fn tab_track(theme: &Theme) -> container::Style {
+    let t = t(theme);
+    container::Style {
+        background: Some(t.raised.into()),
+        border: rounded(radius::LG),
+        ..Default::default()
+    }
+}
+
+/// Fully round dot used for status LEDs, with a glow in its own colour.
 pub fn led(fill: Color) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        text_color: None,
-        background: Some(Background::Color(fill)),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 5.0.into(),
-        },
+        background: Some(fill.into()),
+        border: rounded(radius::PILL),
         shadow: Shadow {
             color: fill.scale_alpha(0.6),
             offset: iced::Vector::new(0.0, 0.0),
             blur_radius: 6.0,
         },
-        ..container::Style::default()
+        ..Default::default()
     }
 }
 
-/// Deterministic avatar background color for a contact/history entry, hashed
-/// from its display name/number so the same person always gets the same
-/// color without needing to persist one.
+/// Floating overlay card (modals, toasts, menus).
+pub fn overlay(theme: &Theme) -> container::Style {
+    let t = t(theme);
+    container::Style {
+        background: Some(t.panel.into()),
+        text_color: Some(t.text),
+        border: Border {
+            radius: border::radius(radius::LG),
+            width: 1.0,
+            color: t.line,
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, if t.mode == Mode::Dark { 0.5 } else { 0.18 }),
+            offset: iced::Vector::new(0.0, 8.0),
+            blur_radius: 28.0,
+        },
+        ..Default::default()
+    }
+}
+
+/// Dim scrim behind a modal.
+pub fn scrim(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
+        ..Default::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// A toast: overlay card with a coloured left accent (border colour).
+pub fn toast(kind: ToastKind) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let t = t(theme);
+        let accent = match kind {
+            ToastKind::Info => t.info,
+            ToastKind::Success => t.success,
+            ToastKind::Warning => t.warning,
+            ToastKind::Error => t.danger,
+        };
+        let mut style = overlay(theme);
+        style.border.color = tint(accent, 0.6);
+        style
+    }
+}
+
+pub fn toast_accent(kind: ToastKind, theme: &Theme) -> Color {
+    let t = t(theme);
+    match kind {
+        ToastKind::Info => t.info,
+        ToastKind::Success => t.success,
+        ToastKind::Warning => t.warning,
+        ToastKind::Error => t.danger,
+    }
+}
+
+// --------------------------------------------------------------------- avatars
+
+/// Deterministic avatar colour for a person, hashed from their name/number.
 pub fn avatar_color(seed: &str) -> Color {
     let hash = seed
         .bytes()
         .fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32));
     let hue = (hash % 360) as f32;
-    hsl_to_rgb(hue, 0.55, 0.5)
+    hsl_to_rgb(hue, 0.5, 0.48)
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color {
@@ -210,41 +426,14 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color {
     Color::from_rgb(r + m, g + m, b + m)
 }
 
-/// A perfectly round container, e.g. for a contact/history avatar initial.
-pub fn avatar(fill: Color) -> impl Fn(&Theme) -> container::Style {
-    move |_theme| container::Style {
-        text_color: Some(Color::WHITE),
-        background: Some(Background::Color(fill)),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 999.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-/// Same as `avatar`, plus a soft colored glow scaled by `live_amount`
-/// (0.0-1.0) — used for the caller/callee avatar on the incoming-call and
-/// in-call screens while there's actually live audio (ringing, or connected
-/// and not on hold), so the one moment that matters most in the whole app
-/// reads as more alive than a flat circle. Takes a continuous amount rather
-/// than a bool so a caller can drive it from an `iced::Animation<bool>`
-/// (see `CallUiState::Active::avatar_glow`) and get a real cross-fade
-/// instead of the glow snapping on/off. A single function (not two) so
-/// every call site shares one concrete return type — `if`/`else` can't pick
-/// between two `impl Trait` functions even when their signatures match,
-/// since each one is still a distinct anonymous type.
+/// `avatar` plus a glow scaled by `live_amount` (0–1) for a ringing or
+/// connected party — drive it from an `iced::Animation<bool>` for a fade.
 pub fn avatar_state(fill: Color, live_amount: f32) -> impl Fn(&Theme) -> container::Style {
     let live_amount = live_amount.clamp(0.0, 1.0);
     move |_theme| container::Style {
         text_color: Some(Color::WHITE),
-        background: Some(Background::Color(fill)),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 999.0.into(),
-        },
+        background: Some(top_lit(fill)),
+        border: rounded(radius::PILL),
         shadow: Shadow {
             color: fill.scale_alpha(0.55 * live_amount),
             offset: iced::Vector::new(0.0, 0.0),
@@ -254,68 +443,139 @@ pub fn avatar_state(fill: Color, live_amount: f32) -> impl Fn(&Theme) -> contain
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum Pill {
-    Primary,
-    Success,
-    Danger,
-    Neutral,
-    /// 0.0 = unselected, 1.0 = selected — a continuous amount (rather than a
-    /// bare `bool`) so the tab bar can cross-fade the fill in/out via
-    /// `iced::Animation<bool>::interpolate` instead of it snapping instantly.
-    Tab(f32),
-}
+// --------------------------------------------------------------------- buttons
 
-/// Linear interpolation between two colors, channel-wise.
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    Color {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
+fn btn(bg: Color, hover: Color, text: Color, r: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => hover,
+            button::Status::Disabled => Color { a: bg.a * 0.5, ..bg },
+            _ => bg,
+        };
+        button::Style {
+            background: Some(background.into()),
+            text_color: if matches!(status, button::Status::Disabled) {
+                Color { a: 0.5, ..text }
+            } else {
+                text
+            },
+            border: rounded(r),
+            shadow: Shadow::default(),
+            snap: true,
+        }
     }
 }
 
-/// Rounded, filled button style used for the tab bar and the primary call
-/// actions (answer/hang up/hold/transfer), replacing iced's default
-/// rectangular button look everywhere in the app.
+/// Filled accent button (the page's primary action).
+pub fn button_primary(theme: &Theme, status: button::Status) -> button::Style {
+    let t = t(theme);
+    btn(
+        t.accent,
+        lerp_color(t.accent, Color::WHITE, 0.12),
+        Color::WHITE,
+        radius::MD,
+    )(theme, status)
+}
+
+/// Raised neutral button.
+pub fn button_soft(theme: &Theme, status: button::Status) -> button::Style {
+    let t = t(theme);
+    btn(t.raised, t.raised_hover, t.text, radius::MD)(theme, status)
+}
+
+/// Borderless button that only shows a fill on hover.
+pub fn button_ghost(theme: &Theme, status: button::Status) -> button::Style {
+    let t = t(theme);
+    btn(Color::TRANSPARENT, t.raised, t.text, radius::MD)(theme, status)
+}
+
+/// Danger-tinted button (delete, clear).
+pub fn button_danger(theme: &Theme, status: button::Status) -> button::Style {
+    let t = t(theme);
+    btn(tint(t.danger, 0.16), tint(t.danger, 0.3), t.danger, radius::MD)(theme, status)
+}
+
+/// Square-ish icon-only button; `active` fills it with the accent.
+pub fn icon_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let t = t(theme);
+        if active {
+            btn(
+                t.accent,
+                lerp_color(t.accent, Color::WHITE, 0.12),
+                Color::WHITE,
+                radius::MD,
+            )(theme, status)
+        } else {
+            btn(Color::TRANSPARENT, t.raised, t.text_dim, radius::MD)(theme, status)
+        }
+    }
+}
+
+/// Sidebar navigation entry; `active` is a continuous 0–1 amount so the
+/// highlight can cross-fade between pages.
+pub fn nav(active: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let t = t(theme);
+        let active = active.clamp(0.0, 1.0);
+        let base = tint(t.accent, 0.2 * active);
+        let hover = lerp_color(t.raised, tint(t.accent, 0.26), active);
+        let text = lerp_color(t.text_dim, t.text, active);
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => hover,
+            _ => base,
+        };
+        button::Style {
+            background: Some(background.into()),
+            text_color: text,
+            border: rounded(radius::MD),
+            shadow: Shadow::default(),
+            snap: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Pill {
+    Success,
+    Danger,
+    /// 0.0 = unselected, 1.0 = selected (continuous for cross-fades).
+    Tab(f32),
+}
+
+/// Rounded, filled pill — the call actions (Call / Answer / Decline / Hang
+/// up) and the segmented tabs.
 pub fn pill(kind: Pill) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
-        let palette = theme.palette();
+        let t = t(theme);
         let (base, text, filled) = match kind {
-            Pill::Primary => (palette.primary, Color::WHITE, true),
-            Pill::Success => (palette.success, Color::BLACK, true),
-            Pill::Danger => (palette.danger, Color::WHITE, true),
-            Pill::Neutral => (
-                Color {
-                    a: 0.08,
-                    ..Color::WHITE
+            Pill::Success => (
+                t.success,
+                if t.mode == Mode::Dark {
+                    color!(0x06201a)
+                } else {
+                    Color::WHITE
                 },
-                palette.text,
-                false,
+                true,
             ),
-            Pill::Tab(t) => (
-                palette.primary.scale_alpha(t.clamp(0.0, 1.0)),
-                lerp_color(palette.text, Color::WHITE, t),
+            Pill::Danger => (t.danger, Color::WHITE, true),
+            Pill::Tab(a) => (
+                lerp_color(Color::TRANSPARENT, t.accent, a),
+                lerp_color(t.text_dim, Color::WHITE, a),
                 false,
             ),
         };
-        let alpha_scale = match status {
-            button::Status::Active => 1.0,
-            button::Status::Hovered => 0.85,
-            button::Status::Pressed => 0.7,
-            button::Status::Disabled => 0.35,
+        let background = match status {
+            button::Status::Active => base,
+            button::Status::Hovered => lerp_color(base, Color::WHITE, 0.08),
+            button::Status::Pressed => lerp_color(base, Color::BLACK, 0.1),
+            button::Status::Disabled => base.scale_alpha(0.4),
         };
         let background = if filled {
-            top_lit(base.scale_alpha(alpha_scale))
+            top_lit(background)
         } else {
-            Background::Color(base.scale_alpha(alpha_scale))
+            Background::Color(background)
         };
-        // Filled pills (primary/success/danger CTAs, the active tab) get a
-        // soft shadow tinted with their own fill color so they visually lift
-        // off the page instead of sitting flush with the background — the
-        // rest stay flat, matching their less prominent role.
         let shadow = if filled && matches!(status, button::Status::Active | button::Status::Hovered) {
             Shadow {
                 color: base.scale_alpha(0.35),
@@ -327,55 +587,32 @@ pub fn pill(kind: Pill) -> impl Fn(&Theme, button::Status) -> button::Style {
         };
         button::Style {
             background: Some(background),
-            text_color: text,
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: 14.0.into(),
+            text_color: if matches!(status, button::Status::Disabled) {
+                Color { a: 0.5, ..text }
+            } else {
+                text
             },
+            border: rounded(radius::LG),
             shadow,
-            ..button::Style::default()
+            snap: true,
         }
     }
 }
 
-/// Card-like button style for list rows (contacts, call history) — each
-/// entry gets its own subtly bordered, slightly-raised surface instead of
-/// `Pill::Neutral`'s flatter near-transparent look, so a list of many
-/// entries reads as distinct separated items rather than a single blurred
-/// block of text.
-pub fn list_row(_theme: &Theme, status: button::Status) -> button::Style {
-    let background = match status {
-        button::Status::Hovered => ROW_SURFACE_HOVER,
-        _ => ROW_SURFACE,
-    };
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color: oxide_palette().text,
-        border: Border {
-            color: SURFACE_BORDER,
-            width: 1.0,
-            radius: 15.0.into(),
-        },
-        shadow: Shadow::default(),
-        ..button::Style::default()
+fn circle_base(theme: &Theme) -> Color {
+    let t = t(theme);
+    if t.mode == Mode::Dark {
+        Color::from_rgba8(255, 255, 255, 0.07)
+    } else {
+        Color::from_rgba8(0, 0, 0, 0.06)
     }
 }
 
-/// Perfectly round buttons — the dialpad keys and the mute/hold icon
-/// toggles. `active` swaps in the primary color (e.g. a toggle that's
-/// currently engaged); otherwise a neutral glass-like fill.
+/// Round button — dialpad keys and the in-call toggles. `active` = accent.
 pub fn circle(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
-        let palette = theme.palette();
-        let base = if active {
-            palette.primary
-        } else {
-            Color {
-                a: 0.07,
-                ..Color::WHITE
-            }
-        };
+        let t = t(theme);
+        let base = if active { t.accent } else { circle_base(theme) };
         let background = match status {
             button::Status::Active => base,
             button::Status::Hovered => Color {
@@ -386,41 +623,27 @@ pub fn circle(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style 
             button::Status::Disabled => base.scale_alpha(0.35),
         };
         button::Style {
-            background: Some(Background::Color(background)),
-            text_color: if active { Color::WHITE } else { palette.text },
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: 999.0.into(),
-            },
+            background: Some(background.into()),
+            text_color: if active { Color::WHITE } else { t.text },
+            border: rounded(radius::PILL),
             shadow: Shadow::default(),
-            ..button::Style::default()
+            snap: true,
         }
     }
 }
 
-/// Round button colored by an arbitrary state color (not just the theme's
-/// primary), used for the Line 1-5 sidebar buttons. `fill` reflects the call
-/// state (`None` = idle, `Some(color)` = ringing/dialing/active/ending);
-/// `selected` is drawn as a border *independent* of `fill` so the currently
-/// selected line is always visually distinguishable — including an idle
-/// selected line, which otherwise looked identical to every other idle line
-/// (the original bug: clicking a line button while nothing was ringing gave
-/// no visible feedback at all, reading as "doesn't work").
+/// Round/rounded button coloured by a call-state colour (the line buttons).
+/// `selected` is a border independent of `fill`, so an idle selected line
+/// is still distinguishable.
 pub fn circle_state(fill: Option<Color>, selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
-        let palette = theme.palette();
-        let indicator = fill.unwrap_or(palette.primary);
-        let base_alpha = match (fill.is_some(), selected) {
-            (true, true) => 0.9,
-            (true, false) => 0.18,
-            (false, true) => 0.14,
-            (false, false) => 0.07,
-        };
-        let base_color = if fill.is_some() { indicator } else { Color::WHITE };
-        let base = Color {
-            a: base_alpha,
-            ..base_color
+        let t = t(theme);
+        let indicator = fill.unwrap_or(t.accent);
+        let base = match (fill, selected) {
+            (Some(c), true) => c.scale_alpha(0.9),
+            (Some(c), false) => tint(c, 0.18),
+            (None, true) => tint(t.accent, 0.14),
+            (None, false) => circle_base(theme),
         };
         let background = match status {
             button::Status::Active => base,
@@ -431,66 +654,44 @@ pub fn circle_state(fill: Option<Color>, selected: bool) -> impl Fn(&Theme, butt
             button::Status::Pressed => base.scale_alpha(0.75),
             button::Status::Disabled => base.scale_alpha(0.35),
         };
-        let text_color = if fill.is_some() && selected {
-            Color::WHITE
-        } else {
-            palette.text
-        };
-        let border_color = if selected {
-            indicator
-        } else if fill.is_some() {
-            indicator.scale_alpha(0.5)
-        } else {
-            Color::TRANSPARENT
-        };
-        // A live/ringing/active line (fill.is_some() && selected, the
-        // "0.9 alpha" case above) gets the same glossy top-lit fill and a
-        // soft colored shadow `pill`'s filled CTAs use, so the one line
-        // that's actually live reads with real presence instead of just a
-        // slightly different flat tint.
         let prominent = fill.is_some() && selected;
-        let background_fill = if prominent {
-            top_lit(background)
-        } else {
-            Background::Color(background)
-        };
-        let shadow = if prominent {
-            Shadow {
-                color: indicator.scale_alpha(0.4),
-                offset: iced::Vector::new(0.0, 2.0),
-                blur_radius: 12.0,
-            }
-        } else {
-            Shadow::default()
-        };
         button::Style {
-            background: Some(background_fill),
-            text_color,
+            background: Some(if prominent {
+                top_lit(background)
+            } else {
+                Background::Color(background)
+            }),
+            text_color: if prominent { Color::WHITE } else { t.text },
             border: Border {
-                color: border_color,
+                color: if selected {
+                    indicator
+                } else if fill.is_some() {
+                    indicator.scale_alpha(0.5)
+                } else {
+                    Color::TRANSPARENT
+                },
                 width: if selected || fill.is_some() { 1.5 } else { 0.0 },
-                radius: 14.0.into(),
+                radius: border::radius(radius::LG),
             },
-            shadow,
-            ..button::Style::default()
+            shadow: if prominent {
+                Shadow {
+                    color: indicator.scale_alpha(0.4),
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 12.0,
+                }
+            } else {
+                Shadow::default()
+            },
+            snap: true,
         }
     }
 }
 
-/// Same shape/role as `circle(false)` (dialpad keys), but blended toward the
-/// primary color by `flash` (0.0 = normal neutral fill, 1.0 = just pressed)
-/// — `view.rs`'s `dialpad` decays this from 1.0 back to 0.0 over a couple
-/// hundred ms after each press, so a tap gets its own brief visible
-/// confirmation instead of relying only on the pointer-held-down `Pressed`
-/// state, which a fast tap-and-release barely shows.
+/// Dialpad key blended toward the accent by `flash` (1.0 = just pressed).
 pub fn circle_flash(flash: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
-        let palette = theme.palette();
-        let neutral = Color {
-            a: 0.07,
-            ..Color::WHITE
-        };
-        let base = lerp_color(neutral, palette.primary, flash.clamp(0.0, 1.0));
+        let t = t(theme);
+        let base = lerp_color(circle_base(theme), t.accent, flash.clamp(0.0, 1.0));
         let background = match status {
             button::Status::Active => base,
             button::Status::Hovered => Color {
@@ -501,32 +702,135 @@ pub fn circle_flash(flash: f32) -> impl Fn(&Theme, button::Status) -> button::St
             button::Status::Disabled => base.scale_alpha(0.35),
         };
         button::Style {
-            background: Some(Background::Color(background)),
-            text_color: lerp_color(palette.text, Color::WHITE, flash.clamp(0.0, 1.0)),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: 999.0.into(),
-            },
+            background: Some(background.into()),
+            text_color: lerp_color(t.text, Color::WHITE, flash.clamp(0.0, 1.0)),
+            border: rounded(radius::PILL),
             shadow: Shadow::default(),
-            ..button::Style::default()
+            snap: true,
         }
     }
 }
 
-/// A transparent-rail slider, meant to be stacked directly on top of a level
-/// meter fill (see `view.rs`'s `meter_slider`) so the two fuse into one
-/// control: the meter shows live signal level, the thin handle bar is what
-/// you actually drag to set gain. A plain slider would paint its own opaque
-/// rail over the meter and hide it.
+// --------------------------------------------------------------------- widgets
+
+pub fn text_input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let t = t(theme);
+    let focused = matches!(status, text_input::Status::Focused { .. });
+    text_input::Style {
+        background: t.meter_bg.into(),
+        border: Border {
+            radius: border::radius(radius::MD),
+            width: 1.0,
+            color: if focused { t.accent } else { t.line },
+        },
+        icon: t.text_dim,
+        placeholder: t.text_dim,
+        value: t.text,
+        selection: tint(t.accent, 0.35),
+    }
+}
+
+pub fn pick_list_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let t = t(theme);
+    let hovered = matches!(status, pick_list::Status::Hovered | pick_list::Status::Opened { .. });
+    pick_list::Style {
+        text_color: t.text,
+        placeholder_color: t.text_dim,
+        handle_color: t.text_dim,
+        background: (if hovered { t.raised_hover } else { t.raised }).into(),
+        border: Border {
+            radius: border::radius(radius::MD),
+            width: 1.0,
+            color: t.line,
+        },
+    }
+}
+
+pub fn menu_style(theme: &Theme) -> iced::overlay::menu::Style {
+    let t = t(theme);
+    iced::overlay::menu::Style {
+        background: t.panel.into(),
+        border: Border {
+            radius: border::radius(radius::MD),
+            width: 1.0,
+            color: t.line,
+        },
+        text_color: t.text,
+        selected_text_color: Color::WHITE,
+        selected_background: t.accent.into(),
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 18.0,
+        },
+    }
+}
+
+pub fn toggler_style(theme: &Theme, status: toggler::Status) -> toggler::Style {
+    let t = t(theme);
+    let on = matches!(
+        status,
+        toggler::Status::Active { is_toggled: true } | toggler::Status::Hovered { is_toggled: true }
+    );
+    let hovered = matches!(status, toggler::Status::Hovered { .. });
+    let off_bg = if hovered { t.raised_hover } else { t.raised };
+    toggler::Style {
+        background: (if on { t.accent } else { off_bg }).into(),
+        background_border_width: if on { 0.0 } else { 1.0 },
+        background_border_color: t.line,
+        foreground: Color::WHITE.into(),
+        foreground_border_width: 0.0,
+        foreground_border_color: Color::TRANSPARENT,
+        text_color: None,
+        border_radius: None,
+        padding_ratio: 0.2,
+    }
+}
+
+/// Thin embedded scrollbar.
+pub fn scrollable_style(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let t = t(theme);
+    let active = !matches!(status, scrollable::Status::Active { .. });
+    let scroller = scrollable::Scroller {
+        background: (if active { t.text_dim } else { tint(t.text_dim, 0.5) }).into(),
+        border: rounded(radius::PILL),
+    };
+    let rail = scrollable::Rail {
+        background: None,
+        border: rounded(radius::PILL),
+        scroller,
+    };
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail,
+        horizontal_rail: rail,
+        gap: None,
+        auto_scroll: scrollable::AutoScroll {
+            background: t.panel.into(),
+            border: rounded(radius::PILL),
+            shadow: Shadow::default(),
+            icon: t.text_dim,
+        },
+    }
+}
+
+pub fn rule_style(theme: &Theme) -> rule::Style {
+    let t = t(theme);
+    rule::Style {
+        color: t.line,
+        radius: border::radius(0.0),
+        fill_mode: rule::FillMode::Full,
+        snap: true,
+    }
+}
+
+/// A transparent-rail slider stacked on top of a level meter so the meter
+/// shows signal and the thin handle is what you drag to set gain.
 pub fn meter_slider(theme: &Theme, _status: slider::Status) -> slider::Style {
-    let palette = theme.palette();
+    let t = t(theme);
     slider::Style {
         rail: slider::Rail {
-            backgrounds: (
-                Background::Color(Color::TRANSPARENT),
-                Background::Color(Color::TRANSPARENT),
-            ),
+            backgrounds: (Color::TRANSPARENT.into(), Color::TRANSPARENT.into()),
             width: 22.0,
             border: Border::default(),
         },
@@ -535,9 +839,9 @@ pub fn meter_slider(theme: &Theme, _status: slider::Status) -> slider::Style {
                 width: 5,
                 border_radius: 3.0.into(),
             },
-            background: Background::Color(Color::WHITE),
+            background: Color::WHITE.into(),
             border_width: 2.0,
-            border_color: palette.primary,
+            border_color: t.accent,
         },
     }
 }

@@ -2,7 +2,9 @@ use crate::app_settings::{self, AppSettings};
 use crate::audio_devices::{self, AudioDeviceConfig};
 use crate::contacts::{self, Contact};
 use crate::history;
-use crate::{branding, bridge, icon, incoming, notify, number, view};
+use crate::theme::{self, ThemeSetting, ToastKind};
+use crate::toast::Toast;
+use crate::{branding, bridge, incoming, notify, number, ui, ui_state};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::{Element, Subscription, Task, window};
 use softphone_core::config::{DtmfMode, PREFERRED_CODECS, PreferredCodec, SipAccountConfig, SipTransport};
@@ -153,50 +155,89 @@ fn idx_line(idx: usize) -> u8 {
     (idx + 1) as u8
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    Dialer,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Page {
+    #[default]
+    Phone,
     Contacts,
     History,
+    Settings,
 }
 
-/// Drives the tab bar's selected-pill cross-fade (`theme::Pill::Tab`,
-/// `view.rs::tab_bar`) — one `Animation<bool>` per tab so the newly
-/// selected one eases its fill in (and the previously selected one eases
-/// out) instead of snapping, same pattern as `CallUiState::Active`'s
-/// `avatar_glow`.
-pub struct TabAnimations {
-    dialer: iced::Animation<bool>,
-    contacts: iced::Animation<bool>,
-    history: iced::Animation<bool>,
+impl Page {
+    pub const ALL: [Page; 4] = [Page::Phone, Page::Contacts, Page::History, Page::Settings];
 }
 
-impl TabAnimations {
-    fn new(selected: Screen) -> Self {
-        TabAnimations {
-            dialer: iced::Animation::new(selected == Screen::Dialer).quick(),
-            contacts: iced::Animation::new(selected == Screen::Contacts).quick(),
-            history: iced::Animation::new(selected == Screen::History).quick(),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SettingsSection {
+    #[default]
+    Accounts,
+    Audio,
+    Calls,
+    Appearance,
+    About,
+}
+
+impl SettingsSection {
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsSection::Accounts => "Accounts",
+            SettingsSection::Audio => "Audio & codecs",
+            SettingsSection::Calls => "Calls",
+            SettingsSection::Appearance => "Appearance",
+            SettingsSection::About => "About",
         }
     }
 
-    /// Retargets all three tabs' animations toward `selected` — safe to call
-    /// even if `selected` is already the current target (`Animation::go_mut`
-    /// is a no-op in that case).
-    fn select(&mut self, selected: Screen) {
-        let now = Instant::now();
-        self.dialer.go_mut(selected == Screen::Dialer, now);
-        self.contacts.go_mut(selected == Screen::Contacts, now);
-        self.history.go_mut(selected == Screen::History, now);
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            SettingsSection::Accounts => "SIP accounts and registration",
+            SettingsSection::Audio => "Devices, codecs, encryption, DTMF",
+            SettingsSection::Calls => "Incoming calls, deny list, recording, routing",
+            SettingsSection::Appearance => "Theme and window",
+            SettingsSection::About => "Version, shortcuts, credits",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryFilter {
+    #[default]
+    All,
+    Missed,
+    Incoming,
+    Outgoing,
+}
+
+/// Drives the sidebar's selected-item cross-fade — one `Animation<bool>`
+/// per page so the newly selected one eases in while the old one eases out.
+pub struct NavAnimations {
+    items: [(Page, iced::Animation<bool>); 4],
+}
+
+impl NavAnimations {
+    fn new(selected: Page) -> Self {
+        NavAnimations {
+            items: Page::ALL.map(|page| (page, iced::Animation::new(page == selected).quick())),
+        }
     }
 
-    pub(crate) fn amount(&self, screen: Screen, now: Instant) -> f32 {
-        let anim = match screen {
-            Screen::Dialer => &self.dialer,
-            Screen::Contacts => &self.contacts,
-            Screen::History => &self.history,
-        };
-        anim.interpolate(0.0_f32, 1.0_f32, now)
+    fn select(&mut self, selected: Page) {
+        let now = Instant::now();
+        for (page, anim) in &mut self.items {
+            anim.go_mut(*page == selected, now);
+        }
+    }
+
+    pub(crate) fn amount(&self, page: Page, now: Instant) -> f32 {
+        self.items
+            .iter()
+            .find(|(p, _)| *p == page)
+            .map(|(_, anim)| anim.interpolate(0.0_f32, 1.0_f32, now))
+            .unwrap_or(0.0)
     }
 }
 
@@ -268,11 +309,10 @@ impl AudioSettingsForm {
 pub struct SettingsForm {
     pub dnd: bool,
     pub auto_answer: bool,
-    pub forwarding_enabled: bool,
-    pub forwarding_number: String,
     pub deny_list: Vec<String>,
     pub deny_list_input: String,
     pub notify_incoming: bool,
+    pub theme: ThemeSetting,
     pub recording_enabled: bool,
     pub recording_path: String,
     pub secondary_output_target: Option<String>,
@@ -284,11 +324,10 @@ impl SettingsForm {
         SettingsForm {
             dnd: settings.dnd,
             auto_answer: settings.auto_answer,
-            forwarding_enabled: settings.forwarding_enabled,
-            forwarding_number: settings.forwarding_number.clone(),
             deny_list: settings.deny_list.clone(),
             deny_list_input: String::new(),
             notify_incoming: settings.notify_incoming,
+            theme: settings.theme,
             recording_enabled: settings.recording_enabled,
             recording_path: settings.recording_path.clone(),
             secondary_output_target: settings.secondary_output_target.clone(),
@@ -314,20 +353,16 @@ pub enum ContactSort {
     #[default]
     NameAsc,
     NameDesc,
+    /// Most recently added first.
+    Recent,
 }
 
 impl ContactSort {
     fn next(self) -> Self {
         match self {
             ContactSort::NameAsc => ContactSort::NameDesc,
-            ContactSort::NameDesc => ContactSort::NameAsc,
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            ContactSort::NameAsc => "A-Z",
-            ContactSort::NameDesc => "Z-A",
+            ContactSort::NameDesc => ContactSort::Recent,
+            ContactSort::Recent => ContactSort::NameAsc,
         }
     }
 }
@@ -576,8 +611,26 @@ pub struct App {
     /// Which account's lines/registration status the Dialer tab and account
     /// switcher currently show — index into `accounts`.
     pub(crate) selected_account: usize,
-    pub(crate) screen: Screen,
-    pub(crate) tab_animations: TabAnimations,
+    pub(crate) page: Page,
+    pub(crate) settings_section: SettingsSection,
+    pub(crate) nav_animations: NavAnimations,
+    pub(crate) history_filter: HistoryFilter,
+    /// Manual collapse (Ctrl+B); the sidebar also auto-collapses on narrow
+    /// windows regardless of this.
+    pub(crate) sidebar_collapsed: bool,
+    /// Missed calls since the History page was last viewed (sidebar badge).
+    pub(crate) unseen_missed: u32,
+    /// The "a call is in progress — quit anyway?" modal.
+    pub(crate) quit_prompt: bool,
+    /// Whether the in-call keypad is shown on the call card.
+    pub(crate) keypad_open: bool,
+    /// Esc pressed once during a call — a second press within 2 s hangs up.
+    last_escape: Option<Instant>,
+    /// The main window's size outside compact mode (restored on expand).
+    normal_window_size: iced::Size,
+    ui_state: ui_state::UiState,
+    /// When `ui_state` last changed and still needs writing (debounced).
+    ui_state_dirty_at: Option<Instant>,
     pub(crate) dial_input: String,
     /// Whether the recent-outgoing-numbers panel below the dial input is
     /// expanded. Toggled by its own button rather than on focus, since
@@ -604,16 +657,18 @@ pub struct App {
     /// counterpart to `app_capture_streams`, shown in the secondary-input
     /// picker. Same "re-scanned on demand, not cached" treatment.
     pub(crate) app_playback_streams: Vec<AudioDevice>,
-    pub(crate) error: Option<String>,
+    /// Transient feedback (errors, confirmations) — see `toast.rs`.
+    pub(crate) toasts: Vec<Toast>,
+    next_toast_id: u64,
+    /// The desktop's colour scheme as last reported by the portal; used
+    /// when `settings.theme` is `System`.
+    system_mode: theme::Mode,
     main_window: window::Id,
-    main_window_size: iced::Size,
+    pub(crate) main_window_size: iced::Size,
     /// Whether the main window is currently shrunk to the compact
     /// floating call bar. A window-level concept, not tied to any one
     /// line's data — it just reflects whatever line is selected.
     pub(crate) compact_mode: bool,
-    sip_settings_window: Option<window::Id>,
-    audio_settings_window: Option<window::Id>,
-    settings_window: Option<window::Id>,
     /// The single always-on-top incoming-call window (see `incoming.rs`),
     /// open while at least one line is ringing. Its content is derived from
     /// `accounts[*].lines` every render, so it needs no per-call bookkeeping;
@@ -699,6 +754,9 @@ pub enum Message {
     RejectIncomingCall(usize, CallId),
     /// Stop the ringtone without answering or declining anything.
     SilenceRingtone,
+    ToastDismissed(u64),
+    SystemThemeChanged(iced::theme::Mode),
+    SettingsThemeChanged(ThemeSetting),
     /// A key press nothing else consumed, tagged with the window it landed in.
     KeyPressed(window::Id, Key, Modifiers),
     /// Lifecycle of the desktop notification shown for a ringing call.
@@ -736,8 +794,6 @@ pub enum Message {
     SettingsDndToggled(bool),
     SettingsAutoAnswerToggled(bool),
     SettingsNotifyToggled(bool),
-    SettingsForwardingToggled(bool),
-    SettingsForwardingNumberChanged(String),
     SettingsDenyListInputChanged(String),
     SettingsDenyListAddPressed,
     SettingsDenyListRemovePressed(usize),
@@ -773,7 +829,22 @@ pub enum Message {
     InputVolumeChanged(f32),
     WindowClosed(window::Id),
     WindowResized(window::Id, iced::Size),
-    TabSelected(Screen),
+    PageSelected(Page),
+    SettingsSectionSelected(SettingsSection),
+    SidebarToggled,
+    DndQuickToggled(bool),
+    ThemeQuickToggled,
+    DialBackspace,
+    KeypadToggled,
+    HistoryFilterChanged(HistoryFilter),
+    /// The compositor asked to close a window (title-bar X, Alt+F4).
+    CloseRequested(window::Id),
+    QuitConfirmed,
+    QuitCancelled,
+    OpenUrl(String),
+    OpenConfigFolder,
+    TestRingPressed,
+    TestRingStop,
     DialNumber(String),
     RedialPressed,
     HoldToggled,
@@ -805,10 +876,11 @@ pub enum Message {
     ContactsIoPathChanged(String),
     ContactsImportPressed,
     ContactsExportPressed,
+    ImportFileChosen(Option<String>),
+    ExportFileChosen(Option<String>),
     BrowseContactsImportPressed,
     BrowseContactsExportPressed,
     TonePlayerReady(Result<Arc<DtmfTonePlayer>, String>),
-    IconFontLoaded(Result<(), iced::font::Error>),
 }
 
 /// Legacy single-account migration lives in `main.rs` (it needs to run once
@@ -816,9 +888,15 @@ pub enum Message {
 /// resulting multi-account file is persisted from then on.
 const ACCOUNTS_FILENAME: &str = "accounts.toml";
 
-const MAIN_WINDOW_SIZE: iced::Size = iced::Size::new(380.0, 640.0);
-const COMPACT_WINDOW_SIZE: iced::Size = iced::Size::new(320.0, 190.0);
-const COMPACT_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(280.0, 170.0);
+const MAIN_WINDOW_SIZE: iced::Size = iced::Size::new(980.0, 660.0);
+const MAIN_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(820.0, 560.0);
+const COMPACT_WINDOW_SIZE: iced::Size = iced::Size::new(400.0, 190.0);
+const COMPACT_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(360.0, 170.0);
+
+/// Widget ids for keyboard focus (`Ctrl+K`, opening the contact form).
+pub const DIAL_INPUT_ID: &str = "dial-input";
+pub const SEARCH_INPUT_ID: &str = "contact-search";
+pub const CONTACT_NAME_ID: &str = "contact-name";
 /// How long a line stays "open" (dial tone played, ready to dial) with
 /// nothing dialed before it times out on its own — see
 /// `App::schedule_dial_timeout`/`Message::LineIdleTimeout`. Set just a
@@ -827,12 +905,6 @@ const COMPACT_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(280.0, 170.0);
 /// timeout read as one continuous sequence — tone, brief silence, reorder —
 /// instead of a short blip followed by a long dead gap.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
-const SIP_SETTINGS_WINDOW_SIZE: iced::Size = iced::Size::new(560.0, 560.0);
-const SIP_SETTINGS_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(440.0, 420.0);
-const AUDIO_SETTINGS_WINDOW_SIZE: iced::Size = iced::Size::new(400.0, 560.0);
-const AUDIO_SETTINGS_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(360.0, 420.0);
-const SETTINGS_WINDOW_SIZE: iced::Size = iced::Size::new(420.0, 600.0);
-const SETTINGS_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(360.0, 440.0);
 /// Tuned to feel like a real-time meter without redrawing so often it wastes
 /// cycles — noticeably snappier than a 200ms poll (which reads as laggy).
 const TICK_INTERVAL: Duration = Duration::from_millis(80);
@@ -863,14 +935,29 @@ impl App {
         // forced the compositor to reconcile the size. A single min_size
         // that's always low enough for either mode needs no such
         // coordination — `resize_for_compact` is now just one resize call.
+        let saved_ui = ui_state::load();
+        let initial_size = saved_ui
+            .window_size
+            .map(|[w, h]| iced::Size::new(w.max(MAIN_WINDOW_MIN_SIZE.width), h.max(MAIN_WINDOW_MIN_SIZE.height)))
+            .unwrap_or(MAIN_WINDOW_SIZE);
         let (main_window, open_task) = window::open(window::Settings {
             resizable: true,
-            ..branding::window_settings(MAIN_WINDOW_SIZE, Some(COMPACT_WINDOW_MIN_SIZE))
+            // Close requests go through `Message::CloseRequested` so an
+            // active call can ask for confirmation first.
+            exit_on_close_request: false,
+            position: match saved_ui.window_position {
+                Some([x, y]) => window::Position::Specific(iced::Point::new(x, y)),
+                None => window::Position::Centered,
+            },
+            // One low min size for both normal and compact mode: resizing
+            // min_size and size in the same frame races on Wayland.
+            ..branding::window_settings(initial_size, Some(COMPACT_WINDOW_MIN_SIZE))
         });
 
         let audio_devices = audio_devices::load();
         let settings = app_settings::load();
         let needs_setup = accounts.is_empty();
+        let initial_page = if needs_setup { Page::Settings } else { saved_ui.page };
         let sessions: Vec<AccountSession> = accounts.into_iter().map(AccountSession::new).collect();
         let sip_settings_form = sessions
             .first()
@@ -884,8 +971,18 @@ impl App {
         let app = App {
             accounts: sessions,
             selected_account: 0,
-            screen: Screen::Dialer,
-            tab_animations: TabAnimations::new(Screen::Dialer),
+            page: initial_page,
+            settings_section: saved_ui.settings_section,
+            nav_animations: NavAnimations::new(initial_page),
+            history_filter: saved_ui.history_filter,
+            sidebar_collapsed: saved_ui.sidebar_collapsed,
+            unseen_missed: 0,
+            quit_prompt: false,
+            keypad_open: false,
+            last_escape: None,
+            normal_window_size: initial_size,
+            ui_state: saved_ui.clone(),
+            ui_state_dirty_at: None,
             dial_input: String::new(),
             dial_history_open: false,
             sip_settings_form,
@@ -896,13 +993,12 @@ impl App {
             output_devices: Vec::new(),
             app_capture_streams: Vec::new(),
             app_playback_streams: Vec::new(),
-            error: None,
+            toasts: Vec::new(),
+            next_toast_id: 1,
+            system_mode: theme::Mode::Dark,
             main_window,
-            main_window_size: MAIN_WINDOW_SIZE,
+            main_window_size: initial_size,
             compact_mode: false,
-            sip_settings_window: None,
-            audio_settings_window: None,
-            settings_window: None,
             incoming_popup: None,
             incoming_popup_cards: 0,
             ringtone_playing: false,
@@ -916,7 +1012,13 @@ impl App {
             contact_filter: String::new(),
             contact_form: None,
             contact_sort: ContactSort::default(),
-            contacts_io_path: "./contacts_export.json".to_string(),
+            contacts_io_path: saved_ui.contacts_io_path.clone().unwrap_or_else(|| {
+                dirs::document_dir()
+                    .unwrap_or_else(|| Path::new(".").to_path_buf())
+                    .join("oxidesip-contacts.json")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
             contacts_io_status: None,
             tone_player: None,
             dialpad_flash: None,
@@ -934,12 +1036,11 @@ impl App {
             Message::TonePlayerReady(result)
         });
 
-        let icon_font_task = iced::font::load(icon::FONT_BYTES).map(Message::IconFontLoaded);
-
-        let mut startup = vec![open_task.discard(), tone_task, icon_font_task];
-        if needs_setup {
-            startup.push(Task::done(Message::OpenSipSettings));
-        }
+        let startup = vec![
+            open_task.discard(),
+            tone_task,
+            iced::system::theme().map(Message::SystemThemeChanged),
+        ];
         (app, Task::batch(startup))
     }
 
@@ -970,17 +1071,11 @@ impl App {
             bridge::subscription(&configs),
             iced::time::every(TICK_INTERVAL).map(|_| Message::Tick),
             window::close_events().map(Message::WindowClosed),
+            window::close_requests().map(Message::CloseRequested),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
             iced::event::listen_with(Self::global_keys),
+            iced::system::theme_changes().map(Message::SystemThemeChanged),
         ])
-    }
-
-    /// A multiplier applied to key font sizes/paddings/circle diameters in
-    /// `view.rs` so the UI scales up on a wider window instead of just
-    /// leaving extra empty margin — clamped to a sane range so it can't make
-    /// text illegibly tiny or comically huge at the window's resize limits.
-    pub(crate) fn ui_scale(&self) -> f32 {
-        (self.main_window_size.width / MAIN_WINDOW_SIZE.width).clamp(0.85, 1.6)
     }
 
     pub(crate) fn selected(&self) -> Option<&AccountSession> {
@@ -994,33 +1089,76 @@ impl App {
     pub fn view(&self, window: window::Id) -> Element<'_, Message> {
         if Some(window) == self.incoming_popup {
             incoming::window_view(self)
-        } else if Some(window) == self.sip_settings_window {
-            view::sip_settings_window_view(self)
-        } else if Some(window) == self.audio_settings_window {
-            view::audio_settings_window_view(self)
-        } else if Some(window) == self.settings_window {
-            view::settings_window_view(self)
         } else {
-            view::main_view(self)
+            ui::main_view(self)
         }
     }
 
     pub fn title(&self, window: window::Id) -> String {
         if Some(window) == self.incoming_popup {
-            incoming::title(self)
-        } else if Some(window) == self.sip_settings_window {
-            format!("{} — SIP Setup", branding::APP_NAME)
-        } else if Some(window) == self.audio_settings_window {
-            format!("{} — Audio & Codecs", branding::APP_NAME)
-        } else if Some(window) == self.settings_window {
-            format!("{} — Settings", branding::APP_NAME)
-        } else {
-            branding::APP_NAME.to_string()
+            return incoming::title(self);
+        }
+        let active = self
+            .accounts
+            .iter()
+            .flat_map(|a| a.lines.iter())
+            .find_map(|line| match line {
+                CallUiState::Active {
+                    number, remote_name, ..
+                } => Some(
+                    ui::components::contact_name_for(&self.contacts, number)
+                        .or(remote_name.as_deref())
+                        .unwrap_or(number)
+                        .to_string(),
+                ),
+                _ => None,
+            });
+        match active {
+            Some(who) => format!("{who} — {}", branding::APP_NAME),
+            None => branding::APP_NAME.to_string(),
         }
     }
 
     pub fn theme(&self, _window: window::Id) -> iced::Theme {
-        crate::theme::theme()
+        theme::theme(self.mode())
+    }
+
+    /// The colour mode currently in effect (settings preference resolved
+    /// against the desktop's scheme).
+    pub(crate) fn mode(&self) -> theme::Mode {
+        match self.settings.theme {
+            ThemeSetting::System => self.system_mode,
+            ThemeSetting::Dark => theme::Mode::Dark,
+            ThemeSetting::Light => theme::Mode::Light,
+        }
+    }
+
+    pub(crate) fn push_toast(&mut self, kind: ToastKind, title: impl Into<String>, detail: Option<String>) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push(Toast {
+            id,
+            kind,
+            title: title.into(),
+            detail,
+            created: Instant::now(),
+            ttl: crate::toast::default_ttl(kind),
+        });
+        if self.toasts.len() > 6 {
+            self.toasts.remove(0);
+        }
+    }
+
+    pub(crate) fn toast_error(&mut self, message: impl Into<String>) {
+        self.push_toast(ToastKind::Error, message, None);
+    }
+
+    pub(crate) fn toast_info(&mut self, message: impl Into<String>) {
+        self.push_toast(ToastKind::Info, message, None);
+    }
+
+    pub(crate) fn toast_success(&mut self, message: impl Into<String>) {
+        self.push_toast(ToastKind::Success, message, None);
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -1146,6 +1284,7 @@ impl App {
                     history::CallOutcome::Missed,
                     None,
                 );
+                self.unseen_missed += 1;
                 Task::none()
             }
             Message::Core(account, CoreEvent::OutgoingCallStarted { id, line }) => {
@@ -1175,7 +1314,7 @@ impl App {
                     // below.
                     acc.last_call_status[idx] = Some(reason.clone());
                 }
-                self.error = Some(reason);
+                self.toast_error(reason);
                 Task::none()
             }
             Message::Core(_, CoreEvent::DtmfResult { ok, digit, .. }) => {
@@ -1197,7 +1336,7 @@ impl App {
                         acc.last_call_status[idx] = Some("transfer requested".to_string());
                     }
                 } else {
-                    self.error = Some("transfer request rejected".to_string());
+                    self.toast_error("transfer request rejected".to_string());
                 }
                 Task::none()
             }
@@ -1207,7 +1346,7 @@ impl App {
                 // just surface why the button press didn't visibly do
                 // anything, instead of leaving it silently swallowed.
                 let action = if hold { "hold" } else { "resume" };
-                self.error = Some(format!("{action} failed: {reason}"));
+                self.toast_error(format!("{action} failed: {reason}"));
                 Task::none()
             }
 
@@ -1287,6 +1426,25 @@ impl App {
                 self.answer_line(account, idx)
             }
             Message::RejectIncomingCall(account, id) => self.decline_call(account, id),
+            Message::ToastDismissed(id) => {
+                self.toasts.retain(|t| t.id != id);
+                Task::none()
+            }
+            Message::SystemThemeChanged(mode) => {
+                self.system_mode = match mode {
+                    iced::theme::Mode::Light => theme::Mode::Light,
+                    _ => theme::Mode::Dark,
+                };
+                Task::none()
+            }
+            Message::SettingsThemeChanged(setting) => {
+                self.settings.theme = setting;
+                self.settings_form.theme = setting;
+                if let Err(e) = app_settings::save(&self.settings) {
+                    self.toast_error(format!("couldn't save settings: {e}"));
+                }
+                Task::none()
+            }
             Message::SilenceRingtone => {
                 self.stop_ringtone();
                 Task::none()
@@ -1365,7 +1523,7 @@ impl App {
             }
             Message::MediaReady(account, id, Err(reason)) => {
                 tracing::warn!(%reason, "failed to start media session, hanging up");
-                self.error = Some(format!("audio pipeline failed: {reason}"));
+                self.toast_error(format!("audio pipeline failed: {reason}"));
                 if let Some(acc) = self.accounts.get(account) {
                     acc.send_command(CoreCommand::HangUp(id));
                 }
@@ -1382,16 +1540,9 @@ impl App {
                     .selected()
                     .map(|a| SipSettingsForm::from_config(&a.config))
                     .unwrap_or_default();
-                self.error = None;
-                if let Some(id) = self.sip_settings_window {
-                    return window::gain_focus(id);
-                }
-                let (id, open_task) = window::open(window::Settings {
-                    resizable: true,
-                    ..branding::window_settings(SIP_SETTINGS_WINDOW_SIZE, Some(SIP_SETTINGS_WINDOW_MIN_SIZE))
-                });
-                self.sip_settings_window = Some(id);
-                open_task.discard()
+                self.settings_section = SettingsSection::Accounts;
+                self.navigate(Page::Settings);
+                Task::none()
             }
             Message::OpenAudioSettings => {
                 self.audio_settings_form = self
@@ -1400,16 +1551,9 @@ impl App {
                     .unwrap_or_else(|| {
                         AudioSettingsForm::from_config(&SipAccountConfig::default(), &self.audio_devices)
                     });
-                self.error = None;
-                if let Some(id) = self.audio_settings_window {
-                    return window::gain_focus(id);
-                }
-                let (id, open_task) = window::open(window::Settings {
-                    resizable: true,
-                    ..branding::window_settings(AUDIO_SETTINGS_WINDOW_SIZE, Some(AUDIO_SETTINGS_WINDOW_MIN_SIZE))
-                });
-                self.audio_settings_window = Some(id);
-                let device_task = Task::future(async {
+                self.settings_section = SettingsSection::Audio;
+                self.navigate(Page::Settings);
+                Task::future(async {
                     let (inputs, outputs) = tokio::task::spawn_blocking(|| {
                         let inputs = softphone_media::devices::list_input_devices().unwrap_or_else(|e| {
                             tracing::warn!(%e, "failed to list input devices");
@@ -1424,8 +1568,7 @@ impl App {
                     .await
                     .unwrap_or_default();
                     Message::DevicesLoaded(inputs, outputs)
-                });
-                Task::batch([open_task.discard(), device_task])
+                })
             }
             Message::SipSettingsNameChanged(s) => {
                 self.sip_settings_form.name = s;
@@ -1456,24 +1599,23 @@ impl App {
                 Task::none()
             }
             Message::SipSettingsCancelPressed => {
-                self.error = None;
-                if let Some(id) = self.sip_settings_window.take() {
-                    return window::close(id);
-                }
+                self.sip_settings_form = self
+                    .editing_account
+                    .and_then(|i| self.accounts.get(i))
+                    .map(|a| SipSettingsForm::from_config(&a.config))
+                    .unwrap_or_default();
                 Task::none()
             }
             Message::SelectAccountForEditing(index) => {
                 if let Some(acc) = self.accounts.get(index) {
                     self.editing_account = Some(index);
                     self.sip_settings_form = SipSettingsForm::from_config(&acc.config);
-                    self.error = None;
                 }
                 Task::none()
             }
             Message::AddAccountPressed => {
                 self.editing_account = None;
                 self.sip_settings_form = SipSettingsForm::default();
-                self.error = None;
                 Task::none()
             }
             Message::DeleteAccountPressed(index) => {
@@ -1537,7 +1679,6 @@ impl App {
                 }
                 self.selected_account = index;
                 self.dial_input.clear();
-                self.error = None;
                 if let Some(acc) = self.selected() {
                     acc.resume_current_if_held();
                 }
@@ -1571,33 +1712,23 @@ impl App {
             }
             Message::AudioSettingsSavePressed => {
                 self.handle_audio_settings_save();
-                if let Some(id) = self.audio_settings_window.take() {
-                    return window::close(id);
-                }
+                self.toast_success("Audio settings saved — they apply to the next call");
                 Task::none()
             }
             Message::AudioSettingsCancelPressed => {
-                self.error = None;
-                if let Some(id) = self.audio_settings_window.take() {
-                    return window::close(id);
-                }
+                self.audio_settings_form = self
+                    .selected()
+                    .map(|a| AudioSettingsForm::from_config(&a.config, &self.audio_devices))
+                    .unwrap_or_else(|| {
+                        AudioSettingsForm::from_config(&SipAccountConfig::default(), &self.audio_devices)
+                    });
                 Task::none()
             }
             Message::OpenSettings => {
                 self.settings_form = SettingsForm::from_settings(&self.settings);
-                self.error = None;
-                let window_task = if let Some(id) = self.settings_window {
-                    window::gain_focus(id)
-                } else {
-                    let (id, open_task) = window::open(window::Settings {
-                        resizable: true,
-                        ..branding::window_settings(SETTINGS_WINDOW_SIZE, Some(SETTINGS_WINDOW_MIN_SIZE))
-                    });
-                    self.settings_window = Some(id);
-                    open_task.discard()
-                };
+                self.settings_section = SettingsSection::Calls;
+                self.navigate(Page::Settings);
                 Task::batch([
-                    window_task,
                     self.refresh_secondary_output_targets(),
                     self.refresh_secondary_input_targets(),
                 ])
@@ -1626,14 +1757,6 @@ impl App {
             }
             Message::SettingsAutoAnswerToggled(enabled) => {
                 self.settings_form.auto_answer = enabled;
-                Task::none()
-            }
-            Message::SettingsForwardingToggled(enabled) => {
-                self.settings_form.forwarding_enabled = enabled;
-                Task::none()
-            }
-            Message::SettingsForwardingNumberChanged(s) => {
-                self.settings_form.forwarding_number = s;
                 Task::none()
             }
             Message::SettingsDenyListInputChanged(s) => {
@@ -1688,29 +1811,24 @@ impl App {
                 self.settings = AppSettings {
                     dnd: self.settings_form.dnd,
                     auto_answer: self.settings_form.auto_answer,
-                    forwarding_enabled: self.settings_form.forwarding_enabled,
-                    forwarding_number: self.settings_form.forwarding_number.trim().to_string(),
+                    forwarding_enabled: self.settings.forwarding_enabled,
+                    forwarding_number: self.settings.forwarding_number.clone(),
                     deny_list: self.settings_form.deny_list.clone(),
                     notify_incoming: self.settings_form.notify_incoming,
+                    theme: self.settings_form.theme,
                     recording_enabled: self.settings_form.recording_enabled,
                     recording_path: self.settings_form.recording_path.trim().to_string(),
                     secondary_output_target: self.settings_form.secondary_output_target.clone(),
                     secondary_input_target: self.settings_form.secondary_input_target.clone(),
                 };
-                if let Err(e) = app_settings::save(&self.settings) {
-                    tracing::warn!(%e, "failed to save settings");
-                }
-                self.error = None;
-                if let Some(id) = self.settings_window.take() {
-                    return window::close(id);
+                match app_settings::save(&self.settings) {
+                    Ok(()) => self.toast_success("Settings saved"),
+                    Err(e) => self.toast_error(format!("couldn't save settings: {e}")),
                 }
                 Task::none()
             }
             Message::SettingsCancelPressed => {
-                self.error = None;
-                if let Some(id) = self.settings_window.take() {
-                    return window::close(id);
-                }
+                self.settings_form = SettingsForm::from_settings(&self.settings);
                 Task::none()
             }
             Message::DevicesLoaded(inputs, outputs) => {
@@ -1735,15 +1853,6 @@ impl App {
                         .map(|(account, call_id)| self.decline_call(account, call_id))
                         .collect();
                     Task::batch(tasks)
-                } else if Some(id) == self.sip_settings_window {
-                    self.sip_settings_window = None;
-                    Task::none()
-                } else if Some(id) == self.audio_settings_window {
-                    self.audio_settings_window = None;
-                    Task::none()
-                } else if Some(id) == self.settings_window {
-                    self.settings_window = None;
-                    Task::none()
                 } else if id == self.main_window {
                     iced::exit()
                 } else {
@@ -1753,11 +1862,30 @@ impl App {
             Message::WindowResized(id, size) => {
                 if id == self.main_window {
                     self.main_window_size = size;
+                    if !self.compact_mode {
+                        self.normal_window_size = size;
+                        self.ui_state.window_size = Some([size.width, size.height]);
+                        self.mark_ui_state_dirty();
+                    }
                 }
                 Task::none()
             }
 
             Message::Tick => {
+                let now = Instant::now();
+                self.toasts.retain(|t| !t.expired(now));
+                if self
+                    .ui_state_dirty_at
+                    .is_some_and(|at| now.duration_since(at) > Duration::from_millis(600))
+                {
+                    self.flush_ui_state();
+                }
+                if self
+                    .last_escape
+                    .is_some_and(|at| now.duration_since(at) > Duration::from_secs(2))
+                {
+                    self.last_escape = None;
+                }
                 if let Some(acc) = self.selected_mut() {
                     let idx = acc.selected_idx();
                     if let CallUiState::Active {
@@ -1853,9 +1981,107 @@ impl App {
                 Task::none()
             }
 
-            Message::TabSelected(screen) => {
-                self.screen = screen;
-                self.tab_animations.select(screen);
+            Message::PageSelected(page) => {
+                self.navigate(page);
+                Task::none()
+            }
+            Message::SettingsSectionSelected(section) => {
+                self.settings_section = section;
+                self.ui_state.settings_section = section;
+                self.mark_ui_state_dirty();
+                // Entering a section reloads its form from the live state
+                // and refreshes whatever device lists it shows.
+                match section {
+                    SettingsSection::Accounts => self.update_inner(Message::OpenSipSettings),
+                    SettingsSection::Audio => self.update_inner(Message::OpenAudioSettings),
+                    SettingsSection::Calls => self.update_inner(Message::OpenSettings),
+                    SettingsSection::Appearance | SettingsSection::About => Task::none(),
+                }
+            }
+            Message::SidebarToggled => {
+                self.sidebar_collapsed = !self.sidebar_collapsed;
+                self.ui_state.sidebar_collapsed = self.sidebar_collapsed;
+                self.mark_ui_state_dirty();
+                Task::none()
+            }
+            Message::DndQuickToggled(on) => {
+                self.settings.dnd = on;
+                self.settings_form.dnd = on;
+                if let Err(e) = app_settings::save(&self.settings) {
+                    self.toast_error(format!("couldn't save settings: {e}"));
+                }
+                self.toast_info(if on {
+                    "Do Not Disturb on — incoming calls are declined"
+                } else {
+                    "Do Not Disturb off"
+                });
+                Task::none()
+            }
+            Message::ThemeQuickToggled => {
+                let next = match self.mode() {
+                    theme::Mode::Dark => ThemeSetting::Light,
+                    theme::Mode::Light => ThemeSetting::Dark,
+                };
+                self.update_inner(Message::SettingsThemeChanged(next))
+            }
+            Message::DialBackspace => {
+                self.dial_input.pop();
+                Task::none()
+            }
+            Message::KeypadToggled => {
+                self.keypad_open = !self.keypad_open;
+                Task::none()
+            }
+            Message::HistoryFilterChanged(filter) => {
+                self.history_filter = filter;
+                self.ui_state.history_filter = filter;
+                self.mark_ui_state_dirty();
+                Task::none()
+            }
+            Message::CloseRequested(id) => {
+                if id != self.main_window {
+                    return Task::none();
+                }
+                if self.any_call_in_progress() {
+                    self.quit_prompt = true;
+                    Task::none()
+                } else {
+                    self.flush_ui_state();
+                    window::close(id)
+                }
+            }
+            Message::QuitConfirmed => {
+                self.quit_prompt = false;
+                self.hang_up_everything();
+                self.flush_ui_state();
+                iced::exit()
+            }
+            Message::QuitCancelled => {
+                self.quit_prompt = false;
+                Task::none()
+            }
+            Message::OpenUrl(url) => {
+                open_external(&url);
+                Task::none()
+            }
+            Message::OpenConfigFolder => {
+                open_external(&crate::paths::config_file("").to_string_lossy());
+                Task::none()
+            }
+            Message::TestRingPressed => {
+                if let Some(player) = &self.tone_player {
+                    player.play_incoming_ringtone();
+                    self.ringtone_playing = true;
+                }
+                Task::future(async {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Message::TestRingStop
+                })
+            }
+            Message::TestRingStop => {
+                if incoming::ringing_calls(self).is_empty() {
+                    self.stop_ringtone();
+                }
                 Task::none()
             }
             Message::DialNumber(number) => {
@@ -1864,12 +2090,11 @@ impl App {
                 };
                 let idx = acc.selected_idx();
                 if !matches!(acc.lines[idx], CallUiState::Idle) {
-                    self.error = Some("selected line is busy — pick a free line first".to_string());
+                    self.toast_error("selected line is busy — pick a free line first".to_string());
                     return Task::none();
                 }
                 self.dial_input = number;
-                self.screen = Screen::Dialer;
-                self.tab_animations.select(Screen::Dialer);
+                self.navigate(Page::Phone);
                 self.handle_call_pressed()
             }
             Message::RedialPressed => {
@@ -1885,7 +2110,7 @@ impl App {
                 if let Some(acc) = self.selected() {
                     let idx = acc.selected_idx();
                     if acc.joined[idx].is_some() {
-                        self.error = Some("can't hold a joined call — split it first".to_string());
+                        self.toast_error("can't hold a joined call — split it first".to_string());
                         return Task::none();
                     }
                     if let CallUiState::Active { id, on_hold, .. } = &acc.lines[idx] {
@@ -2025,9 +2250,8 @@ impl App {
                     .any(|l| l != selected_line && matches!(acc.lines[line_idx(l)], CallUiState::Active { .. }));
                 if has_other_active {
                     acc.pending_join = Some(selected_line);
-                    self.error = None;
                 } else {
-                    self.error = Some("no other active call to join".to_string());
+                    self.toast_error("no other active call to join".to_string());
                 }
                 Task::none()
             }
@@ -2035,7 +2259,6 @@ impl App {
                 // Split is the corrective action for "can't hold a joined
                 // call — split it first" (see `HoldToggled`) — clear it
                 // unconditionally so it doesn't linger once followed.
-                self.error = None;
                 if let Some(acc) = self.selected_mut() {
                     let idx = acc.selected_idx();
                     if let Some(partner) = acc.joined[idx] {
@@ -2053,12 +2276,9 @@ impl App {
                 let free = (1..=LINE_COUNT as u8)
                     .find(|&l| l != selected_line && matches!(acc.lines[line_idx(l)], CallUiState::Idle));
                 match free {
-                    Some(line) => {
-                        self.error = None;
-                        self.select_line(line)
-                    }
+                    Some(line) => self.select_line(line),
                     None => {
-                        self.error = Some("all lines are busy".to_string());
+                        self.toast_error("all lines are busy".to_string());
                         Task::none()
                     }
                 }
@@ -2074,7 +2294,7 @@ impl App {
             }
             Message::AddContactPressed => {
                 self.contact_form = Some(ContactForm::default());
-                Task::none()
+                iced::widget::operation::focus(CONTACT_NAME_ID)
             }
             Message::EditContactPressed(index) => {
                 if let Some(c) = self.contacts.get(index) {
@@ -2147,13 +2367,14 @@ impl App {
                         number: entry.number.clone(),
                         editing_index: None,
                     });
-                    self.screen = Screen::Contacts;
-                    self.tab_animations.select(Screen::Contacts);
+                    self.navigate(Page::Contacts);
                 }
                 self.history_context_menu = None;
                 Task::none()
             }
             Message::ContactsIoPathChanged(path) => {
+                self.ui_state.contacts_io_path = Some(path.clone());
+                self.mark_ui_state_dirty();
                 self.contacts_io_path = path;
                 Task::none()
             }
@@ -2192,9 +2413,28 @@ impl App {
                         .add_filter("JSON", &["json"])
                         .pick_file()
                         .await;
-                    Message::ContactsIoPathChanged(file.map(|f| f.path().display().to_string()).unwrap_or(current))
+                    let _ = current;
+                    Message::ImportFileChosen(file.map(|f| f.path().display().to_string()))
                 })
             }
+            Message::ImportFileChosen(path) => match path {
+                Some(path) => {
+                    self.contacts_io_path = path.clone();
+                    self.ui_state.contacts_io_path = Some(path);
+                    self.mark_ui_state_dirty();
+                    self.update_inner(Message::ContactsImportPressed)
+                }
+                None => Task::none(),
+            },
+            Message::ExportFileChosen(path) => match path {
+                Some(path) => {
+                    self.contacts_io_path = path.clone();
+                    self.ui_state.contacts_io_path = Some(path);
+                    self.mark_ui_state_dirty();
+                    self.update_inner(Message::ContactsExportPressed)
+                }
+                None => Task::none(),
+            },
             Message::BrowseContactsExportPressed => {
                 let current = self.contacts_io_path.clone();
                 Task::future(async move {
@@ -2204,7 +2444,8 @@ impl App {
                         .set_file_name("contacts_export.json")
                         .save_file()
                         .await;
-                    Message::ContactsIoPathChanged(file.map(|f| f.path().display().to_string()).unwrap_or(current))
+                    let _ = current;
+                    Message::ExportFileChosen(file.map(|f| f.path().display().to_string()))
                 })
             }
 
@@ -2216,13 +2457,6 @@ impl App {
                 tracing::warn!(%e, "failed to start DTMF tone player");
                 Task::none()
             }
-            Message::IconFontLoaded(Err(e)) => {
-                // Non-fatal: icon glyphs render as tofu boxes instead of the
-                // intended symbol, everything else keeps working.
-                tracing::warn!(?e, "failed to load bundled icon font");
-                Task::none()
-            }
-            Message::IconFontLoaded(Ok(())) => Task::none(),
         }
     }
 
@@ -2263,7 +2497,6 @@ impl App {
                 if !acc.line_open {
                     self.dial_input.clear();
                 }
-                self.error = None;
                 if acc.line_open {
                     return Self::schedule_dial_timeout(account, line);
                 }
@@ -2288,7 +2521,6 @@ impl App {
         }
         acc.selected_line = line;
         self.dial_input.clear();
-        self.error = None;
         let new_idx = acc.selected_idx();
         if acc.joined[new_idx].is_none()
             && let CallUiState::Active { id, on_hold: true, .. } = &acc.lines[new_idx]
@@ -2324,8 +2556,8 @@ impl App {
             return Task::none();
         };
         match acc.complete_join(a, b) {
-            Ok(()) => self.error = None,
-            Err(e) => self.error = Some(e.to_string()),
+            Ok(()) => {}
+            Err(e) => self.toast_error(e.to_string()),
         }
         Task::none()
     }
@@ -2448,12 +2680,12 @@ impl App {
         let port: u16 = match self.sip_settings_form.port.trim().parse() {
             Ok(p) => p,
             Err(_) => {
-                self.error = Some(format!("invalid port: {:?}", self.sip_settings_form.port));
+                self.toast_error(format!("invalid port: {:?}", self.sip_settings_form.port));
                 return;
             }
         };
         if self.sip_settings_form.host.trim().is_empty() || self.sip_settings_form.username.trim().is_empty() {
-            self.error = Some("server and username are required".to_string());
+            self.toast_error("server and username are required".to_string());
             return;
         }
         let name = self.sip_settings_form.name.trim();
@@ -2497,7 +2729,7 @@ impl App {
             }
         }
         self.persist_accounts();
-        self.error = None;
+        self.toast_success("Account saved — registering");
     }
 
     /// Scans both hardware/virtual sinks and live app capture streams
@@ -2566,8 +2798,6 @@ impl App {
             tracing::warn!(%e, "failed to save audio device config");
         }
         self.audio_devices = new_audio_devices;
-
-        self.error = None;
     }
 
     fn handle_call_state_changed(&mut self, account: usize, id: CallId, state: CallState) -> Task<Message> {
@@ -2890,6 +3120,7 @@ impl App {
                             history::CallOutcome::Missed,
                             None,
                         );
+                        self.unseen_missed += 1;
                     }
                     CallUiState::Outgoing { number, .. } | CallUiState::EarlyMedia { number, .. } => {
                         Self::push_history(
@@ -2958,7 +3189,11 @@ impl App {
     /// and if the compositor's own confirming event arrives shortly after
     /// with the same value, it's a harmless no-op update.
     fn resize_for_compact(&mut self, compact: bool) -> Task<Message> {
-        let size = if compact { COMPACT_WINDOW_SIZE } else { MAIN_WINDOW_SIZE };
+        let size = if compact {
+            COMPACT_WINDOW_SIZE
+        } else {
+            self.normal_window_size
+        };
         self.main_window_size = size;
         window::resize(self.main_window, size)
     }
@@ -2993,7 +3228,7 @@ impl App {
         }
         let (number, post_dial) = split_dial_input(&self.dial_input);
         if number.is_empty() {
-            self.error = Some("enter a number to call".to_string());
+            self.toast_error("enter a number to call".to_string());
             return Task::none();
         }
         match ReservedSocket::reserve() {
@@ -3009,7 +3244,7 @@ impl App {
                     local_rtp_port,
                 });
             }
-            Err(e) => self.error = Some(format!("failed to reserve local port: {e}")),
+            Err(e) => self.toast_error(format!("failed to reserve local port: {e}")),
         }
         Task::none()
     }
@@ -3060,7 +3295,7 @@ impl App {
     }
 
     fn notification_text(&self, account: usize, remote: &RemoteParty) -> (String, String) {
-        let name = view::party_name(&self.contacts, remote)
+        let name = ui::components::party_name(&self.contacts, remote)
             .unwrap_or(&remote.user)
             .to_string();
         let account_name = self
@@ -3101,8 +3336,7 @@ impl App {
             let Some((account, idx, id)) = newest else {
                 return Task::none();
             };
-            let lower = key.as_ref();
-            return match lower {
+            return match key.as_ref() {
                 Key::Named(Named::Enter) | Key::Character("a") | Key::Character("A") => self.answer_line(account, idx),
                 Key::Named(Named::Escape) | Key::Character("d") | Key::Character("D") => self.decline_call(account, id),
                 Key::Character("s") | Key::Character("S") => {
@@ -3112,7 +3346,132 @@ impl App {
                 _ => Task::none(),
             };
         }
-        Task::none()
+        if window != self.main_window {
+            return Task::none();
+        }
+        if modifiers.command() {
+            return match key.as_ref() {
+                Key::Character("1") => self.update_inner(Message::PageSelected(Page::Phone)),
+                Key::Character("2") => self.update_inner(Message::PageSelected(Page::Contacts)),
+                Key::Character("3") => self.update_inner(Message::PageSelected(Page::History)),
+                Key::Character("4") | Key::Character(",") => self.update_inner(Message::PageSelected(Page::Settings)),
+                Key::Character("k") | Key::Character("K") => match self.page {
+                    Page::Contacts => iced::widget::operation::focus(SEARCH_INPUT_ID),
+                    _ => {
+                        self.navigate(Page::Phone);
+                        iced::widget::operation::focus(DIAL_INPUT_ID)
+                    }
+                },
+                Key::Character("m") | Key::Character("M") => self.update_inner(Message::MuteToggled),
+                Key::Character("h") | Key::Character("H") => self.update_inner(Message::HoldToggled),
+                Key::Character("t") | Key::Character("T") => self.update_inner(Message::TransferPanelToggled),
+                Key::Character("b") | Key::Character("B") => self.update_inner(Message::SidebarToggled),
+                Key::Character("c") | Key::Character("C") if modifiers.shift() => {
+                    self.update_inner(Message::CompactToggled)
+                }
+                Key::Character("q") | Key::Character("Q") => {
+                    self.update_inner(Message::CloseRequested(self.main_window))
+                }
+                _ => Task::none(),
+            };
+        }
+        if modifiers.alt() {
+            return Task::none();
+        }
+        let selected_state = self.selected().map(|acc| match acc.selected_call() {
+            CallUiState::Idle => 0,
+            CallUiState::Incoming { .. } => 1,
+            CallUiState::Active { .. } => 2,
+            _ => 3,
+        });
+        match key.as_ref() {
+            Key::Named(Named::Escape) => {
+                if self.quit_prompt {
+                    self.quit_prompt = false;
+                } else if self.contact_form.is_some() {
+                    self.contact_form = None;
+                } else if self.history_context_menu.is_some() {
+                    self.history_context_menu = None;
+                } else if selected_state == Some(1) {
+                    return self.update_inner(Message::RejectPressed);
+                } else if matches!(selected_state, Some(2) | Some(3)) {
+                    if self.last_escape.is_some() {
+                        self.last_escape = None;
+                        return self.handle_hang_up_pressed();
+                    }
+                    self.last_escape = Some(Instant::now());
+                    self.push_toast(ToastKind::Warning, "Press Esc again to hang up", None);
+                }
+                Task::none()
+            }
+            Key::Named(Named::Enter) if selected_state == Some(1) => self.update_inner(Message::AnswerPressed),
+            Key::Named(Named::Enter) if selected_state == Some(0) && self.page == Page::Phone => {
+                self.handle_call_pressed()
+            }
+            Key::Named(Named::Backspace) if self.page == Page::Phone && selected_state == Some(0) => {
+                self.dial_input.pop();
+                Task::none()
+            }
+            Key::Character(c) if self.page == Page::Phone && c.len() == 1 => {
+                let ch = c.chars().next().unwrap_or(' ');
+                if ch.is_ascii_digit() || ch == '*' || ch == '#' || ch == '+' {
+                    return self.update_inner(Message::DialpadPressed(ch));
+                }
+                Task::none()
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// Switches the main window to `page`.
+    fn navigate(&mut self, page: Page) {
+        self.page = page;
+        self.nav_animations.select(page);
+        if page == Page::History {
+            self.unseen_missed = 0;
+        }
+        if self.ui_state.page != page {
+            self.ui_state.page = page;
+            self.mark_ui_state_dirty();
+        }
+    }
+
+    fn mark_ui_state_dirty(&mut self) {
+        if self.ui_state_dirty_at.is_none() {
+            self.ui_state_dirty_at = Some(Instant::now());
+        }
+    }
+
+    fn flush_ui_state(&mut self) {
+        self.ui_state_dirty_at = None;
+        if let Err(e) = ui_state::save(&self.ui_state) {
+            tracing::warn!(%e, "failed to save ui state");
+        }
+    }
+
+    fn any_call_in_progress(&self) -> bool {
+        self.accounts
+            .iter()
+            .any(|acc| acc.lines.iter().any(|line| !matches!(line, CallUiState::Idle)))
+    }
+
+    /// Hangs up / declines every call on every account (before quitting).
+    fn hang_up_everything(&mut self) {
+        for acc in &self.accounts {
+            for line in &acc.lines {
+                match line {
+                    CallUiState::Incoming { id, .. } => acc.send_command(CoreCommand::RejectCall {
+                        id: id.clone(),
+                        reason: RejectReason::Busy,
+                    }),
+                    CallUiState::Outgoing { id, .. }
+                    | CallUiState::EarlyMedia { id, .. }
+                    | CallUiState::Active { id, .. } => acc.send_command(CoreCommand::HangUp(id.clone())),
+                    CallUiState::Idle => {}
+                }
+            }
+        }
+        self.stop_ringtone();
     }
 
     /// How long a call may ring unanswered before it is refused as busy and
@@ -3145,6 +3504,7 @@ impl App {
                         history::CallOutcome::Missed,
                         None,
                     );
+                    self.unseen_missed += 1;
                 }
                 acc.send_command(CoreCommand::RejectCall {
                     id,
@@ -3232,7 +3592,7 @@ impl App {
                 acc.pending_sockets[idx] = Some(reserved);
                 acc.send_command(CoreCommand::AnswerCall { id, local_rtp_port });
             }
-            Err(e) => self.error = Some(format!("failed to reserve local port: {e}")),
+            Err(e) => self.toast_error(format!("failed to reserve local port: {e}")),
         }
         Task::none()
     }
@@ -3347,5 +3707,12 @@ fn split_dial_input(input: &str) -> (String, String) {
             (number, post_dial)
         }
         None => (sanitize_dial_chars(input, true), String::new()),
+    }
+}
+
+/// Opens a URL or folder with the desktop's default handler.
+fn open_external(target: &str) {
+    if let Err(e) = std::process::Command::new("xdg-open").arg(target).spawn() {
+        tracing::warn!(%e, target, "xdg-open failed");
     }
 }

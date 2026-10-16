@@ -58,6 +58,9 @@ pub struct AppSettings {
     /// off for every new call regardless of this setting.
     #[serde(default)]
     pub secondary_input_target: Option<String>,
+    /// Colour scheme: follow the desktop, or force dark/light.
+    #[serde(default)]
+    pub theme: crate::theme::ThemeSetting,
 }
 
 impl Default for AppSettings {
@@ -73,6 +76,7 @@ impl Default for AppSettings {
             recording_path: String::new(),
             secondary_output_target: None,
             secondary_input_target: None,
+            theme: crate::theme::ThemeSetting::default(),
         }
     }
 }
