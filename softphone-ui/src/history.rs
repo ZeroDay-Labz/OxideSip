@@ -87,9 +87,16 @@ pub fn save(entries: &[HistoryEntry]) {
     let file = HistoryFile {
         entries: entries[start..].to_vec(),
     };
-    if let Ok(text) = toml::to_string_pretty(&file) {
-        let _ = std::fs::write(crate::paths::config_file(HISTORY_FILENAME), text);
-    }
+    let path = crate::paths::config_file(HISTORY_FILENAME);
+    // Off the UI thread: every call end writes this file.
+    std::thread::spawn(move || match toml::to_string_pretty(&file) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                tracing::warn!(%e, path = %path.display(), "failed to save call history");
+            }
+        }
+        Err(e) => tracing::warn!(%e, "failed to serialize call history"),
+    });
 }
 
 /// A short "3m ago" / "2h ago" style label. Deliberately relative rather

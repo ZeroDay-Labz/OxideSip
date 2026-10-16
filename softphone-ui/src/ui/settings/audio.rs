@@ -30,7 +30,7 @@ pub fn view<'a>(app: &'a App, t: &Tokens) -> Element<'a, Message> {
         ),
         row![
             text_button("Test ring", theme::button_soft).on_press(Message::TestRingPressed),
-            text("Plays the ringtone on the selected output for two seconds. Device changes apply to the next call.")
+            text("Plays the ringtone for two seconds. Device changes apply to the next call; dial tones and the ringtone follow after a restart.")
                 .size(theme::text_size::CAPTION)
                 .color(muted(t)),
         ]

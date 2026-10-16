@@ -90,7 +90,14 @@ pub fn save(contacts: &[Contact]) {
     let mut sorted = contacts.to_vec();
     sorted.sort_by_key(|c| c.name.to_lowercase());
     let file = ContactsFile { contacts: sorted };
-    if let Ok(text) = toml::to_string_pretty(&file) {
-        let _ = std::fs::write(crate::paths::config_file(CONTACTS_FILENAME), text);
-    }
+    let path = crate::paths::config_file(CONTACTS_FILENAME);
+    // Off the UI thread: a contacts edit must never stall a frame on disk I/O.
+    std::thread::spawn(move || match toml::to_string_pretty(&file) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                tracing::warn!(%e, path = %path.display(), "failed to save contacts");
+            }
+        }
+        Err(e) => tracing::warn!(%e, "failed to serialize contacts"),
+    });
 }

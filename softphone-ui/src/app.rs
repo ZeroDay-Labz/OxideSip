@@ -468,8 +468,13 @@ impl AccountSession {
     }
 
     fn send_command(&self, command: CoreCommand) {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.try_send(command);
+        match &self.command_tx {
+            Some(tx) => {
+                if let Err(e) = tx.try_send(command) {
+                    tracing::warn!(%e, account = %self.config.name, "dropping command: core not keeping up or gone");
+                }
+            }
+            None => tracing::warn!(account = %self.config.name, "dropping command: core not connected yet"),
         }
     }
 
@@ -717,9 +722,10 @@ pub struct App {
     pub(crate) contacts_io_status: Option<String>,
     /// `None` until `Message::TonePlayerReady` arrives (or forever, if
     /// startup failed — non-fatal, dialpad presses just stay silent).
-    /// Started once against the output device configured at boot; doesn't
-    /// follow later Settings changes without an app restart, same as a
-    /// call's `MediaSession` needing a fresh call to pick up a device change.
+    /// Started once against the output device configured at boot. It keeps
+    /// its `pw-play` process for the app's lifetime and has no stop method,
+    /// so a changed output device applies to tones after a restart (calls
+    /// pick it up on the next call). `None` in demo mode.
     tone_player: Option<Arc<DtmfTonePlayer>>,
     /// The most recently pressed dialpad key and when — `view.rs`'s
     /// `dialpad` reads this to give the just-pressed key a brief colored
@@ -2712,8 +2718,10 @@ impl App {
     }
 
     fn persist_contacts(&mut self) {
+        // Keep the in-memory list in the same order the file is written in
+        // (by name) instead of re-reading the file we just wrote.
+        self.contacts.sort_by_key(|c| c.name.to_lowercase());
         contacts::save(&self.contacts);
-        self.contacts = contacts::load();
     }
 
     fn persist_accounts(&self) {
