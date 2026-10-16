@@ -26,7 +26,7 @@ pub fn view<'a>(app: &'a App, t: &Tokens) -> Element<'a, Message> {
     let window = column![
         text("The window remembers its size and position. Below 860 px wide the sidebar collapses to icons.")
             .size(theme::text_size::BODY),
-        text("During a call, the shrink button in the top bar (or Ctrl+Shift+C) turns the window into a small floating call bar.")
+        text("During a call, the shrink button in the top bar (or Ctrl+Shift+C) opens a small always-on-top call bar you can leave over other windows.")
             .size(theme::text_size::CAPTION)
             .color(muted(t)),
     ]

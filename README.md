@@ -87,8 +87,8 @@ every release asset.
    the same Answer / Decline buttons.
 4. During a call: mute, hold, transfer (type a number or SIP URI), open the in-call keypad for
    DTMF, start another call on a free line with **+**, and **Join** two active lines. The
-   shrink button in the top bar (or **Ctrl+Shift+C**) turns the window into a small floating
-   call bar.
+   shrink button in the top bar (or **Ctrl+Shift+C**) opens a small always-on-top call bar you
+   can keep over other windows; it closes when the call ends.
 
 | Page | What is there |
 |---|---|
@@ -147,10 +147,10 @@ number clicked in a browser can open here.
 - **No audio, or the wrong device.** Pick the microphone and speaker under
   **Settings ▸ Audio & codecs**. Device changes apply to the next call; the ringtone and dial
   tones follow after a restart. `pw-top` shows whether the `OxideSip` streams are running.
-- **No taskbar icon on Wayland.** The icon comes from the installed `.desktop` entry matched by
-  app id (`io.github.zerodaylabz.OxideSip`). If you run a tarball binary, install
-  `packaging/io.github.zerodaylabz.OxideSip.desktop` and the SVG icon into
-  `~/.local/share/applications/` and `~/.local/share/icons/hicolor/scalable/apps/`.
+- **No icon, or an old icon, in the task bar.** On Wayland the icon comes from the `.desktop`
+  entry matched by app id (`io.github.zerodaylabz.OxideSip`). The app installs its icons into
+  `~/.local/share/icons` on start, and a launcher entry too when no package provides one; if an
+  older icon lingers it is KDE's icon cache — log out and back in once.
 - **The incoming window does not come to the front.** KDE and GNOME may refuse to raise a new
   window over a full-screen app; the task-bar entry pulses instead and the desktop notification
   carries Answer / Decline. Make sure *Desktop notifications* is on under **Settings ▸ Calls**.

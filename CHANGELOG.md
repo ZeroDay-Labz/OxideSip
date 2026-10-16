@@ -32,6 +32,11 @@ All notable changes to OxideSip are documented here. The format follows
 - The whole interface: a sidebar layout (Phone, Contacts, History, Settings) with a top bar,
   panels and consistent tokens, Inter as the bundled UI font and Lucide SVG icons; the three
   detached settings windows are now sections of one Settings page.
+- The compact call bar is now its own small always-on-top window instead of a resize of the
+  main window (a resized Wayland surface could show its old buffer stretched until the
+  compositor repainted); it closes when the call ends.
+- On start the app installs its icons into `~/.local/share/icons` (and a launcher entry when no
+  package provides one), so builds run from a source tree or tarball get the right icon.
 - The incoming-call window is rebuilt: one always-on-top window sized to its content, stacking
   simultaneous calls, with account chip, name / number / host, ring timer, large Decline and
   Answer buttons, a Silence button, focus and attention requests, and keyboard shortcuts.

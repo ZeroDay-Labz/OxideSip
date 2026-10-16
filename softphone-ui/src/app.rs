@@ -633,7 +633,6 @@ pub struct App {
     /// Esc pressed once during a call — a second press within 2 s hangs up.
     last_escape: Option<Instant>,
     /// The main window's size outside compact mode (restored on expand).
-    normal_window_size: iced::Size,
     ui_state: ui_state::UiState,
     /// When `ui_state` last changed and still needs writing (debounced).
     ui_state_dirty_at: Option<Instant>,
@@ -684,7 +683,10 @@ pub struct App {
     /// Whether the main window is currently shrunk to the compact
     /// floating call bar. A window-level concept, not tied to any one
     /// line's data — it just reflects whatever line is selected.
-    pub(crate) compact_mode: bool,
+    /// The floating compact call bar — its own small always-on-top window
+    /// (never a resize of the main window: on Wayland a resized surface can
+    /// show its old buffer stretched until the compositor repaints).
+    pub(crate) compact_window: Option<window::Id>,
     /// The single always-on-top incoming-call window (see `incoming.rs`),
     /// open while at least one line is ringing. Its content is derived from
     /// `accounts[*].lines` every render, so it needs no per-call bookkeeping;
@@ -927,8 +929,7 @@ const ACCOUNTS_FILENAME: &str = "accounts.toml";
 
 const MAIN_WINDOW_SIZE: iced::Size = iced::Size::new(980.0, 660.0);
 const MAIN_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(820.0, 560.0);
-const COMPACT_WINDOW_SIZE: iced::Size = iced::Size::new(400.0, 190.0);
-const COMPACT_WINDOW_MIN_SIZE: iced::Size = iced::Size::new(360.0, 170.0);
+const COMPACT_WINDOW_SIZE: iced::Size = iced::Size::new(420.0, 180.0);
 
 /// Widget ids for keyboard focus (`Ctrl+K`, opening the contact form).
 pub const DIAL_INPUT_ID: &str = "dial-input";
@@ -1000,7 +1001,7 @@ impl App {
             },
             // One low min size for both normal and compact mode: resizing
             // min_size and size in the same frame races on Wayland.
-            ..branding::window_settings(initial_size, Some(COMPACT_WINDOW_MIN_SIZE))
+            ..branding::window_settings(initial_size, Some(MAIN_WINDOW_MIN_SIZE))
         });
 
         let audio_devices = if demo {
@@ -1045,7 +1046,6 @@ impl App {
             quit_prompt: false,
             keypad_open: false,
             last_escape: None,
-            normal_window_size: initial_size,
             ui_state: saved_ui.clone(),
             ui_state_dirty_at: None,
             demo,
@@ -1067,7 +1067,7 @@ impl App {
             system_mode: theme::Mode::Dark,
             main_window,
             main_window_size: initial_size,
-            compact_mode: false,
+            compact_window: None,
             incoming_popup: None,
             incoming_popup_cards: 0,
             ringtone_playing: false,
@@ -1166,6 +1166,8 @@ impl App {
     pub fn view(&self, window: window::Id) -> Element<'_, Message> {
         if Some(window) == self.incoming_popup {
             incoming::window_view(self)
+        } else if Some(window) == self.compact_window {
+            ui::compact_window_view(self)
         } else {
             ui::main_view(self)
         }
@@ -1919,6 +1921,10 @@ impl App {
                 Task::none()
             }
             Message::WindowClosed(id) => {
+                if Some(id) == self.compact_window {
+                    self.compact_window = None;
+                    return Task::none();
+                }
                 if Some(id) == self.incoming_popup {
                     // `sync_incoming_ui` clears `incoming_popup` *before*
                     // issuing its own `window::close`, so reaching here with
@@ -1944,11 +1950,8 @@ impl App {
             Message::WindowResized(id, size) => {
                 if id == self.main_window {
                     self.main_window_size = size;
-                    if !self.compact_mode {
-                        self.normal_window_size = size;
-                        self.ui_state.window_size = Some([size.width, size.height]);
-                        self.mark_ui_state_dirty();
-                    }
+                    self.ui_state.window_size = Some([size.width, size.height]);
+                    self.mark_ui_state_dirty();
                 }
                 Task::none()
             }
@@ -2003,10 +2006,18 @@ impl App {
                     && !plan.capturing
                 {
                     plan.frames += 1;
-                    if plan.frames >= plan.settle_frames {
+                    let page = plan.current.unwrap_or(ShotPage::Phone);
+                    let frames = plan.frames;
+                    if let Some((_, step)) = ShotPlan::script(page).iter().find(|(at, _)| *at == frames) {
+                        return match step {
+                            crate::screenshot::ScriptStep::ToggleCompact => self.update_inner(Message::CompactToggled),
+                        };
+                    }
+                    if plan.frames >= ShotPlan::settle_frames(page, plan.settle_frames) {
                         plan.capturing = true;
                         let target = match plan.current {
                             Some(ShotPage::Incoming) => self.incoming_popup.unwrap_or(self.main_window),
+                            Some(ShotPage::Compact) => self.compact_window.unwrap_or(self.main_window),
                             _ => self.main_window,
                         };
                         return window::screenshot(target).map(Message::Shot);
@@ -2322,8 +2333,24 @@ impl App {
                 Task::none()
             }
             Message::CompactToggled => {
-                self.compact_mode = !self.compact_mode;
-                self.resize_for_compact(self.compact_mode)
+                if self.compact_window.is_some() {
+                    return Task::batch([self.close_compact(), window::gain_focus(self.main_window)]);
+                }
+                let in_call = self
+                    .selected()
+                    .is_some_and(|acc| matches!(acc.selected_call(), CallUiState::Active { .. }));
+                if !in_call {
+                    self.toast_info("The compact call bar is available during a call");
+                    return Task::none();
+                }
+                let (id, open) = window::open(window::Settings {
+                    resizable: false,
+                    minimizable: false,
+                    level: window::Level::AlwaysOnTop,
+                    ..branding::window_settings(COMPACT_WINDOW_SIZE, Some(COMPACT_WINDOW_SIZE))
+                });
+                self.compact_window = Some(id);
+                open.discard()
             }
             Message::PostDialAdvance(account, id) => {
                 let Some(acc) = self.accounts.get_mut(account) else {
@@ -3347,9 +3374,8 @@ impl App {
                 acc.pending_sockets[idx] = None;
                 // (If this call was still ringing — the caller hung up —
                 // `sync_incoming_ui` drops its card and closes the window.)
-                if self.compact_mode && account == self.selected_account && idx == acc.selected_idx() {
-                    self.compact_mode = false;
-                    return self.resize_for_compact(false);
+                if self.compact_window.is_some() && account == self.selected_account && idx == acc.selected_idx() {
+                    return self.close_compact();
                 }
                 Task::none()
             }
@@ -3377,14 +3403,12 @@ impl App {
     /// regardless of how long the compositor takes to visually catch up —
     /// and if the compositor's own confirming event arrives shortly after
     /// with the same value, it's a harmless no-op update.
-    fn resize_for_compact(&mut self, compact: bool) -> Task<Message> {
-        let size = if compact {
-            COMPACT_WINDOW_SIZE
-        } else {
-            self.normal_window_size
-        };
-        self.main_window_size = size;
-        window::resize(self.main_window, size)
+    /// Closes the compact call bar if it is open.
+    fn close_compact(&mut self) -> Task<Message> {
+        match self.compact_window.take() {
+            Some(id) => window::close(id),
+            None => Task::none(),
+        }
     }
 
     fn handle_dialpad(&mut self, digit: char) -> Task<Message> {
@@ -3651,7 +3675,7 @@ impl App {
         }
         match page {
             ShotPage::Phone => self.navigate(Page::Phone),
-            ShotPage::PhoneActive => {
+            ShotPage::PhoneActive | ShotPage::Compact | ShotPage::CompactRestored => {
                 self.navigate(Page::Phone);
                 self.dial_input = "2004".to_string();
                 tasks.push(self.handle_call_pressed());
@@ -3922,11 +3946,7 @@ impl App {
             player.stop_incoming_ringtone();
             player.play_disconnect_tone();
         }
-        if self.compact_mode {
-            self.compact_mode = false;
-            return self.resize_for_compact(false);
-        }
-        Task::none()
+        self.close_compact()
     }
 }
 

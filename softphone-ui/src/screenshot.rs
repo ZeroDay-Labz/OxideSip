@@ -15,10 +15,14 @@ pub enum ShotPage {
     SettingsAccounts,
     SettingsAudio,
     SettingsCalls,
+    /// The compact call bar (an active call shrunk).
+    Compact,
+    /// Back to the full window after a compact round trip.
+    CompactRestored,
 }
 
 impl ShotPage {
-    pub const ALL: [ShotPage; 8] = [
+    pub const ALL: [ShotPage; 9] = [
         ShotPage::Phone,
         ShotPage::PhoneActive,
         ShotPage::Incoming,
@@ -27,6 +31,7 @@ impl ShotPage {
         ShotPage::SettingsAccounts,
         ShotPage::SettingsAudio,
         ShotPage::SettingsCalls,
+        ShotPage::Compact,
     ];
 
     pub fn parse(name: &str) -> Option<Vec<ShotPage>> {
@@ -40,6 +45,8 @@ impl ShotPage {
             "settings" | "settings-accounts" => vec![ShotPage::SettingsAccounts],
             "settings-audio" => vec![ShotPage::SettingsAudio],
             "settings-calls" => vec![ShotPage::SettingsCalls],
+            "compact" => vec![ShotPage::Compact],
+            "compact-restored" => vec![ShotPage::CompactRestored],
             _ => return None,
         })
     }
@@ -54,8 +61,15 @@ impl ShotPage {
             ShotPage::SettingsAccounts => "settings-accounts",
             ShotPage::SettingsAudio => "settings-audio",
             ShotPage::SettingsCalls => "settings-calls",
+            ShotPage::Compact => "compact",
+            ShotPage::CompactRestored => "compact-restored",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptStep {
+    ToggleCompact,
 }
 
 /// The run's state: pages still to capture and how many ticks the current
@@ -83,6 +97,22 @@ impl ShotPlan {
             settle_frames,
             capturing: false,
         }
+    }
+
+    /// Extra scripted input for pages that need interaction after staging:
+    /// `(tick at which to fire, what to do)`.
+    pub fn script(page: ShotPage) -> &'static [(u32, ScriptStep)] {
+        match page {
+            ShotPage::Compact => &[(30, ScriptStep::ToggleCompact)],
+            ShotPage::CompactRestored => &[(30, ScriptStep::ToggleCompact), (55, ScriptStep::ToggleCompact)],
+            _ => &[],
+        }
+    }
+
+    /// Ticks to wait before capturing this page (scripts need longer).
+    pub fn settle_frames(page: ShotPage, default: u32) -> u32 {
+        let last = Self::script(page).iter().map(|(at, _)| *at).max().unwrap_or(0);
+        default.max(last + 25)
     }
 
     pub fn path_for(&self, page: ShotPage) -> PathBuf {

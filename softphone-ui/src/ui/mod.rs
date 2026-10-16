@@ -23,33 +23,6 @@ pub const COLLAPSE_BELOW: f32 = 860.0;
 pub fn main_view(app: &App) -> Element<'_, Message> {
     let t = theme::tokens(app.mode());
 
-    if app.compact_mode
-        && let Some(acc) = app.selected()
-        && let CallUiState::Active {
-            number,
-            remote_name,
-            media,
-            muted,
-            on_hold,
-            answered_at,
-            ..
-        } = acc.selected_call()
-    {
-        return with_toasts(
-            app,
-            compact::view(
-                &t,
-                &app.contacts,
-                number,
-                remote_name.as_deref(),
-                app.media_ready(media),
-                *muted,
-                *on_hold,
-                app.elapsed(*answered_at),
-            ),
-        );
-    }
-
     let collapsed = app.sidebar_collapsed || app.main_window_size.width < COLLAPSE_BELOW;
     let page: Element<'_, Message> = match app.page {
         Page::Phone => phone::view(app, &t),
@@ -82,6 +55,41 @@ pub fn main_view(app: &App) -> Element<'_, Message> {
         layers.push(modal(quit_prompt(&t), Message::QuitCancelled));
     }
     with_toasts(app, stack(layers).into())
+}
+
+/// The floating compact call bar window. Shows the selected line's active
+/// call; the window is closed by `App` as soon as that call ends.
+pub fn compact_window_view(app: &App) -> Element<'_, Message> {
+    let t = theme::tokens(app.mode());
+    if let Some(acc) = app.selected()
+        && let CallUiState::Active {
+            number,
+            remote_name,
+            media,
+            muted,
+            on_hold,
+            answered_at,
+            ..
+        } = acc.selected_call()
+    {
+        return compact::view(
+            &t,
+            &app.contacts,
+            number,
+            remote_name.as_deref(),
+            app.media_ready(media),
+            *muted,
+            *on_hold,
+            app.elapsed(*answered_at),
+        );
+    }
+    container(text("No active call").size(theme::text_size::BODY).color(muted(&t)))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(theme::app_background)
+        .into()
 }
 
 /// Overlays the toast layer on a window's content.
@@ -186,11 +194,18 @@ fn topbar<'a>(app: &'a App, t: &Tokens) -> Element<'a, Message> {
                 .style(theme::chip),
             );
             let in_call = acc.is_some_and(|a| matches!(a.selected_call(), CallUiState::Active { .. }));
+            let compact_open = app.compact_window.is_some();
             actions = actions.push(components::icon_button(
-                icons::minimize(16.0, muted(t)),
-                "Shrink to a compact call bar (Ctrl+Shift+C)",
-                false,
-                in_call.then_some(Message::CompactToggled),
+                icons::minimize(16.0, if compact_open { iced::Color::WHITE } else { muted(t) }),
+                if compact_open {
+                    "Close the compact call bar (Ctrl+Shift+C)"
+                } else if in_call {
+                    "Open a floating compact call bar (Ctrl+Shift+C)"
+                } else {
+                    "Compact call bar — available during a call"
+                },
+                compact_open,
+                (in_call || compact_open).then_some(Message::CompactToggled),
             ));
         }
         Page::Contacts => {

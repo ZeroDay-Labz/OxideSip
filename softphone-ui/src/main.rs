@@ -8,6 +8,7 @@ mod demo;
 mod history;
 mod icons;
 mod incoming;
+mod launcher;
 mod notify;
 mod number;
 mod paths;
@@ -93,6 +94,9 @@ pub fn main() -> iced::Result {
         paths::set_persistence(false);
     }
     let accounts = if demo { demo::accounts() } else { load_accounts() };
+    if !demo {
+        launcher::ensure_installed();
+    }
 
     let theme = cli.theme.as_deref().and_then(|t| match t {
         "dark" => Some(theme::ThemeSetting::Dark),
