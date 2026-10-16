@@ -92,27 +92,57 @@ fn write(path: &PathBuf, bytes: &[u8]) -> bool {
     }
 }
 
-/// Best effort, in the background: tell KDE / the icon cache about the new
-/// files so the running window picks up its icon without a re-login.
+/// Best effort, in the background: tell the desktop about the new files so
+/// the running window picks up its icon without a re-login.
+///
+/// KDE keeps rendered icons in a per-user pixmap cache keyed by icon *name*
+/// (`~/.cache/icon-cache.kcache`), so after an upgrade the task bar keeps
+/// showing the previous icon even though every file on disk is new. The
+/// `org.kde.KIconLoader.iconChanged` broadcast is what System Settings sends
+/// when the icon theme changes; every KIconLoader (Plasma, KWin, Dolphin…)
+/// drops its caches on receipt.
 fn refresh_caches(data_home: PathBuf) {
     std::thread::spawn(move || {
         let quiet = |mut cmd: std::process::Command| {
-            let _ = cmd
-                .stdout(std::process::Stdio::null())
+            cmd.stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status();
+                .status()
+                .is_ok()
         };
         let mut udd = std::process::Command::new("update-desktop-database");
         udd.arg(data_home.join("applications"));
         quiet(udd);
         for sycoca in ["kbuildsycoca6", "kbuildsycoca5"] {
-            if std::process::Command::new(sycoca)
-                .arg("--noincremental")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok()
-            {
+            let mut cmd = std::process::Command::new(sycoca);
+            cmd.arg("--noincremental");
+            if quiet(cmd) {
+                break;
+            }
+        }
+        // KIconLoader::Group: Desktop, Toolbar, MainToolbar, Small, Panel, Dialog.
+        for group in 0..=5 {
+            let mut dbus_send = std::process::Command::new("dbus-send");
+            dbus_send.args([
+                "--session",
+                "--type=signal",
+                "/KIconLoader",
+                "org.kde.KIconLoader.iconChanged",
+                &format!("int32:{group}"),
+            ]);
+            if quiet(dbus_send) {
+                continue;
+            }
+            let mut gdbus = std::process::Command::new("gdbus");
+            gdbus.args([
+                "emit",
+                "--session",
+                "--object-path",
+                "/KIconLoader",
+                "--signal",
+                "org.kde.KIconLoader.iconChanged",
+                &group.to_string(),
+            ]);
+            if !quiet(gdbus) {
                 break;
             }
         }

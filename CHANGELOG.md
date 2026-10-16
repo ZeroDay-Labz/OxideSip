@@ -3,6 +3,13 @@
 All notable changes to OxideSip are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [Unreleased]
+
+### Fixed
+- KDE kept showing the 0.1.x icon after upgrading because its per-user pixmap cache is keyed by
+  icon name. The app now broadcasts KDE's icon-changed signal whenever it installs new icons,
+  so the task bar switches to the new icon without logging out.
+
 ## [0.2.0] — 2026-10-16
 
 ### Added

@@ -149,8 +149,13 @@ number clicked in a browser can open here.
   tones follow after a restart. `pw-top` shows whether the `OxideSip` streams are running.
 - **No icon, or an old icon, in the task bar.** On Wayland the icon comes from the `.desktop`
   entry matched by app id (`io.github.zerodaylabz.OxideSip`). The app installs its icons into
-  `~/.local/share/icons` on start, and a launcher entry too when no package provides one; if an
-  older icon lingers it is KDE's icon cache — log out and back in once.
+  `~/.local/share/icons` on start, and a launcher entry too when no package provides one. KDE
+  caches rendered icons by name, so after an upgrade the app tells the icon loader to reload;
+  if an old icon still lingers, run the line below (or log out and back in once):
+
+  ```sh
+  dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0
+  ```
 - **The incoming window does not come to the front.** KDE and GNOME may refuse to raise a new
   window over a full-screen app; the task-bar entry pulses instead and the desktop notification
   carries Answer / Decline. Make sure *Desktop notifications* is on under **Settings ▸ Calls**.
