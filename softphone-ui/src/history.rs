@@ -80,6 +80,9 @@ fn repair_legacy_entry(mut entry: HistoryEntry) -> HistoryEntry {
 /// dropped first) so the file doesn't grow unbounded. `entries` is expected
 /// oldest-first (append-on-call-end order).
 pub fn save(entries: &[HistoryEntry]) {
+    if !crate::paths::persistence_enabled() {
+        return;
+    }
     let start = entries.len().saturating_sub(MAX_ENTRIES);
     let file = HistoryFile {
         entries: entries[start..].to_vec(),

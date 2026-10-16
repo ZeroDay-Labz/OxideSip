@@ -93,6 +93,9 @@ pub fn load() -> AppSettings {
 }
 
 pub fn save(settings: &AppSettings) -> std::io::Result<()> {
+    if !crate::paths::persistence_enabled() {
+        return Ok(());
+    }
     let text = toml::to_string_pretty(settings).unwrap_or_default();
     std::fs::write(crate::paths::config_file(SETTINGS_FILENAME), text)
 }

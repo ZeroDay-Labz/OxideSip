@@ -315,7 +315,7 @@ fn lines_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<
         .align_y(Alignment::Center);
         if let Some(since) = timer {
             content = content.push(
-                text(format_elapsed(since.elapsed()))
+                text(format_elapsed(app.elapsed(since)))
                     .size(theme::text_size::CAPTION)
                     .font(iced::Font::MONOSPACE)
                     .color(muted(t)),
@@ -386,10 +386,14 @@ fn call_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<'
         CallUiState::Idle => (idle_card(acc, t), None),
         CallUiState::Incoming {
             caller, ringing_since, ..
-        } => (incoming_card(&app.contacts, caller, *ringing_since, t), Some(t.warning)),
-        CallUiState::Outgoing { number, started_at, .. } | CallUiState::EarlyMedia { number, started_at, .. } => {
-            (outgoing_card(&app.contacts, number, *started_at, t), Some(t.accent))
-        }
+        } => (
+            incoming_card(app, &app.contacts, caller, *ringing_since, t),
+            Some(t.warning),
+        ),
+        CallUiState::Outgoing { number, started_at, .. } | CallUiState::EarlyMedia { number, started_at, .. } => (
+            outgoing_card(app, &app.contacts, number, *started_at, t),
+            Some(t.accent),
+        ),
         CallUiState::Active {
             number,
             remote_name,
@@ -413,7 +417,7 @@ fn call_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<'
                 ActiveView {
                     number,
                     remote_name: remote_name.as_deref(),
-                    media_ready: media.is_some(),
+                    media_ready: app.media_ready(media),
                     glow: avatar_glow.interpolate(0.0_f32, 1.0_f32, Instant::now()),
                     answered_at: *answered_at,
                     input_level: *input_level,
@@ -509,6 +513,7 @@ fn identity_block<'a>(
 }
 
 fn incoming_card<'a>(
+    app: &'a App,
     contacts: &'a [Contact],
     caller: &'a softphone_core::events::RemoteParty,
     ringing_since: Instant,
@@ -521,7 +526,7 @@ fn incoming_card<'a>(
         identity_block(
             name,
             &caller.user,
-            format!("Incoming call · {}", format_elapsed(ringing_since.elapsed())),
+            format!("Incoming call · {}", format_elapsed(app.elapsed(ringing_since))),
             t.warning,
             t,
         ),
@@ -553,6 +558,7 @@ fn incoming_card<'a>(
 }
 
 fn outgoing_card<'a>(
+    app: &'a App,
     contacts: &'a [Contact],
     number: &'a str,
     started_at: Instant,
@@ -563,7 +569,7 @@ fn outgoing_card<'a>(
         identity_block(
             contact_name_for(contacts, number),
             number,
-            format!("Calling… {}", format_elapsed(started_at.elapsed())),
+            format!("Calling… {}", format_elapsed(app.elapsed(started_at))),
             t.accent,
             t,
         ),
@@ -631,7 +637,7 @@ fn active_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens, v: ActiveV
         (JoinUi::Joined { partner }, _, _) => (format!("Joined with line {partner}"), t.success),
         (_, false, _) => ("Connecting audio…".to_string(), t.warning),
         (_, _, true) => ("On hold".to_string(), t.warning),
-        _ => (format_elapsed(v.answered_at.elapsed()), t.success),
+        _ => (format_elapsed(app.elapsed(v.answered_at)), t.success),
     };
     let name = contact_name_for(&app.contacts, v.number).or(v.remote_name);
     let seed = name.unwrap_or(v.number);

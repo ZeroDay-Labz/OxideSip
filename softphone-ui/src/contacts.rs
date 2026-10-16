@@ -84,6 +84,9 @@ pub fn load() -> Vec<Contact> {
 }
 
 pub fn save(contacts: &[Contact]) {
+    if !crate::paths::persistence_enabled() {
+        return;
+    }
     let mut sorted = contacts.to_vec();
     sorted.sort_by_key(|c| c.name.to_lowercase());
     let file = ContactsFile { contacts: sorted };

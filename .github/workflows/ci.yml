@@ -40,3 +40,13 @@ jobs:
           fi
       - name: Shell scripts parse
         run: for f in scripts/*.sh; do bash -n "$f"; done
+      # Boots the real UI against the demo backend under Xvfb and renders
+      # one page — proves the window, fonts, icons and layout come up
+      # headless. Software rendering, so it is slow and allowed to fail
+      # without failing the build.
+      - name: Headless screenshot smoke test
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y xvfb
+          ICED_BACKEND=tiny-skia xvfb-run -a target/debug/oxidesip --screenshot /tmp/shots --page phone --frames 20
+          ls -la /tmp/shots

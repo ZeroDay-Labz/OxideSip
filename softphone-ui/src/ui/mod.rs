@@ -42,10 +42,10 @@ pub fn main_view(app: &App) -> Element<'_, Message> {
                 &app.contacts,
                 number,
                 remote_name.as_deref(),
-                media.is_some(),
+                app.media_ready(media),
                 *muted,
                 *on_hold,
-                *answered_at,
+                app.elapsed(*answered_at),
             ),
         );
     }

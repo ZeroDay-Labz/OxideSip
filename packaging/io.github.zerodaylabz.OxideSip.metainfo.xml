@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.zerodaylabz.OxideSip</id>
+  <name>OxideSip</name>
+  <summary>Native Linux SIP softphone with PipeWire audio</summary>
+  <developer id="io.github.zerodaylabz">
+    <name>ZeroDay-Labz</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      OxideSip registers one or more SIP accounts with your PBX (FreePBX, Asterisk and others)
+      and gives each of them five call lines. Place, answer, hold, transfer and join calls,
+      send DTMF, record calls, and route call audio into or out of other applications such
+      as Discord — all through native PipeWire streams.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Multiple accounts registered at once, five lines each, with hold, blind transfer and local three-way join</li>
+      <li>Incoming calls open an always-on-top window with Answer and Decline, plus a desktop notification with the same buttons</li>
+      <li>RFC 4733 DTMF with SIP INFO fallback, ordered codec priority (G.711 µ-law / A-law), optional SDES-SRTP, UDP/TCP/TLS transports</li>
+      <li>Contacts with JSON import/export, call history with filters, Do Not Disturb, auto-answer and a deny list</li>
+      <li>Secondary audio routing: send the other party's voice to another app or mix another app's audio into the call</li>
+      <li>Dark and light themes that follow the desktop, keyboard shortcuts, and a compact floating call bar</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.zerodaylabz.OxideSip.desktop</launchable>
+  <provides>
+    <binary>oxidesip</binary>
+  </provides>
+  <url type="homepage">https://github.com/ZeroDay-Labz/OxideSip</url>
+  <url type="bugtracker">https://github.com/ZeroDay-Labz/OxideSip/issues</url>
+  <url type="vcs-browser">https://github.com/ZeroDay-Labz/OxideSip</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>An active call: lines, meters and call controls</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/OxideSip/main/docs/screenshots/phone-active.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The incoming-call window</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/OxideSip/main/docs/screenshots/incoming.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Contacts</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/OxideSip/main/docs/screenshots/contacts.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Call history</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/OxideSip/main/docs/screenshots/history.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Settings: accounts</caption>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/OxideSip/main/docs/screenshots/settings-accounts.png</image>
+    </screenshot>
+  </screenshots>
+  <branding>
+    <color type="primary" scheme_preference="light">#ff7a3d</color>
+    <color type="primary" scheme_preference="dark">#1a1d24</color>
+  </branding>
+  <categories>
+    <category>Network</category>
+    <category>Telephony</category>
+  </categories>
+  <keywords>
+    <keyword>sip</keyword>
+    <keyword>voip</keyword>
+    <keyword>softphone</keyword>
+    <keyword>phone</keyword>
+    <keyword>pbx</keyword>
+    <keyword>asterisk</keyword>
+    <keyword>freepbx</keyword>
+  </keywords>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">820</display_length>
+    <internet>always</internet>
+  </requires>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-audio">intense</content_attribute>
+    <content_attribute id="social-contacts">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="0.2.0" date="2026-10-16">
+      <description>
+        <p>New sidebar layout, dark and light themes, a rebuilt incoming-call window with desktop notifications, structured caller ID, a real app icon, and a demo/screenshot mode.</p>
+      </description>
+    </release>
+    <release version="0.1.8" date="2026-08-07"/>
+  </releases>
+</component>

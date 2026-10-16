@@ -34,6 +34,9 @@ pub fn load() -> UiState {
 }
 
 pub fn save(state: &UiState) -> std::io::Result<()> {
+    if !crate::paths::persistence_enabled() {
+        return Ok(());
+    }
     let text = toml::to_string_pretty(state).map_err(std::io::Error::other)?;
     std::fs::write(crate::paths::config_file(FILENAME), text)
 }

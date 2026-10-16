@@ -2,9 +2,10 @@ use crate::app_settings::{self, AppSettings};
 use crate::audio_devices::{self, AudioDeviceConfig};
 use crate::contacts::{self, Contact};
 use crate::history;
+use crate::screenshot::{ShotPage, ShotPlan};
 use crate::theme::{self, ThemeSetting, ToastKind};
 use crate::toast::Toast;
-use crate::{branding, bridge, incoming, notify, number, ui, ui_state};
+use crate::{branding, bridge, demo, incoming, notify, number, ui, ui_state};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::{Element, Subscription, Task, window};
 use softphone_core::config::{DtmfMode, PREFERRED_CODECS, PreferredCodec, SipAccountConfig, SipTransport};
@@ -631,6 +632,16 @@ pub struct App {
     ui_state: ui_state::UiState,
     /// When `ui_state` last changed and still needs writing (debounced).
     ui_state_dirty_at: Option<Instant>,
+    /// Running against the scripted demo backend (see `demo.rs`).
+    pub(crate) demo: bool,
+    /// Phase of the fake level meters in demo mode.
+    demo_phase: f32,
+    /// An in-progress `--screenshot` run.
+    shots: Option<ShotPlan>,
+    /// Screenshot runs read timers against this fixed instant instead of
+    /// the real clock, so no label changes between frames (text that
+    /// changes right before an offscreen capture is not rendered).
+    frozen_clock: Option<Instant>,
     pub(crate) dial_input: String,
     /// Whether the recent-outgoing-numbers panel below the dial input is
     /// expanded. Toggled by its own button rather than on focus, since
@@ -837,6 +848,8 @@ pub enum Message {
     DialBackspace,
     KeypadToggled,
     HistoryFilterChanged(HistoryFilter),
+    /// A window finished opening.
+    WindowOpened(window::Id),
     /// The compositor asked to close a window (title-bar X, Alt+F4).
     CloseRequested(window::Id),
     QuitConfirmed,
@@ -845,6 +858,9 @@ pub enum Message {
     OpenConfigFolder,
     TestRingPressed,
     TestRingStop,
+    /// Screenshot run: stage the next page.
+    ShotNext,
+    Shot(window::Screenshot),
     DialNumber(String),
     RedialPressed,
     HoldToggled,
@@ -883,6 +899,21 @@ pub enum Message {
     TonePlayerReady(Result<Arc<DtmfTonePlayer>, String>),
 }
 
+/// What `main.rs` parsed from the command line.
+#[derive(Debug, Default)]
+pub struct BootOptions {
+    /// Scripted backend, seeded data, nothing persisted (`--demo`).
+    pub demo: bool,
+    /// Render documentation screenshots and exit (`--screenshot DIR`).
+    pub screenshot: Option<ShotPlan>,
+    /// Force a colour scheme for this run (`--theme`).
+    pub theme: Option<ThemeSetting>,
+    /// Initial window size (`--size WxH`).
+    pub size: Option<iced::Size>,
+    /// Number to pre-fill the dial field with (a `sip:`/`tel:` URI argument).
+    pub dial: Option<String>,
+}
+
 /// Legacy single-account migration lives in `main.rs` (it needs to run once
 /// at process startup, before `App` exists) — this is just where the
 /// resulting multi-account file is persisted from then on.
@@ -919,7 +950,9 @@ impl App {
     /// default (unlike `iced::application()`), so this has to do it
     /// explicitly. Unlike the settings windows, the main window's `Id` *is*
     /// stored (`main_window`) — compact call mode needs to resize it.
-    pub fn boot(accounts: Vec<SipAccountConfig>) -> (Self, Task<Message>) {
+    pub fn boot(accounts: Vec<SipAccountConfig>, options: BootOptions) -> (Self, Task<Message>) {
+        let demo = options.demo;
+        let screenshot_run = options.screenshot.is_some();
         // `min_size` is set once, here, to the *smallest* size the window
         // ever needs (compact mode's floor) — not the main layout's floor —
         // and never touched again. `resize_for_compact` used to toggle
@@ -935,16 +968,26 @@ impl App {
         // forced the compositor to reconcile the size. A single min_size
         // that's always low enough for either mode needs no such
         // coordination — `resize_for_compact` is now just one resize call.
-        let saved_ui = ui_state::load();
-        let initial_size = saved_ui
-            .window_size
-            .map(|[w, h]| iced::Size::new(w.max(MAIN_WINDOW_MIN_SIZE.width), h.max(MAIN_WINDOW_MIN_SIZE.height)))
+        let saved_ui = if demo {
+            ui_state::UiState::default()
+        } else {
+            ui_state::load()
+        };
+        let initial_size = options
+            .size
+            .or(saved_ui.window_size.map(|[w, h]| iced::Size::new(w, h)))
+            .map(|s| {
+                iced::Size::new(
+                    s.width.max(MAIN_WINDOW_MIN_SIZE.width),
+                    s.height.max(MAIN_WINDOW_MIN_SIZE.height),
+                )
+            })
             .unwrap_or(MAIN_WINDOW_SIZE);
         let (main_window, open_task) = window::open(window::Settings {
             resizable: true,
             // Close requests go through `Message::CloseRequested` so an
             // active call can ask for confirmation first.
-            exit_on_close_request: false,
+            exit_on_close_request: screenshot_run,
             position: match saved_ui.window_position {
                 Some([x, y]) => window::Position::Specific(iced::Point::new(x, y)),
                 None => window::Position::Centered,
@@ -954,8 +997,24 @@ impl App {
             ..branding::window_settings(initial_size, Some(COMPACT_WINDOW_MIN_SIZE))
         });
 
-        let audio_devices = audio_devices::load();
-        let settings = app_settings::load();
+        let audio_devices = if demo {
+            AudioDeviceConfig::default()
+        } else {
+            audio_devices::load()
+        };
+        let mut settings = if demo {
+            AppSettings::default()
+        } else {
+            app_settings::load()
+        };
+        if let Some(theme) = options.theme {
+            settings.theme = theme;
+        }
+        let (demo_inputs, demo_outputs) = if demo {
+            demo::devices()
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let needs_setup = accounts.is_empty();
         let initial_page = if needs_setup { Page::Settings } else { saved_ui.page };
         let sessions: Vec<AccountSession> = accounts.into_iter().map(AccountSession::new).collect();
@@ -983,14 +1042,18 @@ impl App {
             normal_window_size: initial_size,
             ui_state: saved_ui.clone(),
             ui_state_dirty_at: None,
-            dial_input: String::new(),
+            demo,
+            demo_phase: 0.0,
+            frozen_clock: screenshot_run.then(|| Instant::now() + Duration::from_secs(3)),
+            shots: options.screenshot,
+            dial_input: options.dial.clone().unwrap_or_default(),
             dial_history_open: false,
             sip_settings_form,
             editing_account: Some(0),
             audio_settings_form,
             audio_devices,
-            input_devices: Vec::new(),
-            output_devices: Vec::new(),
+            input_devices: demo_inputs,
+            output_devices: demo_outputs,
             app_capture_streams: Vec::new(),
             app_playback_streams: Vec::new(),
             toasts: Vec::new(),
@@ -1006,9 +1069,9 @@ impl App {
             notifications: HashMap::new(),
             settings_form: SettingsForm::from_settings(&settings),
             settings,
-            call_history: history::load(),
+            call_history: if demo { demo::history() } else { history::load() },
             history_context_menu: None,
-            contacts: contacts::load(),
+            contacts: if demo { demo::contacts() } else { contacts::load() },
             contact_filter: String::new(),
             contact_form: None,
             contact_sort: ContactSort::default(),
@@ -1036,11 +1099,14 @@ impl App {
             Message::TonePlayerReady(result)
         });
 
-        let startup = vec![
+        let mut startup = vec![
             open_task.discard(),
-            tone_task,
             iced::system::theme().map(Message::SystemThemeChanged),
         ];
+        if !demo {
+            startup.push(tone_task);
+        }
+        let _ = screenshot_run;
         (app, Task::batch(startup))
     }
 
@@ -1068,10 +1134,15 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let configs: Vec<SipAccountConfig> = self.accounts.iter().map(|a| a.config.clone()).collect();
         Subscription::batch([
-            bridge::subscription(&configs),
+            if self.demo {
+                demo::subscription(&configs)
+            } else {
+                bridge::subscription(&configs)
+            },
             iced::time::every(TICK_INTERVAL).map(|_| Message::Tick),
             window::close_events().map(Message::WindowClosed),
             window::close_requests().map(Message::CloseRequested),
+            window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
             iced::event::listen_with(Self::global_keys),
             iced::system::theme_changes().map(Message::SystemThemeChanged),
@@ -1176,6 +1247,7 @@ impl App {
             }
 
             Message::Core(account, CoreEvent::Registered { expires, rtt_ms }) => {
+                tracing::info!(account, expires, rtt_ms, "registered with SIP server");
                 if let Some(acc) = self.accounts.get_mut(account) {
                     acc.registration = RegistrationStatus::Registered {
                         expires,
@@ -1259,7 +1331,7 @@ impl App {
                     // started here is the desktop notification, the one
                     // channel that reliably reaches the user even when the
                     // compositor refuses to raise a new window.
-                    if self.settings.notify_incoming {
+                    if self.settings.notify_incoming && !self.demo {
                         let (summary, body) = self.notification_text(account, &remote_for_notify);
                         return Task::stream(notify::incoming_call(id, summary, body))
                             .map(|(id, event)| Message::Notification(id, event));
@@ -1289,6 +1361,7 @@ impl App {
             }
             Message::Core(account, CoreEvent::OutgoingCallStarted { id, line }) => {
                 let idx = line_idx(line);
+                self.dial_input.clear();
                 if let Some(acc) = self.accounts.get_mut(account) {
                     let number = std::mem::take(&mut acc.pending_numbers[idx]);
                     acc.lines[idx] = CallUiState::Outgoing {
@@ -1553,6 +1626,9 @@ impl App {
                     });
                 self.settings_section = SettingsSection::Audio;
                 self.navigate(Page::Settings);
+                if self.demo {
+                    return Task::none();
+                }
                 Task::future(async {
                     let (inputs, outputs) = tokio::task::spawn_blocking(|| {
                         let inputs = softphone_media::devices::list_input_devices().unwrap_or_else(|e| {
@@ -1886,6 +1962,50 @@ impl App {
                 {
                     self.last_escape = None;
                 }
+                if self.demo {
+                    self.demo_phase += 0.09;
+                    let phase = self.demo_phase;
+                    for acc in &mut self.accounts {
+                        for line in &mut acc.lines {
+                            if let CallUiState::Active {
+                                media: None,
+                                input_level,
+                                output_level,
+                                on_hold,
+                                avatar_glow,
+                                ..
+                            } = line
+                            {
+                                let live = !*on_hold;
+                                *input_level = if live {
+                                    0.32 + 0.28 * (phase * 1.7).sin().abs()
+                                } else {
+                                    0.0
+                                };
+                                *output_level = if live {
+                                    0.45 + 0.35 * (phase * 1.1 + 0.8).sin().abs()
+                                } else {
+                                    0.0
+                                };
+                                avatar_glow.go_mut(live, now);
+                            }
+                        }
+                    }
+                }
+                if let Some(plan) = &mut self.shots
+                    && plan.current.is_some()
+                    && !plan.capturing
+                {
+                    plan.frames += 1;
+                    if plan.frames >= plan.settle_frames {
+                        plan.capturing = true;
+                        let target = match plan.current {
+                            Some(ShotPage::Incoming) => self.incoming_popup.unwrap_or(self.main_window),
+                            _ => self.main_window,
+                        };
+                        return window::screenshot(target).map(Message::Shot);
+                    }
+                }
                 if let Some(acc) = self.selected_mut() {
                     let idx = acc.selected_idx();
                     if let CallUiState::Active {
@@ -2038,6 +2158,20 @@ impl App {
                 self.mark_ui_state_dirty();
                 Task::none()
             }
+            Message::WindowOpened(id) => {
+                if id != self.main_window {
+                    return Task::none();
+                }
+                // A window launched from a terminal never gets focus on its
+                // own, and on Wayland an unfocused, untouched window can stay
+                // on its very first frame — ask for focus like a click would,
+                // then (for `--screenshot`) start staging pages.
+                let mut tasks = vec![window::gain_focus(id)];
+                if self.shots.as_ref().is_some_and(|plan| plan.current.is_none()) {
+                    tasks.push(Task::done(Message::ShotNext));
+                }
+                Task::batch(tasks)
+            }
             Message::CloseRequested(id) => {
                 if id != self.main_window {
                     return Task::none();
@@ -2077,6 +2211,21 @@ impl App {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     Message::TestRingStop
                 })
+            }
+            Message::ShotNext => self.stage_next_shot(),
+            Message::Shot(shot) => {
+                let Some(plan) = &mut self.shots else {
+                    return Task::none();
+                };
+                plan.capturing = false;
+                if let Some(page) = plan.current {
+                    let path = plan.path_for(page);
+                    match crate::screenshot::save_png(&path, &shot) {
+                        Ok(()) => tracing::info!(path = %path.display(), "saved screenshot"),
+                        Err(e) => tracing::error!(%e, path = %path.display(), "screenshot failed"),
+                    }
+                }
+                self.stage_next_shot()
             }
             Message::TestRingStop => {
                 if incoming::ringing_calls(self).is_empty() {
@@ -2568,6 +2717,9 @@ impl App {
     }
 
     fn persist_accounts(&self) {
+        if !crate::paths::persistence_enabled() {
+            return;
+        }
         let configs: Vec<SipAccountConfig> = self.accounts.iter().map(|a| a.config.clone()).collect();
         if let Err(e) = softphone_core::config::save_accounts(&crate::paths::config_file(ACCOUNTS_FILENAME), &configs) {
             tracing::warn!(%e, "failed to save accounts");
@@ -2739,6 +2891,14 @@ impl App {
     /// exists while the owning app is actually listening, so it has to be
     /// re-scanned on demand, not cached.
     fn refresh_secondary_output_targets(&self) -> Task<Message> {
+        if self.demo {
+            let (_, outputs) = demo::devices();
+            let apps = vec![softphone_media::AudioDevice {
+                id: "discord-capture".into(),
+                description: "Discord — WEBRTC VoiceEngine".into(),
+            }];
+            return Task::done(Message::SecondaryOutputTargetsLoaded(outputs, apps));
+        }
         Task::future(async {
             let (sinks, app_streams) = tokio::task::spawn_blocking(|| {
                 let sinks = softphone_media::devices::list_output_devices().unwrap_or_else(|e| {
@@ -2761,6 +2921,14 @@ impl App {
     /// method's doc comment for why this is re-scanned on demand rather than
     /// cached from boot/the Audio settings window.
     fn refresh_secondary_input_targets(&self) -> Task<Message> {
+        if self.demo {
+            let (inputs, _) = demo::devices();
+            let apps = vec![softphone_media::AudioDevice {
+                id: "discord-playback".into(),
+                description: "Discord — WEBRTC VoiceEngine".into(),
+            }];
+            return Task::done(Message::SecondaryInputTargetsLoaded(inputs, apps));
+        }
         Task::future(async {
             let (inputs, app_streams) = tokio::task::spawn_blocking(|| {
                 let inputs = softphone_media::devices::list_input_devices().unwrap_or_else(|e| {
@@ -2847,6 +3015,9 @@ impl App {
                 let capture_target = self.audio_devices.input_device.clone();
                 let playback_target = self.audio_devices.output_device.clone();
                 let label = format!("OxideSip Acct{} Line {} (early)", account + 1, idx + 1);
+                if self.demo {
+                    return Task::none();
+                }
                 Task::future(async move {
                     let result = MediaSession::start(
                         reserved,
@@ -2988,7 +3159,11 @@ impl App {
                     direction,
                     media: None,
                     dtmf_feedback: Vec::new(),
-                    answered_at: Instant::now(),
+                    answered_at: if self.demo {
+                        Instant::now() - Duration::from_secs(134)
+                    } else {
+                        Instant::now()
+                    },
                     input_level: 0.0,
                     output_level: 0.0,
                     muted: false,
@@ -3005,7 +3180,13 @@ impl App {
                 let playback_target = self.audio_devices.output_device.clone();
                 let label = format!("OxideSip Acct{} Line {}", account + 1, idx + 1);
                 let post_dial_id = id.clone();
+                let demo = self.demo;
                 let media_task = Task::future(async move {
+                    if demo {
+                        // No audio in demo mode; the pending socket is just
+                        // dropped. `media_ready` reports true for demo calls.
+                        return Message::Tick;
+                    }
                     let result = MediaSession::start(
                         reserved,
                         remote.remote_addr,
@@ -3421,6 +3602,72 @@ impl App {
             }
             _ => Task::none(),
         }
+    }
+
+    /// Time since `since`, frozen during screenshot runs (see `frozen_clock`).
+    pub(crate) fn elapsed(&self, since: Instant) -> Duration {
+        match self.frozen_clock {
+            Some(frozen) => frozen.saturating_duration_since(since),
+            None => since.elapsed(),
+        }
+    }
+
+    /// Whether a call's audio pipeline is up — always true in demo mode,
+    /// where no `MediaSession` is ever started.
+    pub(crate) fn media_ready(&self, media: &Option<MediaSession>) -> bool {
+        self.demo || media.is_some()
+    }
+
+    /// `--screenshot`: tear down the previous page's staging, set up the
+    /// next one, or exit when the queue is empty.
+    fn stage_next_shot(&mut self) -> Task<Message> {
+        let Some(plan) = &mut self.shots else {
+            return Task::none();
+        };
+        let previous = plan.current.take();
+        plan.frames = 0;
+        let Some(page) = plan.queue.pop_front() else {
+            tracing::info!("screenshot run complete");
+            return iced::exit();
+        };
+        plan.current = Some(page);
+        let mut tasks = Vec::new();
+        if previous == Some(ShotPage::Incoming) {
+            let ringing: Vec<(usize, CallId)> = incoming::ringing_calls(self)
+                .iter()
+                .map(|c| (c.account, c.id.clone()))
+                .collect();
+            for (account, id) in ringing {
+                tasks.push(self.decline_call(account, id));
+            }
+        }
+        match page {
+            ShotPage::Phone => self.navigate(Page::Phone),
+            ShotPage::PhoneActive => {
+                self.navigate(Page::Phone);
+                self.dial_input = "2004".to_string();
+                tasks.push(self.handle_call_pressed());
+            }
+            ShotPage::Incoming => {
+                self.navigate(Page::Phone);
+                demo::trigger(demo::Trigger::Incoming {
+                    account: 0,
+                    caller: demo::demo_caller(),
+                });
+            }
+            ShotPage::Contacts => self.navigate(Page::Contacts),
+            ShotPage::History => self.navigate(Page::History),
+            ShotPage::SettingsAccounts => {
+                tasks.push(self.update_inner(Message::SettingsSectionSelected(SettingsSection::Accounts)))
+            }
+            ShotPage::SettingsAudio => {
+                tasks.push(self.update_inner(Message::SettingsSectionSelected(SettingsSection::Audio)))
+            }
+            ShotPage::SettingsCalls => {
+                tasks.push(self.update_inner(Message::SettingsSectionSelected(SettingsSection::Calls)))
+            }
+        }
+        Task::batch(tasks)
     }
 
     /// Switches the main window to `page`.

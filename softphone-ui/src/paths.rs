@@ -18,6 +18,20 @@
 
 use std::path::PathBuf;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static PERSISTENCE: AtomicBool = AtomicBool::new(true);
+
+/// Demo / screenshot runs switch persistence off so they never touch the
+/// user's real configuration; every `save` in the UI crate checks this.
+pub fn set_persistence(enabled: bool) {
+    PERSISTENCE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn persistence_enabled() -> bool {
+    PERSISTENCE.load(Ordering::Relaxed)
+}
+
 fn config_dir() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join("oxidesip");
@@ -31,7 +45,7 @@ fn config_dir() -> PathBuf {
 /// yet but a CWD-relative one does.
 pub fn config_file(filename: &str) -> PathBuf {
     let new_path = config_dir().join(filename);
-    if !new_path.exists() {
+    if persistence_enabled() && !new_path.exists() {
         let old_path = PathBuf::from(".").join(filename);
         if old_path.exists()
             && let Ok(contents) = std::fs::read(&old_path)

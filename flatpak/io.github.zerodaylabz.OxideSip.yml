@@ -60,6 +60,22 @@ modules:
         /app/share/applications/io.github.zerodaylabz.OxideSip.desktop
       - install -Dm644 packaging/io.github.zerodaylabz.OxideSip.svg
         /app/share/icons/hicolor/scalable/apps/io.github.zerodaylabz.OxideSip.svg
+      - install -Dm644 packaging/io.github.zerodaylabz.OxideSip.metainfo.xml
+        /app/share/metainfo/io.github.zerodaylabz.OxideSip.metainfo.xml
+      - install -Dm644 packaging/icons/16.png
+        /app/share/icons/hicolor/16x16/apps/io.github.zerodaylabz.OxideSip.png
+      - install -Dm644 packaging/icons/32.png
+        /app/share/icons/hicolor/32x32/apps/io.github.zerodaylabz.OxideSip.png
+      - install -Dm644 packaging/icons/48.png
+        /app/share/icons/hicolor/48x48/apps/io.github.zerodaylabz.OxideSip.png
+      - install -Dm644 packaging/icons/64.png
+        /app/share/icons/hicolor/64x64/apps/io.github.zerodaylabz.OxideSip.png
+      - install -Dm644 packaging/icons/128.png
+        /app/share/icons/hicolor/128x128/apps/io.github.zerodaylabz.OxideSip.png
+      - install -Dm644 packaging/icons/256.png
+        /app/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.OxideSip.png
+      - install -Dm644 packaging/icons/512.png
+        /app/share/icons/hicolor/512x512/apps/io.github.zerodaylabz.OxideSip.png
     sources:
       - type: dir
         path: ..

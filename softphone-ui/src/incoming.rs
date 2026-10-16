@@ -126,7 +126,7 @@ fn card<'a>(app: &'a App, t: &theme::Tokens, call: &Ringing<'a>, primary: bool) 
     let header = row![
         icons::bell_ring(16.0, t.warning),
         text("Incoming call").size(theme::text_size::BODY).color(muted(t)),
-        text(format_elapsed(call.ringing_since.elapsed()))
+        text(format_elapsed(app.elapsed(call.ringing_since)))
             .size(theme::text_size::BODY)
             .font(iced::Font::MONOSPACE)
             .color(muted(t)),

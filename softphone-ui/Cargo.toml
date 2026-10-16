@@ -59,7 +59,15 @@ name = "oxidesip"
 assets = [
     { source = "target/release/oxidesip", dest = "/usr/bin/oxidesip", mode = "755" },
     { source = "packaging/io.github.zerodaylabz.OxideSip.desktop", dest = "/usr/share/applications/io.github.zerodaylabz.OxideSip.desktop", mode = "644" },
+    { source = "packaging/io.github.zerodaylabz.OxideSip.metainfo.xml", dest = "/usr/share/metainfo/io.github.zerodaylabz.OxideSip.metainfo.xml", mode = "644" },
+    { source = "packaging/io.github.zerodaylabz.OxideSip.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.zerodaylabz.OxideSip.svg", mode = "644" },
+    { source = "packaging/icons/16.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
+    { source = "packaging/icons/32.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
+    { source = "packaging/icons/48.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
+    { source = "packaging/icons/64.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
+    { source = "packaging/icons/128.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
     { source = "packaging/icons/256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
+    { source = "packaging/icons/512.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.zerodaylabz.OxideSip.png", mode = "644" },
 ]
 
 # Consumed by `cargo deb` (see .github/workflows/release.yml) to build a
@@ -80,5 +88,13 @@ copyright = "2026, ZeroDay-Labz"
 assets = [
     ["target/release/oxidesip", "usr/bin/", "755"],
     ["../packaging/io.github.zerodaylabz.OxideSip.desktop", "usr/share/applications/", "644"],
-    ["../packaging/icons/256.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["../packaging/io.github.zerodaylabz.OxideSip.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../packaging/io.github.zerodaylabz.OxideSip.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../packaging/icons/16.png", "usr/share/icons/hicolor/16x16/apps/io.github.zerodaylabz.OxideSip.png", "644"],
+    ["../packaging/icons/32.png", "usr/share/icons/hicolor/32x32/apps/io.github.zerodaylabz.OxideSip.png", "644"],
+    ["../packaging/icons/48.png", "usr/share/icons/hicolor/48x48/apps/io.github.zerodaylabz.OxideSip.png", "644"],
+    ["../packaging/icons/64.png", "usr/share/icons/hicolor/64x64/apps/io.github.zerodaylabz.OxideSip.png", "644"],
+    ["../packaging/icons/128.png", "usr/share/icons/hicolor/128x128/apps/io.github.zerodaylabz.OxideSip.png", "644"],
+    ["../packaging/icons/256.png", "usr/share/icons/hicolor/256x256/apps/io.github.zerodaylabz.OxideSip.png", "644"],
+    ["../packaging/icons/512.png", "usr/share/icons/hicolor/512x512/apps/io.github.zerodaylabz.OxideSip.png", "644"],
 ]

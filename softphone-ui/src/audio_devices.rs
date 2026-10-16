@@ -18,6 +18,9 @@ pub fn load() -> AudioDeviceConfig {
 }
 
 pub fn save(config: &AudioDeviceConfig) -> std::io::Result<()> {
+    if !crate::paths::persistence_enabled() {
+        return Ok(());
+    }
     let text = toml::to_string_pretty(config).unwrap_or_default();
     std::fs::write(crate::paths::config_file(AUDIO_DEVICES_FILENAME), text)
 }

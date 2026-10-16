@@ -9,7 +9,6 @@ use crate::ui::components::{
 use crate::{branding, icons};
 use iced::widget::{column, container, row, text};
 use iced::{Alignment, Color, Element, Length};
-use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
@@ -20,14 +19,14 @@ pub fn view<'a>(
     media_ready: bool,
     is_muted: bool,
     on_hold: bool,
-    answered_at: Instant,
+    elapsed: std::time::Duration,
 ) -> Element<'a, Message> {
     let (status, status_color) = if !media_ready {
         ("Connecting…".to_string(), t.warning)
     } else if on_hold {
         ("On hold".to_string(), t.warning)
     } else {
-        (format_elapsed(answered_at.elapsed()), t.success)
+        (format_elapsed(elapsed), t.success)
     };
     let name = contact_name_for(contacts, number).or(remote_name).unwrap_or(number);
     let header = row![
