@@ -22,19 +22,18 @@ use tokio_util::sync::CancellationToken;
 // latency on a live 3-way call.
 const BRIDGE_RING_CAPACITY: usize = 4_000; // ~0.5s of 8kHz mono i16 samples
 
-// Must comfortably exceed pipewire_io.rs's MAX_BUFFERED_SAMPLES (~2.5s) —
-// see that constant's doc comment for why the playback side needs this much
-// headroom on this system. Used for both rings for simplicity; the capture
-// side doesn't need nearly as much (Notify-driven draining keeps it close
-// to empty in steady state) but the memory cost either way is trivial
-// (tens of KB).
-const RING_CAPACITY: usize = 24_000; // ~3s of 8kHz mono i16 samples
+// Must comfortably exceed the deepest pipewire_io.rs's adaptive playback
+// buffer lets the ring get (MARGIN_MAX + a packet + BURST_HEADROOM, 320ms)
+// before it skips ahead — this is only the hard limit on how much a burst
+// can queue before that happens. Used for
+// both rings for simplicity; the capture side needs even less
+// (Notify-driven draining keeps it close to empty in steady state).
+const RING_CAPACITY: usize = 4_000; // 0.5s of 8kHz mono i16 samples
 const SAMPLES_PER_PACKET: usize = 160; // 20ms @ 8000Hz
 const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
-// 5 packets = 100ms of reordering tolerance. Sustained clock drift/backlog
-// growth (the dominant cause of both audible dropouts and rising latency on
-// a real call) is now handled separately by `pipewire_io.rs`'s buffer-depth
-// catch-up, so this window only needs to cover genuine short-range
+// 5 packets = 100ms of reordering tolerance. Clock drift/backlog growth is
+// handled separately by `pipewire_io.rs`'s buffer-depth catch-up, so this
+// window only needs to cover genuine short-range
 // out-of-order arrival — keeping it modest bounds the worst-case latency a
 // real gap can add.
 const REORDER_WINDOW: usize = 5;
@@ -498,8 +497,7 @@ impl Drop for MediaSession {
 /// `notify`, which tracks PipeWire's real audio callback cadence instead of
 /// an independent wall-clock timer — a fixed timer here previously caused
 /// periodic dropouts because it ran at a slightly different rate than
-/// PipeWire's actual delivery cadence (see the plan doc's root-cause
-/// analysis for the exact numbers on this system).
+/// PipeWire's actual delivery cadence.
 async fn wait_for_data(notify: &Notify) {
     let _ = tokio::time::timeout(NOTIFY_TIMEOUT, notify.notified()).await;
 }

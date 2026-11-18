@@ -24,6 +24,11 @@
 //! a pragmatic fix for what's otherwise an unresolved WirePlumber scheduling
 //! quirk.
 //!
+//! (Since resolved: it was never WirePlumber. Our playback callbacks filled
+//! the whole stream buffer instead of the `requested` frames — see
+//! `pipewire_io.rs`'s buffering comment. `pw-play` still works
+//! well here, so this module keeps using it.)
+//!
 //! Two earlier iterations of this module both had real problems:
 //!
 //! - Spawning a brand-new `pw-play <file>` process per sound was audibly

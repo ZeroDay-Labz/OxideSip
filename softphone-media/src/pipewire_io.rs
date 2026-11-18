@@ -3,7 +3,7 @@
 //! blocking OS thread, bridging PCM i16 samples to/from ring buffers, and
 //! signaling `session.rs`'s RTP send loop via a shared `Notify` so
 //! packetization tracks PipeWire's real audio callback cadence instead of
-//! an independent timer (see the plan doc's root-cause analysis).
+//! an independent timer.
 
 use crate::error::MediaError;
 use pipewire as pw;
@@ -24,36 +24,72 @@ const CHANNELS: u32 = 1;
 // time). Hardcoded rather than adding a direct dependency on the `-sys`
 // crate for one constant.
 const SPA_AUDIO_CHANNEL_MONO: u32 = 2;
-// On this system, the playback stream's `process()` callback was measured
-// (via direct instrumentation, not inferred) firing only once every ~1.5s,
-// requesting ~12288 frames each time — not the ~170-frame/~21ms cadence a
-// PipeWire client normally gets. This was true regardless of target device,
-// media.role (several values and none at all), NODE_LATENCY hints,
-// node.always-process, realtime thread scheduling (pw_thread_loop +
-// client.conf's rt module), dropping the RT_PROCESS connect flag, a plain
-// MainLoopRc instead of ThreadLoopRc, or the graph's clock.max-quantum
-// setting — all tested directly across two separate investigation passes,
-// none changed it. A *separate*, ordinary PipeWire client (`pw-play`)
-// confirmed fast (~100ms) through this exact same WirePlumber loopback
-// route (`input.loopback.sink.role.multimedia`, verified via `pw-dump`),
-// so this is specific to something about a `pw::stream`-API client's
-// negotiation on this system, not a global graph/hardware limit — but the
-// actual trigger remains unresolved after exhausting every client-side
-// lever the pipewire-rs API exposes.
+const STRIDE: usize = mem::size_of::<i16>();
+
+// Playback buffering, in samples (8kHz mono, so 8 samples = 1ms). This is
+// the receive-side latency the app itself adds, so it is kept as small as
+// ordinary network jitter allows.
 //
-// `TARGET_BUFFERED_SAMPLES`/`MAX_BUFFERED_SAMPLES` below are what actually
-// keep audio continuous once a call is running (steady-state has to survive
-// a callback that can demand ~12288 frames at once). `PREBUFFER_SAMPLES` is
-// a much smaller, separate concern: only the *first couple of callbacks at
-// the very start of a call* need it, so it doesn't need to be sized to the
-// full pathological callback demand the way the steady-state ceiling does —
-// by the time the second real callback rolls around ~1.5s later, normal RTP
-// arrival has already accumulated a comparable amount "for free". Gating
-// audible playback on a full ~2s prebuffer was adding a flat ~2s of pure
-// startup latency on top of the ~1.5s callback-interval floor, which is a
-// meaningful chunk of the "5 seconds of delay" a live call feels like — cut
-// down to just enough to avoid literal dead air the instant a call answers.
-const PREBUFFER_SAMPLES: usize = 1_600; // ~200ms @ 8kHz mono
+// History, because these used to be ~2s and the code around them said so:
+// the playback callback filled the *whole* mapped stream buffer (~12288
+// frames) on every call instead of the `requested` frames the graph asked
+// for (43-171, depending on the graph's quantum). PipeWire doesn't call `process()`
+// again until what was queued has played, so the callback fired once every
+// 12288 / 8000Hz = 1.536s, and every buffer here had to be sized to survive
+// that. It was long misread as a WirePlumber/scheduling quirk; `pw-play` was
+// fast on the same route simply because it honours `requested`.
+// `fill_playback` does now too, so the callback runs once per graph cycle
+// (every 5-21ms).
+//
+// The buffer is adaptive rather than a fixed depth, since how much jitter
+// there is to absorb depends on the network and the PBX and changes during a
+// call. See `fill_playback` for the mechanism; in short, it keeps the
+// *lowest* depth the ring reaches (its trough) at `margin`, and learns
+// `margin` from underruns:
+//
+// - Every ADAPT_WINDOW it looks at the trough over that window. Anything
+//   above `margin` there was never used — pure delay — and is removed; a
+//   trough below `margin` (the far end's clock running slower than ours,
+//   draining the ring) is topped back up before it becomes an underrun.
+//   Both are done by dropping or repeating one sample in every
+//   SLEW_INTERVAL, which is inaudible, unless the excess is large.
+// - An underrun raises `margin` by however long the ring stayed dry, i.e. by
+//   how late the audio actually was.
+// - `margin` then decays slowly, so a brief bad patch doesn't cost latency
+//   for the rest of the call.
+//
+// On a quiet LAN this settles at a ~10ms trough (~20ms average depth); on a
+// jittery link it settles at whatever that link needs.
+const PACKET_SAMPLES: usize = 160; // one 20ms RTP packet
+const MARGIN_START: usize = 160; // 20ms
+const MARGIN_MIN: usize = 80; // 10ms
+const MARGIN_MAX: usize = 1_600; // 200ms
+// Smallest raise per underrun, and the smallest excess worth skipping.
+const MARGIN_STEP: usize = 80; // 10ms
+// A ring dry for longer than this was a paused stream (hold, silence
+// suppression), not jitter — don't learn from it.
+const STALL_SAMPLES: usize = 2_400; // 300ms
+// More than this far above the starting depth is a burst (a network stall
+// releasing, or audio that queued before the stream started): skip it now
+// rather than waiting for the next window.
+const BURST_HEADROOM: usize = 800; // 100ms
+const ADAPT_WINDOW: usize = 2 * SAMPLE_RATE as usize; // 2s of played frames
+// Drop/repeat at most one sample per this many played: a 1.25% speed change.
+const SLEW_INTERVAL: usize = 80;
+// Smallest trough error worth correcting.
+const SLEW_MIN: usize = 16; // 2ms
+// An excess too big to slew away within one window is skipped instead.
+const SKIP_ABOVE: usize = 200; // 25ms
+// Lower `margin` by MARGIN_DECAY once per this many underrun-free windows:
+// 1ms per 32s, so a 10ms raise is held for about five minutes.
+const DECAY_EVERY_WINDOWS: u32 = 16;
+const MARGIN_DECAY: usize = 8; // 1ms
+// Frames to write if a server doesn't report `requested` (it has since
+// PipeWire 0.3.49): one RTP packet's worth, never the whole buffer.
+const FALLBACK_FRAMES: usize = 160;
+// Log playback stats once per this many frames played (~5s), whatever
+// quantum the graph happens to be running at.
+const STATS_EVERY_FRAMES: usize = 5 * SAMPLE_RATE as usize;
 
 static PW_INIT: Once = Once::new();
 
@@ -67,32 +103,15 @@ enum PwCommand {
     Terminate,
 }
 
-/// A plain `std::thread::JoinHandle` + `mpsc::Sender`, same shape as before —
-/// but what runs *inside* that thread changed fundamentally. It used to call
-/// `MainLoopRc::run()` directly, meaning all audio callback processing ran on
-/// this manually-spawned thread, which gets ordinary `SCHED_OTHER` scheduling
-/// (confirmed on this system via `ps -eLo policy,pri` — priority 19, no RT
-/// class at all). Under any real desktop load, a non-RT thread with 20ms
-/// audio deadlines can go unscheduled for a second or more; when it finally
-/// does run, PipeWire's client-side stream code hands it a buffer sized to
-/// cover however much time actually elapsed — observed directly on this
-/// system as ~12288-frame (1.5s) callbacks instead of the expected
-/// ~170-frame/~21ms ones. Since that's larger than any ring buffer we'd
-/// reasonably keep, every callback underran into mostly silence: this, not
-/// clock drift or reorder-window sizing, was the dominant cause of both the
-/// dropouts and the multi-second echo-test latency.
-///
-/// Now `run()` instead creates a [`pw::thread_loop::ThreadLoopRc`] and calls
-/// `.start()`, which spawns *PipeWire's own* internal thread to do the actual
-/// callback processing — the same realtime-scheduling mechanism (via rtkit)
-/// that the PipeWire server's own threads use (confirmed separately:
-/// rtkit-daemon is active and already grants the server RT priority on this
-/// system). This "owner" thread just holds the `Rc`-based handles alive
-/// (needed since `ThreadLoopRc`/the `Context`/streams aren't `Send`, so they
-/// can't be moved into `spawn_blocking` for shutdown the way the old
-/// `std::thread::JoinHandle` was) and blocks on `shutdown_rx` until told to
-/// stop — it never touches audio itself, so its own lack of RT scheduling is
-/// irrelevant.
+/// A plain `std::thread::JoinHandle` + `mpsc::Sender` for the thin "owner"
+/// thread. That thread does no audio work: `run()` creates a
+/// [`pw::thread_loop::ThreadLoopRc`] and calls `.start()`, which spawns
+/// *PipeWire's own* internal thread to run the stream callbacks — with
+/// realtime scheduling via rtkit once `client.conf` is loaded (see `run`).
+/// The owner thread just holds the `Rc`-based handles alive (`ThreadLoopRc`/
+/// the `Context`/streams aren't `Send`, so they can't be moved elsewhere for
+/// shutdown) and blocks on `shutdown_rx` until told to stop, so its own
+/// ordinary `SCHED_OTHER` scheduling doesn't matter.
 pub struct PwThreadHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     shutdown: std::sync::mpsc::Sender<PwCommand>,
@@ -137,24 +156,209 @@ struct CaptureUserData {
 struct PlaybackUserData {
     cons: HeapCons<i16>,
     output_level_bits: Arc<AtomicU32>,
-    prebuffered: bool,
-    underrun_frames: u64,
+    state: PlaybackState,
     callback_count: u64,
+    frames_since_stats: usize,
 }
 
-// Target/ceiling for how much decoded audio is allowed to sit in the
-// playback ring buffer at once, in samples (8kHz mono, so 1 sample = 0.125ms).
-// Sized around the real measured callback cadence on this system (~1.5s,
-// ~12288 frames per call — see `PREBUFFER_SAMPLES`'s doc comment) rather
-// than the ~20ms cadence a normal PipeWire client gets, so the catch-up
-// mechanism below doesn't fight the buffering `PREBUFFER_SAMPLES` actually
-// needs. This still protects against unbounded growth from ordinary VoIP
-// clock drift (our clock vs. FreePBX's RTP transmit clock) layered on top
-// of that baseline: when occupancy exceeds `MAX_BUFFERED_SAMPLES`, the
-// playback callback discards the stale backlog down to
-// `TARGET_BUFFERED_SAMPLES` rather than playing through it.
-const TARGET_BUFFERED_SAMPLES: usize = 16_000; // ~2s
-const MAX_BUFFERED_SAMPLES: usize = 20_000; // ~2.5s
+/// Per-stream adaptive playback buffering state, owned by the realtime
+/// callback. See the constants above for the idea.
+struct PlaybackState {
+    /// `false` until the ring holds `margin` plus one packet, and again
+    /// after every underrun — silence is played while it's `false`.
+    prebuffered: bool,
+    /// Depth, in samples, the ring's trough is steered to.
+    margin: usize,
+    /// Lowest depth seen (after serving a callback) in the current window.
+    low_water: usize,
+    /// Frames played in the current window.
+    window_frames: usize,
+    /// Samples still to drop (positive) or repeat (negative), one per
+    /// `SLEW_INTERVAL` played frames; `slew_credit` counts those frames.
+    slew: isize,
+    slew_credit: usize,
+    /// Last sample played, for repeating.
+    last_sample: i16,
+    /// Consecutive windows without an underrun, for `margin`'s decay.
+    clean_windows: u32,
+    /// Set by an underrun until audio arrives again; `dry_samples` counts
+    /// how much silence was played in between.
+    recovering: bool,
+    dry_samples: usize,
+    /// Number of times the ring ran dry mid-playback.
+    underruns: u64,
+    /// Samples discarded to shed delay (slewed, trimmed or burst-skipped).
+    trimmed_samples: u64,
+    /// Samples repeated to top the ring back up.
+    stretched_samples: u64,
+}
+
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            prebuffered: false,
+            margin: MARGIN_START,
+            low_water: usize::MAX,
+            window_frames: 0,
+            slew: 0,
+            slew_credit: 0,
+            last_sample: 0,
+            clean_windows: 0,
+            recovering: false,
+            dry_samples: 0,
+            underruns: 0,
+            trimmed_samples: 0,
+            stretched_samples: 0,
+        }
+    }
+}
+
+impl PlaybackState {
+    fn reset_window(&mut self) {
+        self.low_water = usize::MAX;
+        self.window_frames = 0;
+    }
+}
+
+/// What one `fill_playback` call wrote.
+#[derive(Default)]
+struct PlaybackFill {
+    /// Frames written to the output buffer (the chunk size to report).
+    frames: usize,
+    /// Peak absolute sample value among them, for the level meter.
+    peak: u16,
+}
+
+/// Fills one playback callback's worth of audio from `cons` into `out`
+/// (the stream buffer's mapped bytes, S16LE mono). Shared by the primary and
+/// secondary playback streams; touches no PipeWire types so it can be
+/// unit-tested.
+///
+/// Writes `requested` frames, not `out.len() / STRIDE`: the mapped buffer is
+/// far larger (~12288 frames) than one graph cycle (43-171 frames), and a
+/// stream that queues the whole thing is not called again until all of it
+/// has played — 1.5s later. See the buffering constants' comment.
+fn fill_playback(cons: &mut HeapCons<i16>, state: &mut PlaybackState, out: &mut [u8], requested: u64) -> PlaybackFill {
+    let max_frames = out.len() / STRIDE;
+    let frames = if requested > 0 {
+        usize::try_from(requested).unwrap_or(usize::MAX).min(max_frames)
+    } else {
+        max_frames.min(FALLBACK_FRAMES)
+    };
+
+    if !state.prebuffered && state.recovering && cons.occupied_len() > 0 {
+        // Audio is back after an underrun. How long the ring stayed dry
+        // (counted below) is how much more cushion would have covered it.
+        if state.dry_samples <= STALL_SAMPLES {
+            state.margin = (state.margin + state.dry_samples.max(MARGIN_STEP)).min(MARGIN_MAX);
+        }
+        state.recovering = false;
+    }
+
+    // Depth to (re)start playing at: with packets landing 160 samples at a
+    // time, starting one packet above `margin` puts the trough at `margin`.
+    let start_depth = state.margin + PACKET_SAMPLES;
+    let occupied = cons.occupied_len();
+    if occupied > start_depth + BURST_HEADROOM {
+        state.trimmed_samples += cons.skip(occupied - start_depth) as u64;
+        state.slew = 0;
+        state.reset_window();
+    }
+    if !state.prebuffered && cons.occupied_len() >= start_depth {
+        state.prebuffered = true;
+        state.slew = 0;
+        state.reset_window();
+    }
+
+    // Pending slew: this callback's share of samples to drop or repeat.
+    let mut repeat = 0usize;
+    if state.prebuffered && state.slew != 0 {
+        state.slew_credit += frames;
+        let n = (state.slew_credit / SLEW_INTERVAL)
+            .min(state.slew.unsigned_abs())
+            .min(frames);
+        state.slew_credit -= n * SLEW_INTERVAL;
+        if state.slew > 0 {
+            state.trimmed_samples += cons.skip(n) as u64;
+            state.slew -= n as isize;
+        } else {
+            repeat = n;
+            state.slew += n as isize;
+            state.stretched_samples += n as u64;
+        }
+        if state.slew == 0 {
+            // Measure the result from scratch, not mixed with what the
+            // trough was before the correction.
+            state.slew_credit = 0;
+            state.reset_window();
+        }
+    }
+
+    let mut scratch = [0i16; 256];
+    let mut written = 0usize;
+    let mut peak: u16 = 0;
+    // The last `repeat` frames of this callback are not taken from the ring.
+    let from_ring = frames - repeat;
+    while written < from_ring {
+        let want = (from_ring - written).min(scratch.len());
+        let got = if state.prebuffered {
+            cons.pop_slice(&mut scratch[..want])
+        } else {
+            0
+        };
+        // Underrun or not-yet-prebuffered: silence-fill rather than block.
+        scratch[got..want].fill(0);
+        if state.prebuffered && got < want {
+            // Ran dry. Go back to prebuffering so the cushion is rebuilt
+            // once, instead of running at zero depth and clicking on every
+            // callback that lands a moment before its packet does.
+            state.prebuffered = false;
+            state.slew = 0;
+            state.recovering = true;
+            state.dry_samples = want - got;
+            state.clean_windows = 0;
+            state.underruns += 1;
+        } else if state.recovering {
+            state.dry_samples = state.dry_samples.saturating_add(want - got);
+        }
+        for (i, &sample) in scratch[..want].iter().enumerate() {
+            peak = peak.max(sample.unsigned_abs());
+            let start = (written + i) * STRIDE;
+            out[start..start + STRIDE].copy_from_slice(&sample.to_le_bytes());
+        }
+        if want > 0 {
+            state.last_sample = scratch[want - 1];
+        }
+        written += want;
+    }
+    for frame in from_ring..frames {
+        peak = peak.max(state.last_sample.unsigned_abs());
+        let start = frame * STRIDE;
+        out[start..start + STRIDE].copy_from_slice(&state.last_sample.to_le_bytes());
+    }
+
+    if state.prebuffered && state.slew == 0 {
+        state.low_water = state.low_water.min(cons.occupied_len());
+        state.window_frames += frames;
+        if state.window_frames >= ADAPT_WINDOW {
+            // The trough never went below `low_water` this window, so
+            // whatever part of it is above `margin` was delay nobody needed;
+            // and if it is below `margin`, the ring is draining.
+            let excess = state.low_water as isize - state.margin as isize;
+            if excess > SKIP_ABOVE as isize {
+                state.trimmed_samples += cons.skip(excess as usize) as u64;
+            } else if excess.unsigned_abs() >= SLEW_MIN {
+                state.slew = excess;
+            }
+            state.clean_windows += 1;
+            if state.clean_windows.is_multiple_of(DECAY_EVERY_WINDOWS) {
+                state.margin = state.margin.saturating_sub(MARGIN_DECAY).max(MARGIN_MIN);
+            }
+            state.reset_window();
+        }
+    }
+    PlaybackFill { frames, peak }
+}
 
 /// Spawn the PipeWire thread. Blocks (briefly) until the streams are
 /// connected or setup fails, so callers get a real `Result` instead of
@@ -208,7 +412,7 @@ fn pw_err(e: pw::Error) -> MediaError {
 
 struct SecondaryPlaybackUserData {
     cons: HeapCons<i16>,
-    prebuffered: bool,
+    state: PlaybackState,
 }
 
 /// Spawns a playback-*only* PipeWire stream on its own thread — no capture
@@ -246,12 +450,11 @@ pub fn spawn_playback(
     }
 }
 
-/// Same buffering/prebuffer/catch-up behavior as `run`'s playback stream
-/// (see its callback and the `PREBUFFER_SAMPLES`/`*_BUFFERED_SAMPLES` doc
-/// comments) — deliberately duplicated rather than shared, since this
-/// stream's lifecycle (spun up/torn down per-call, independent of the
-/// primary capture+playback pair) doesn't fit cleanly into `run`'s combined
-/// setup without a much larger refactor for a single extra stream.
+/// Same buffering behavior as `run`'s playback stream (both go through
+/// `fill_playback`). The stream setup itself is deliberately separate rather
+/// than folded into `run`, since this stream's lifecycle (spun up/torn down
+/// per-call, independent of the primary capture+playback pair) doesn't fit
+/// `run`'s combined setup.
 fn run_playback_only(
     shutdown_rx: std::sync::mpsc::Receiver<PwCommand>,
     playback_cons: HeapCons<i16>,
@@ -276,7 +479,7 @@ fn run_playback_only(
 
     let playback_user_data = SecondaryPlaybackUserData {
         cons: playback_cons,
-        prebuffered: false,
+        state: PlaybackState::default(),
     };
 
     let _playback_listener = playback_stream
@@ -285,59 +488,23 @@ fn run_playback_only(
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            // How many frames the graph wants this cycle. Must be read
+            // before `datas_mut()` borrows the buffer — and must be honoured,
+            // see `fill_playback`.
+            let requested = buffer.requested();
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
             }
             let data = &mut datas[0];
-            let stride = mem::size_of::<i16>();
-            let n_frames = if let Some(slice) = data.data() {
-                let max_frames = slice.len() / stride;
-                let mut scratch = [0i16; 1024];
-                let mut written = 0usize;
-
-                if !user_data.prebuffered && user_data.cons.occupied_len() >= PREBUFFER_SAMPLES {
-                    user_data.prebuffered = true;
-                }
-
-                let occupied = user_data.cons.occupied_len();
-                if occupied > MAX_BUFFERED_SAMPLES {
-                    let mut to_discard = occupied - TARGET_BUFFERED_SAMPLES;
-                    let mut trash = [0i16; 1024];
-                    while to_discard > 0 {
-                        let n = to_discard.min(trash.len());
-                        let popped = user_data.cons.pop_slice(&mut trash[..n]);
-                        if popped == 0 {
-                            break;
-                        }
-                        to_discard -= popped;
-                    }
-                }
-
-                while written < max_frames {
-                    let want = (max_frames - written).min(scratch.len());
-                    let got = if user_data.prebuffered {
-                        user_data.cons.pop_slice(&mut scratch[..want])
-                    } else {
-                        0
-                    };
-                    for sample in &mut scratch[got..want] {
-                        *sample = 0;
-                    }
-                    for (i, sample) in scratch[..want].iter().enumerate() {
-                        let start = (written + i) * stride;
-                        slice[start..start + stride].copy_from_slice(&sample.to_le_bytes());
-                    }
-                    written += want;
-                }
-                max_frames
-            } else {
-                0
+            let fill = match data.data() {
+                Some(slice) => fill_playback(&mut user_data.cons, &mut user_data.state, slice, requested),
+                None => PlaybackFill::default(),
             };
             let chunk = data.chunk_mut();
             *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = stride as i32;
-            *chunk.size_mut() = (stride * n_frames) as u32;
+            *chunk.stride_mut() = STRIDE as i32;
+            *chunk.size_mut() = (STRIDE * fill.frames) as u32;
         })
         .register()
         .map_err(pw_err)?;
@@ -524,15 +691,8 @@ fn stream_properties(media_category: &str, target: Option<&str>, label: &str) ->
         *pw::keys::NODE_NAME => label,
         *pw::keys::NODE_DESCRIPTION => label,
         // Hint a 20ms (160 samples @ 8000Hz) processing granularity,
-        // matching our real RTP packetization interval. Without this,
-        // PipeWire was negotiating a default buffer far larger than
-        // anything we control (observed ~12288 frames / ~1.5s per
-        // callback on this system) — since that's larger than the ring
-        // buffer feeding it can ever hold, every single playback callback
-        // was guaranteed to underrun into mostly silence, which is what
-        // was actually causing both the dropouts and the multi-second
-        // echo-test latency (not the capture-timing/clock-drift issues
-        // addressed earlier, which were real but secondary).
+        // matching our RTP packetization interval, so the graph doesn't
+        // pick a larger quantum than a call needs on our account.
         *pw::keys::NODE_LATENCY => "160/8000",
     };
     if let Some(target) = target {
@@ -658,9 +818,9 @@ fn run(
     let playback_user_data = PlaybackUserData {
         cons: playback_cons,
         output_level_bits,
-        prebuffered: false,
-        underrun_frames: 0,
+        state: PlaybackState::default(),
         callback_count: 0,
+        frames_since_stats: 0,
     };
 
     let _playback_listener = playback_stream
@@ -669,90 +829,44 @@ fn run(
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            // How many frames the graph wants this cycle. Must be read
+            // before `datas_mut()` borrows the buffer — and must be honoured,
+            // see `fill_playback`.
+            let requested = buffer.requested();
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
             }
             let data = &mut datas[0];
-            let stride = mem::size_of::<i16>();
-            let n_frames = if let Some(slice) = data.data() {
-                let max_frames = slice.len() / stride;
-                let mut scratch = [0i16; 1024];
-                let mut written = 0usize;
-                let mut peak: u16 = 0;
-
-                if !user_data.prebuffered && user_data.cons.occupied_len() >= PREBUFFER_SAMPLES {
-                    user_data.prebuffered = true;
-                }
-
-                // Clock-drift catch-up: if backlog has grown past the
-                // ceiling, fast-forward through the stale excess rather than
-                // playing through ever-increasing latency. See the constants'
-                // doc comment for why this is needed at all.
-                let occupied = user_data.cons.occupied_len();
-                if occupied > MAX_BUFFERED_SAMPLES {
-                    let mut to_discard = occupied - TARGET_BUFFERED_SAMPLES;
-                    let mut trash = [0i16; 1024];
-                    while to_discard > 0 {
-                        let n = to_discard.min(trash.len());
-                        let popped = user_data.cons.pop_slice(&mut trash[..n]);
-                        if popped == 0 {
-                            break;
-                        }
-                        to_discard -= popped;
-                    }
-                    tracing::info!(
-                        occupied,
-                        discarded = occupied - TARGET_BUFFERED_SAMPLES - to_discard,
-                        "playback buffer catch-up: dropped stale backlog"
-                    );
-                }
-
-                while written < max_frames {
-                    let want = (max_frames - written).min(scratch.len());
-                    let got = if user_data.prebuffered {
-                        user_data.cons.pop_slice(&mut scratch[..want])
-                    } else {
-                        0
-                    };
-                    if got < want {
-                        user_data.underrun_frames += (want - got) as u64;
-                    }
-                    for sample in &mut scratch[got..want] {
-                        *sample = 0; // underrun/not-yet-prebuffered: silence-fill rather than block/repeat
-                    }
-                    for &sample in &scratch[..want] {
-                        peak = peak.max(sample.unsigned_abs());
-                    }
-                    for (i, sample) in scratch[..want].iter().enumerate() {
-                        let start = (written + i) * stride;
-                        slice[start..start + stride].copy_from_slice(&sample.to_le_bytes());
-                    }
-                    written += want;
-                }
-                let level = peak as f32 / i16::MAX as f32;
-                user_data.output_level_bits.store(level.to_bits(), Ordering::Relaxed);
-                user_data.callback_count += 1;
-                if user_data.callback_count.is_multiple_of(10) {
-                    // This system's real callback cadence is ~1.5s, not the
-                    // ~20ms a PipeWire client normally gets (see
-                    // PREBUFFER_SAMPLES's doc comment) — every 10 calls is
-                    // roughly every 15s, reasonable visibility without
-                    // spamming logs. Counterpart to send_loop's stats.
-                    tracing::info!(
-                        callback_count = user_data.callback_count,
-                        underrun_frames = user_data.underrun_frames,
-                        "playback callback stats"
-                    );
-                }
-                max_frames
-            } else {
-                0
+            let fill = match data.data() {
+                Some(slice) => fill_playback(&mut user_data.cons, &mut user_data.state, slice, requested),
+                None => PlaybackFill::default(),
             };
+            let level = fill.peak as f32 / i16::MAX as f32;
+            user_data.output_level_bits.store(level.to_bits(), Ordering::Relaxed);
+            user_data.callback_count += 1;
+            user_data.frames_since_stats += fill.frames;
+            if user_data.frames_since_stats >= STATS_EVERY_FRAMES {
+                user_data.frames_since_stats = 0;
+                // `buffered_ms` is the receive-side latency this stream is
+                // adding right now; counterpart to send_loop's stats.
+                tracing::info!(
+                    callback_count = user_data.callback_count,
+                    requested,
+                    frames = fill.frames,
+                    buffered_ms = user_data.cons.occupied_len() * 1000 / SAMPLE_RATE as usize,
+                    margin_ms = user_data.state.margin * 1000 / SAMPLE_RATE as usize,
+                    underruns = user_data.state.underruns,
+                    stretched_samples = user_data.state.stretched_samples,
+                    trimmed_samples = user_data.state.trimmed_samples,
+                    "playback callback stats"
+                );
+            }
+
             let chunk = data.chunk_mut();
             *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = stride as i32;
-            *chunk.size_mut() = (stride * n_frames) as u32;
+            *chunk.stride_mut() = STRIDE as i32;
+            *chunk.size_mut() = (STRIDE * fill.frames) as u32;
         })
         .register()
         .map_err(pw_err)?;
@@ -788,4 +902,278 @@ fn run(
     thread_loop.stop();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ringbuf::HeapRb;
+    use ringbuf::traits::Split;
+
+    const START_DEPTH: usize = MARGIN_START + PACKET_SAMPLES;
+
+    /// A ring pre-loaded with `n` non-zero samples, and a stream-sized
+    /// output buffer (12288 frames, like the real mapped buffer).
+    fn setup(n: usize) -> (HeapProd<i16>, HeapCons<i16>, Vec<u8>) {
+        let (mut prod, cons) = HeapRb::<i16>::new(4_000).split();
+        push(&mut prod, n);
+        (prod, cons, vec![0xAAu8; 12_288 * STRIDE])
+    }
+
+    fn push(prod: &mut HeapProd<i16>, n: usize) {
+        assert_eq!(prod.push_iter(std::iter::repeat_n(1000i16, n)), n);
+    }
+
+    fn sample(out: &[u8], frame: usize) -> i16 {
+        i16::from_le_bytes([out[frame * STRIDE], out[frame * STRIDE + 1]])
+    }
+
+    /// A steady call for `packets` packets: one 160-sample packet every
+    /// 20ms, one 40-frame (5ms) callback four times per packet.
+    fn run_steady(
+        prod: &mut HeapProd<i16>,
+        cons: &mut HeapCons<i16>,
+        state: &mut PlaybackState,
+        out: &mut [u8],
+        packets: usize,
+    ) {
+        for _ in 0..packets {
+            push(prod, PACKET_SAMPLES);
+            for _ in 0..4 {
+                fill_playback(cons, state, out, 40);
+            }
+        }
+    }
+
+    const PACKETS_PER_WINDOW: usize = ADAPT_WINDOW / PACKET_SAMPLES;
+
+    #[test]
+    fn writes_only_the_requested_frames() {
+        let (_prod, mut cons, mut out) = setup(START_DEPTH);
+        let mut state = PlaybackState::default();
+        let fill = fill_playback(&mut cons, &mut state, &mut out, 171);
+        assert_eq!(fill.frames, 171);
+        assert_eq!(fill.peak, 1000);
+        assert_eq!(cons.occupied_len(), START_DEPTH - 171);
+        assert_eq!(sample(&out, 170), 1000);
+        // Nothing past the requested frames is touched.
+        assert_eq!(out[171 * STRIDE], 0xAA);
+    }
+
+    #[test]
+    fn requested_is_capped_to_the_buffer() {
+        let (_prod, mut cons, _) = setup(START_DEPTH);
+        let mut out = vec![0u8; 100 * STRIDE];
+        let fill = fill_playback(&mut cons, &mut PlaybackState::default(), &mut out, 171);
+        assert_eq!(fill.frames, 100);
+    }
+
+    #[test]
+    fn missing_requested_falls_back_to_one_packet() {
+        let (_prod, mut cons, mut out) = setup(START_DEPTH);
+        let fill = fill_playback(&mut cons, &mut PlaybackState::default(), &mut out, 0);
+        assert_eq!(fill.frames, FALLBACK_FRAMES);
+    }
+
+    #[test]
+    fn silent_until_start_depth() {
+        let (mut prod, mut cons, mut out) = setup(START_DEPTH - 1);
+        let mut state = PlaybackState::default();
+        let fill = fill_playback(&mut cons, &mut state, &mut out, 171);
+        assert_eq!((fill.frames, fill.peak), (171, 0));
+        assert_eq!(
+            cons.occupied_len(),
+            START_DEPTH - 1,
+            "nothing consumed while prebuffering"
+        );
+        assert_eq!(state.underruns, 0, "waiting to prebuffer is not an underrun");
+
+        push(&mut prod, 1);
+        let fill = fill_playback(&mut cons, &mut state, &mut out, 171);
+        assert_eq!(fill.peak, 1000);
+    }
+
+    #[test]
+    fn burst_is_skipped_down_to_start_depth() {
+        let (_prod, mut cons, mut out) = setup(START_DEPTH + BURST_HEADROOM + 1);
+        let mut state = PlaybackState::default();
+        fill_playback(&mut cons, &mut state, &mut out, 40);
+        assert_eq!(cons.occupied_len(), START_DEPTH - 40);
+        assert_eq!(state.trimmed_samples as usize, BURST_HEADROOM + 1);
+    }
+
+    #[test]
+    fn unused_depth_is_trimmed_after_one_window() {
+        // Starts 300ms deep (inside the burst headroom, so not skipped
+        // outright) on a perfectly steady stream: none of it is needed.
+        let (mut prod, mut cons, mut out) = setup(START_DEPTH + 600);
+        let mut state = PlaybackState::default();
+        run_steady(&mut prod, &mut cons, &mut state, &mut out, PACKETS_PER_WINDOW);
+        // Trough (end of a packet interval) is now exactly `margin`.
+        assert_eq!(cons.occupied_len(), MARGIN_START);
+        let trimmed = state.trimmed_samples;
+        assert!(trimmed > 0);
+
+        // And it stays there: no further trimming, no underruns.
+        run_steady(&mut prod, &mut cons, &mut state, &mut out, PACKETS_PER_WINDOW * 3);
+        assert_eq!(cons.occupied_len(), MARGIN_START);
+        assert_eq!(state.trimmed_samples, trimmed);
+        assert_eq!(state.underruns, 0);
+    }
+
+    /// Like `run_steady`, but every tenth packet is `skew` samples longer
+    /// or shorter: a far end whose clock is ~625ppm off ours per sample.
+    fn run_skewed(skew: isize, packets: usize) -> (PlaybackState, usize) {
+        let (mut prod, mut cons, mut out) = setup(START_DEPTH);
+        let mut state = PlaybackState::default();
+        let mut lowest = usize::MAX;
+        for i in 0..packets {
+            let n = if i % 10 == 0 {
+                PACKET_SAMPLES as isize + skew
+            } else {
+                PACKET_SAMPLES as isize
+            };
+            push(&mut prod, n as usize);
+            for _ in 0..4 {
+                fill_playback(&mut cons, &mut state, &mut out, 40);
+            }
+            lowest = lowest.min(cons.occupied_len());
+            assert!(
+                cons.occupied_len() <= START_DEPTH + PACKET_SAMPLES,
+                "depth grew at packet {i}"
+            );
+        }
+        (state, lowest)
+    }
+
+    #[test]
+    fn slow_far_end_clock_is_stretched_not_underrun() {
+        // Five minutes. Uncorrected, the ring would lose 1500 samples and
+        // underrun every ~30s.
+        let (state, lowest) = run_skewed(-1, 15_000);
+        assert_eq!(state.underruns, 0);
+        assert!(
+            state.stretched_samples >= 1_300,
+            "stretched {}",
+            state.stretched_samples
+        );
+        assert!(lowest >= MARGIN_MIN / 2, "trough fell to {lowest}");
+    }
+
+    #[test]
+    fn fast_far_end_clock_is_slewed_without_skipping() {
+        let (state, _) = run_skewed(1, 15_000);
+        assert_eq!(state.underruns, 0);
+        // Only what drifted in (plus settling to `margin`) was removed.
+        assert!(
+            (1_300..2_000).contains(&state.trimmed_samples),
+            "trimmed {}",
+            state.trimmed_samples
+        );
+    }
+
+    #[test]
+    fn repeated_samples_copy_the_previous_one() {
+        let (mut prod, mut cons, mut out) = setup(START_DEPTH);
+        let mut state = PlaybackState::default();
+        fill_playback(&mut cons, &mut state, &mut out, 40);
+        state.slew = -1;
+        state.slew_credit = SLEW_INTERVAL;
+        push(&mut prod, 40);
+        let before = cons.occupied_len();
+        let fill = fill_playback(&mut cons, &mut state, &mut out, 40);
+        assert_eq!(fill.frames, 40);
+        assert_eq!(
+            before - cons.occupied_len(),
+            39,
+            "one frame was not taken from the ring"
+        );
+        assert_eq!(sample(&out, 39), 1000);
+        assert_eq!((state.slew, state.stretched_samples), (0, 1));
+    }
+
+    #[test]
+    fn underrun_raises_margin_by_how_late_audio_was() {
+        let (mut prod, mut cons, mut out) = setup(START_DEPTH);
+        let mut state = PlaybackState::default();
+        // Eight 40-frame calls drain the 320 samples exactly; the next three
+        // find nothing: 120 samples (15ms) of silence.
+        for _ in 0..8 {
+            assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 40).peak, 1000);
+        }
+        for _ in 0..3 {
+            assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 40).peak, 0);
+        }
+        assert_eq!(state.underruns, 1);
+
+        // The late packet lands: margin grows by the 15ms it was late, and
+        // one packet is no longer enough to resume...
+        push(&mut prod, PACKET_SAMPLES);
+        assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 40).peak, 0);
+        assert_eq!(state.margin, MARGIN_START + 120);
+        assert_eq!(cons.occupied_len(), PACKET_SAMPLES);
+        // ...the new start depth is, and the wait wasn't another underrun.
+        push(&mut prod, state.margin);
+        assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 40).peak, 1000);
+        assert_eq!(state.underruns, 1);
+    }
+
+    #[test]
+    fn short_underrun_raises_margin_by_at_least_one_step() {
+        let (mut prod, mut cons, mut out) = setup(START_DEPTH);
+        let mut state = PlaybackState::default();
+        // 320 samples: seven 43-frame calls leave 19, the eighth comes up 24
+        // short — a 3ms shortfall.
+        for _ in 0..8 {
+            fill_playback(&mut cons, &mut state, &mut out, 43);
+        }
+        assert_eq!(state.underruns, 1);
+        push(&mut prod, PACKET_SAMPLES);
+        fill_playback(&mut cons, &mut state, &mut out, 43);
+        assert_eq!(state.margin, MARGIN_START + MARGIN_STEP);
+    }
+
+    #[test]
+    fn paused_stream_does_not_raise_margin() {
+        let (mut prod, mut cons, mut out) = setup(START_DEPTH);
+        let mut state = PlaybackState::default();
+        // Drain, then stay dry for a second (hold / silence suppression).
+        for _ in 0..(8 + 200) {
+            fill_playback(&mut cons, &mut state, &mut out, 40);
+        }
+        assert_eq!(state.underruns, 1);
+        push(&mut prod, START_DEPTH);
+        assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 40).peak, 1000);
+        assert_eq!(state.margin, MARGIN_START);
+    }
+
+    #[test]
+    fn margin_decays_slowly_and_stops_at_the_floor() {
+        // One packet short of the start depth, so the first packet starts
+        // playback with the trough already at `margin`: nothing to correct.
+        let (mut prod, mut cons, mut out) = setup(MARGIN_START);
+        let mut state = PlaybackState::default();
+        let windows = DECAY_EVERY_WINDOWS as usize;
+        run_steady(
+            &mut prod,
+            &mut cons,
+            &mut state,
+            &mut out,
+            PACKETS_PER_WINDOW * (windows - 1),
+        );
+        assert_eq!(state.margin, MARGIN_START);
+        run_steady(&mut prod, &mut cons, &mut state, &mut out, PACKETS_PER_WINDOW);
+        assert_eq!(state.margin, MARGIN_START - MARGIN_DECAY);
+
+        state.margin = MARGIN_MIN;
+        run_steady(
+            &mut prod,
+            &mut cons,
+            &mut state,
+            &mut out,
+            PACKETS_PER_WINDOW * windows * 2,
+        );
+        assert_eq!(state.margin, MARGIN_MIN);
+        assert_eq!(state.underruns, 0);
+    }
 }

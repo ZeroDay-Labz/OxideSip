@@ -12,7 +12,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-pipewire = { version = "0.10", features = ["v0_3_44"] }
+pipewire = { version = "0.10", features = ["v0_3_49"] }
 ringbuf = "0.5"
 rand = "0.10"
 libc = "0.2"
