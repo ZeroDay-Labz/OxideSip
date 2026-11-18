@@ -5,10 +5,27 @@ All notable changes to OxideSip are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-11-18
+
 ### Fixed
+- Call audio from the far end played 1.5–2.5 s late. The playback stream filled PipeWire's whole
+  buffer on every callback instead of the amount requested, so it was serviced only every ~1.5 s
+  and needed seconds of buffering to cover the gap. It now runs every graph cycle.
 - KDE kept showing the 0.1.x icon after upgrading because its per-user pixmap cache is keyed by
   icon name. The app now broadcasts KDE's icon-changed signal whenever it installs new icons,
   so the task bar switches to the new icon without logging out.
+
+### Changed
+- The playback jitter buffer is adaptive. It holds only as much audio as the current network
+  needs (about 20–50 ms on a typical PBX link, down from 2 s), grows when audio arrives late,
+  shrinks back afterwards, and follows the far end's clock by dropping or repeating single
+  samples instead of skipping or underrunning. Buffer depth, margin, underruns and corrections
+  are logged every 5 s at `RUST_LOG=info`.
+
+### Added
+- `echo_probe` example: places a call from a configured account (for instance to the `*43` echo
+  test) and measures the network + PBX round trip and packet jitter over RTP, or runs the real
+  audio path and prints the buffer statistics.
 
 ## [0.2.0] — 2026-10-16
 
@@ -74,5 +91,6 @@ All notable changes to OxideSip are documented here. The format follows
 - Multi-account support, codec priority, SRTP, TLS, recording, contacts import / export,
   Flatpak / RPM / deb packaging, and the first incoming-call popup.
 
+[0.2.1]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/ZeroDay-Labz/OxideSip/releases/tag/v0.1.8

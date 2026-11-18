@@ -84,6 +84,11 @@
     <content_attribute id="social-contacts">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.2.1" date="2026-11-18">
+      <description>
+        <p>Much lower call latency: far-end audio no longer plays seconds late, and an adaptive jitter buffer keeps the delay as small as the network allows.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-16">
       <description>
         <p>New sidebar layout, dark and light themes, a rebuilt incoming-call window with desktop notifications, structured caller ID, a real app icon, and a demo/screenshot mode.</p>
