@@ -84,6 +84,11 @@
     <content_attribute id="social-contacts">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.4.0" date="2026-11-18">
+      <description>
+        <p>HD voice with the G.722 wideband codec, and an audio path that runs at whatever rate the call negotiated.</p>
+      </description>
+    </release>
     <release version="0.3.1" date="2026-11-18">
       <description>
         <p>Better behaviour behind NAT (keepalives, symmetric RTP, registrar-observed contact address), registration that follows the server's expiry and unregisters on exit, and tones played through the app's own audio stream.</p>

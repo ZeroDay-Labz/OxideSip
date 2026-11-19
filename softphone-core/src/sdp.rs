@@ -123,15 +123,20 @@ pub fn generate_offer(
 /// walks *our* preference order and returns the first entry that's also in
 /// `offered`, so a call always uses the best codec both sides can agree on
 /// by our own quality ranking rather than whichever the remote listed
-/// first. Falls back to the remote's first offered type if none of our
-/// preferred codecs were offered at all — better to attempt the call with
-/// an unranked codec than to refuse it outright.
+/// first. Failing that, any other codec this app implements that they
+/// offered. `None` when they offered nothing we can encode and decode — the
+/// call can't have audio and should be refused (488).
 pub fn select_payload_type(offered: &[u8], preference: &[u8]) -> Option<u8> {
     preference
         .iter()
         .find(|pt| offered.contains(pt))
+        .or_else(|| offered.iter().find(|pt| is_supported_payload_type(**pt)))
         .copied()
-        .or_else(|| offered.first().copied())
+}
+
+/// The RTP payload types this app has a codec for: PCMU, PCMA, G722.
+pub fn is_supported_payload_type(payload_type: u8) -> bool {
+    matches!(payload_type, 0 | 8 | 9)
 }
 
 /// RTP/AVP static payload type -> `rtpmap` encoding name (RFC 3551). Only
@@ -142,6 +147,7 @@ pub fn select_payload_type(offered: &[u8], preference: &[u8]) -> Option<u8> {
 fn encoding_name(payload_type: u8) -> &'static str {
     match payload_type {
         8 => "PCMA",
+        9 => "G722",
         _ => "PCMU",
     }
 }
@@ -463,8 +469,21 @@ mod tests {
     fn our_preference_order_picks_the_codec() {
         assert_eq!(select_payload_type(&[0, 8], &[8, 0]), Some(8));
         assert_eq!(select_payload_type(&[9, 8], &[0, 8]), Some(8));
+        // Not in our preference list but still a codec we have.
         assert_eq!(select_payload_type(&[9], &[0, 8]), Some(9));
+        // G.729 (18) and GSM (3): nothing we can speak.
+        assert_eq!(select_payload_type(&[18, 3], &[0, 8]), None);
+        assert_eq!(select_payload_type(&[18, 0], &[9]), Some(0));
         assert_eq!(select_payload_type(&[], &[0, 8]), None);
+    }
+
+    #[test]
+    fn g722_is_advertised_with_its_8000_clock() {
+        let offer = generate_offer(10000, None, false, &[9, 0], false);
+        let text = build_sdp("192.168.1.50".parse().unwrap(), &offer).to_string();
+        assert!(text.contains("m=audio 10000 RTP/AVP 9 0"), "{text}");
+        // RFC 3551 §4.5.2: G722's RTP clock rate is 8000, not 16000.
+        assert!(text.contains("a=rtpmap:9 G722/8000"), "{text}");
     }
 
     #[test]

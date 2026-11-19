@@ -40,7 +40,7 @@ layer, no browser engine.
   (Discord's voice engine, OBS, a virtual sink) or mix another app's audio into what the far
   end hears — per call, with one button.
 - **Standards you expect.** RFC 4733 DTMF with SIP INFO fallback, an ordered codec priority
-  list (G.711 µ-law / A-law), optional SDES-SRTP, UDP / TCP / TLS transports.
+  list (G.722 HD voice, G.711 µ-law / A-law), optional SDES-SRTP, UDP / TCP / TLS transports.
 - **The rest of a phone.** Contacts with JSON import/export, call history with filters and
   missed-call badge, Do Not Disturb, auto-answer, a deny list, WAV call recording, a compact
   floating call bar, keyboard shortcuts, dark and light themes that follow the desktop.
@@ -212,7 +212,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | Crate | Purpose |
 |---|---|
 | `softphone-core` | SIP signalling via [`rsipstack`](https://crates.io/crates/rsipstack): registration, dialogs, SDP negotiation, structured caller identity. No UI or audio code. |
-| `softphone-media` | PipeWire capture and playback, RTP send/receive with RFC 4733 events, tones, WAV recording, G.711 codecs, secondary-stream routing. |
+| `softphone-media` | PipeWire capture and playback, RTP send/receive with RFC 4733 events, tones, WAV recording, G.711 and G.722 codecs, SRTP, secondary-stream routing. |
 | `softphone-ui` | The iced desktop app: theme, pages, incoming-call window, notifications, demo and screenshot modes, packaging metadata. |
 
 Tagged pushes (`v*`) run [`release.yml`](.github/workflows/release.yml), which builds the

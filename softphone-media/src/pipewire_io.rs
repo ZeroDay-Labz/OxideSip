@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Once};
 use tokio::sync::Notify;
 
+/// The rate the buffering constants below are written for, and the rate of
+/// tones; a call's streams run at its codec's rate (see `spawn`).
 pub(crate) const SAMPLE_RATE: u32 = 8000;
 const CHANNELS: u32 = 1;
 // SPA_AUDIO_CHANNEL_MONO. Confirmed from the generated libspa-sys bindgen
@@ -92,9 +94,9 @@ const CONCEAL_SAMPLES: usize = 480; // 60ms
 // Frames to write if a server doesn't report `requested` (it has since
 // PipeWire 0.3.49): one RTP packet's worth, never the whole buffer.
 const FALLBACK_FRAMES: usize = 160;
-// Log playback stats once per this many frames played (~5s), whatever
+// Log playback stats once per this many seconds of audio played, whatever
 // quantum the graph happens to be running at.
-const STATS_EVERY_FRAMES: usize = 5 * SAMPLE_RATE as usize;
+const STATS_EVERY_SECS: usize = 5;
 
 static PW_INIT: Once = Once::new();
 
@@ -189,6 +191,7 @@ struct PlaybackUserData {
     output_level_bits: Arc<AtomicU32>,
     stats: Arc<StatsShared>,
     state: PlaybackState,
+    rate: u32,
     callback_count: u64,
     frames_since_stats: usize,
 }
@@ -214,7 +217,7 @@ struct PlaybackState {
     /// The most recent `PACKET_SAMPLES` of real audio played (a ring;
     /// `history_pos` is the oldest sample / next write), and how many
     /// concealment samples the current gap has been given from it.
-    history: [i16; PACKET_SAMPLES],
+    history: Vec<i16>,
     history_pos: usize,
     concealed: usize,
     /// Consecutive windows without an underrun, for `margin`'s decay.
@@ -229,19 +232,30 @@ struct PlaybackState {
     trimmed_samples: u64,
     /// Samples repeated to top the ring back up.
     stretched_samples: u64,
+    /// This stream's sample rate as a multiple of 8 kHz, which is what the
+    /// buffering constants above are written for.
+    scale: usize,
 }
 
 impl Default for PlaybackState {
     fn default() -> Self {
+        Self::new(SAMPLE_RATE)
+    }
+}
+
+impl PlaybackState {
+    /// State for a stream running at `rate` Hz (a multiple of 8000).
+    fn new(rate: u32) -> Self {
+        let scale = (rate / SAMPLE_RATE).max(1) as usize;
         Self {
             prebuffered: false,
-            margin: MARGIN_START,
+            margin: MARGIN_START * scale,
             low_water: usize::MAX,
             window_frames: 0,
             slew: 0,
             slew_credit: 0,
             last_sample: 0,
-            history: [0; PACKET_SAMPLES],
+            history: vec![0; PACKET_SAMPLES * scale],
             history_pos: 0,
             concealed: 0,
             clean_windows: 0,
@@ -250,11 +264,10 @@ impl Default for PlaybackState {
             underruns: 0,
             trimmed_samples: 0,
             stretched_samples: 0,
+            scale,
         }
     }
-}
 
-impl PlaybackState {
     fn reset_window(&mut self) {
         self.low_water = usize::MAX;
         self.window_frames = 0;
@@ -280,27 +293,30 @@ struct PlaybackFill {
 /// stream that queues the whole thing is not called again until all of it
 /// has played — 1.5s later. See the buffering constants' comment.
 fn fill_playback(cons: &mut HeapCons<i16>, state: &mut PlaybackState, out: &mut [u8], requested: u64) -> PlaybackFill {
+    // Every sample-count constant is defined at 8 kHz; `k` scales it to this
+    // stream's rate.
+    let k = state.scale;
     let max_frames = out.len() / STRIDE;
     let frames = if requested > 0 {
         usize::try_from(requested).unwrap_or(usize::MAX).min(max_frames)
     } else {
-        max_frames.min(FALLBACK_FRAMES)
+        max_frames.min(FALLBACK_FRAMES * k)
     };
 
     if !state.prebuffered && state.recovering && cons.occupied_len() > 0 {
         // Audio is back after an underrun. How long the ring stayed dry
         // (counted below) is how much more cushion would have covered it.
-        if state.dry_samples <= STALL_SAMPLES {
-            state.margin = (state.margin + state.dry_samples.max(MARGIN_STEP)).min(MARGIN_MAX);
+        if state.dry_samples <= (STALL_SAMPLES * k) {
+            state.margin = (state.margin + state.dry_samples.max(MARGIN_STEP * k)).min(MARGIN_MAX * k);
         }
         state.recovering = false;
     }
 
     // Depth to (re)start playing at: with packets landing 160 samples at a
     // time, starting one packet above `margin` puts the trough at `margin`.
-    let start_depth = state.margin + PACKET_SAMPLES;
+    let start_depth = state.margin + (PACKET_SAMPLES * k);
     let occupied = cons.occupied_len();
-    if occupied > start_depth + BURST_HEADROOM {
+    if occupied > start_depth + (BURST_HEADROOM * k) {
         state.trimmed_samples += cons.skip(occupied - start_depth) as u64;
         state.slew = 0;
         state.reset_window();
@@ -349,21 +365,21 @@ fn fill_playback(cons: &mut HeapCons<i16>, state: &mut PlaybackState, out: &mut 
         };
         for &sample in &scratch[..got] {
             state.history[state.history_pos] = sample;
-            state.history_pos = (state.history_pos + 1) % PACKET_SAMPLES;
+            state.history_pos = (state.history_pos + 1) % (PACKET_SAMPLES * k);
         }
         if got > 0 {
             state.concealed = 0;
         }
         // Whatever the ring couldn't supply: concealment while a gap that
         // opened mid-playback is still fresh, silence otherwise (start of
-        // call, or a gap longer than CONCEAL_SAMPLES).
+        // call, or a gap longer than (CONCEAL_SAMPLES * k)).
         let in_gap = state.recovering || (state.prebuffered && got < want);
         for sample in &mut scratch[got..want] {
-            *sample = if in_gap && state.concealed < CONCEAL_SAMPLES {
-                let replay = state.history[(state.history_pos + state.concealed) % PACKET_SAMPLES];
-                let gain = (CONCEAL_SAMPLES - state.concealed) as i32;
+            *sample = if in_gap && state.concealed < (CONCEAL_SAMPLES * k) {
+                let replay = state.history[(state.history_pos + state.concealed) % (PACKET_SAMPLES * k)];
+                let gain = (CONCEAL_SAMPLES * k - state.concealed) as i32;
                 state.concealed += 1;
-                (i32::from(replay) * gain / CONCEAL_SAMPLES as i32) as i16
+                (i32::from(replay) * gain / (CONCEAL_SAMPLES * k) as i32) as i16
             } else {
                 0
             };
@@ -400,19 +416,19 @@ fn fill_playback(cons: &mut HeapCons<i16>, state: &mut PlaybackState, out: &mut 
     if state.prebuffered && state.slew == 0 {
         state.low_water = state.low_water.min(cons.occupied_len());
         state.window_frames += frames;
-        if state.window_frames >= ADAPT_WINDOW {
+        if state.window_frames >= (ADAPT_WINDOW * k) {
             // The trough never went below `low_water` this window, so
             // whatever part of it is above `margin` was delay nobody needed;
             // and if it is below `margin`, the ring is draining.
             let excess = state.low_water as isize - state.margin as isize;
-            if excess > SKIP_ABOVE as isize {
+            if excess > (SKIP_ABOVE * k) as isize {
                 state.trimmed_samples += cons.skip(excess as usize) as u64;
-            } else if excess.unsigned_abs() >= SLEW_MIN {
+            } else if excess.unsigned_abs() >= (SLEW_MIN * k) {
                 state.slew = excess;
             }
             state.clean_windows += 1;
             if state.clean_windows.is_multiple_of(DECAY_EVERY_WINDOWS) {
-                state.margin = state.margin.saturating_sub(MARGIN_DECAY).max(MARGIN_MIN);
+                state.margin = state.margin.saturating_sub(MARGIN_DECAY * k).max(MARGIN_MIN * k);
             }
             state.reset_window();
         }
@@ -432,6 +448,7 @@ pub fn spawn(
     capture_target: Option<String>,
     playback_target: Option<String>,
     label: String,
+    rate: u32,
 ) -> Result<PwThreadHandle, MediaError> {
     ensure_init();
 
@@ -449,6 +466,7 @@ pub fn spawn(
                 capture_target,
                 playback_target,
                 &label,
+                rate,
                 &ready_tx,
             ) {
                 let _ = ready_tx.send(Err(e.to_string()));
@@ -619,8 +637,9 @@ pub fn spawn_playback(
     playback_cons: HeapCons<i16>,
     target: Option<String>,
     label: String,
+    rate: u32,
 ) -> Result<PwThreadHandle, MediaError> {
-    spawn_playback_stream(playback_cons, target, label, false)
+    spawn_playback_stream(playback_cons, target, label, rate, false)
 }
 
 /// A playback-only stream for sound generated in this process (dial tones,
@@ -632,13 +651,14 @@ pub fn spawn_tone_playback(
     target: Option<String>,
     label: String,
 ) -> Result<PwThreadHandle, MediaError> {
-    spawn_playback_stream(playback_cons, target, label, true)
+    spawn_playback_stream(playback_cons, target, label, SAMPLE_RATE, true)
 }
 
 fn spawn_playback_stream(
     playback_cons: HeapCons<i16>,
     target: Option<String>,
     label: String,
+    rate: u32,
     direct: bool,
 ) -> Result<PwThreadHandle, MediaError> {
     ensure_init();
@@ -649,7 +669,7 @@ fn spawn_playback_stream(
     let thread = std::thread::Builder::new()
         .name("pipewire-io-secondary".into())
         .spawn(move || {
-            if let Err(e) = run_playback_only(shutdown_rx, playback_cons, target, &label, direct, &ready_tx) {
+            if let Err(e) = run_playback_only(shutdown_rx, playback_cons, target, &label, rate, direct, &ready_tx) {
                 let _ = ready_tx.send(Err(e.to_string()));
             }
         })
@@ -675,6 +695,7 @@ fn run_playback_only(
     playback_cons: HeapCons<i16>,
     target: Option<String>,
     label: &str,
+    rate: u32,
     direct: bool,
     ready_tx: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), MediaError> {
@@ -689,13 +710,13 @@ fn run_playback_only(
     let playback_stream = pw::stream::StreamBox::new(
         &core,
         "OxideSip secondary playback",
-        stream_properties("Playback", target.as_deref(), label),
+        stream_properties("Playback", target.as_deref(), label, rate),
     )
     .map_err(pw_err)?;
 
     let playback_user_data = SecondaryPlaybackUserData {
         cons: playback_cons,
-        state: PlaybackState::default(),
+        state: PlaybackState::new(rate),
         direct,
     };
 
@@ -727,7 +748,7 @@ fn run_playback_only(
         .register()
         .map_err(pw_err)?;
 
-    let playback_format = audio_format_pod()?;
+    let playback_format = audio_format_pod(rate)?;
     let mut playback_params =
         [Pod::from_bytes(&playback_format)
             .ok_or_else(|| MediaError::PipeWire("invalid playback format pod".into()))?];
@@ -762,7 +783,12 @@ struct SecondaryCaptureUserData {
 /// would loop our own injected audio back on itself) into what gets sent as
 /// RTP. `target` (a PipeWire node's `node.name`) pins the stream to that
 /// app's playback node; `None` follows the system default capture device.
-pub fn spawn_capture(prod: HeapProd<i16>, target: Option<String>, label: String) -> Result<PwThreadHandle, MediaError> {
+pub fn spawn_capture(
+    prod: HeapProd<i16>,
+    target: Option<String>,
+    label: String,
+    rate: u32,
+) -> Result<PwThreadHandle, MediaError> {
     ensure_init();
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<PwCommand>();
@@ -771,7 +797,7 @@ pub fn spawn_capture(prod: HeapProd<i16>, target: Option<String>, label: String)
     let thread = std::thread::Builder::new()
         .name("pipewire-io-secondary-in".into())
         .spawn(move || {
-            if let Err(e) = run_capture_only(shutdown_rx, prod, target, &label, &ready_tx) {
+            if let Err(e) = run_capture_only(shutdown_rx, prod, target, &label, rate, &ready_tx) {
                 let _ = ready_tx.send(Err(e.to_string()));
             }
         })
@@ -796,6 +822,7 @@ fn run_capture_only(
     prod: HeapProd<i16>,
     target: Option<String>,
     label: &str,
+    rate: u32,
     ready_tx: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), MediaError> {
     // SAFETY: `pw::init()` has already been called via `ensure_init()` in
@@ -809,7 +836,7 @@ fn run_capture_only(
     let capture_stream = pw::stream::StreamBox::new(
         &core,
         "OxideSip secondary capture",
-        stream_properties("Capture", target.as_deref(), label),
+        stream_properties("Capture", target.as_deref(), label, rate),
     )
     .map_err(pw_err)?;
 
@@ -839,7 +866,7 @@ fn run_capture_only(
         .register()
         .map_err(pw_err)?;
 
-    let capture_format = audio_format_pod()?;
+    let capture_format = audio_format_pod(rate)?;
     let mut capture_params = [
         Pod::from_bytes(&capture_format).ok_or_else(|| MediaError::PipeWire("invalid capture format pod".into()))?
     ];
@@ -863,10 +890,10 @@ fn run_capture_only(
     Ok(())
 }
 
-fn audio_format_pod() -> Result<Vec<u8>, MediaError> {
+fn audio_format_pod(rate: u32) -> Result<Vec<u8>, MediaError> {
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::S16LE);
-    audio_info.set_rate(SAMPLE_RATE);
+    audio_info.set_rate(rate);
     audio_info.set_channels(CHANNELS);
     let mut position = [0u32; spa::param::audio::MAX_CHANNELS];
     position[0] = SPA_AUDIO_CHANNEL_MONO;
@@ -885,7 +912,13 @@ fn audio_format_pod() -> Result<Vec<u8>, MediaError> {
     .map_err(|_| MediaError::PipeWire("failed to serialize audio format pod".into()))
 }
 
-fn stream_properties(media_category: &str, target: Option<&str>, label: &str) -> pw::properties::PropertiesBox {
+fn stream_properties(
+    media_category: &str,
+    target: Option<&str>,
+    label: &str,
+    rate: u32,
+) -> pw::properties::PropertiesBox {
+    let latency = format!("{}/{rate}", rate / 50);
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => media_category,
@@ -908,10 +941,10 @@ fn stream_properties(media_category: &str, target: Option<&str>, label: &str) ->
         // showing up as identically-named nodes.
         *pw::keys::NODE_NAME => label,
         *pw::keys::NODE_DESCRIPTION => label,
-        // Hint a 20ms (160 samples @ 8000Hz) processing granularity,
+        // Hint a 20ms processing granularity,
         // matching our RTP packetization interval, so the graph doesn't
         // pick a larger quantum than a call needs on our account.
-        *pw::keys::NODE_LATENCY => "160/8000",
+        *pw::keys::NODE_LATENCY => latency,
     };
     if let Some(target) = target {
         // Pin to a specific device instead of relying purely on
@@ -930,6 +963,7 @@ fn run(
     capture_target: Option<String>,
     playback_target: Option<String>,
     label: &str,
+    rate: u32,
     ready_tx: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), MediaError> {
     let PipewireShared {
@@ -962,7 +996,7 @@ fn run(
     let capture_stream = pw::stream::StreamBox::new(
         &core,
         "OxideSip capture",
-        stream_properties("Capture", capture_target.as_deref(), label),
+        stream_properties("Capture", capture_target.as_deref(), label, rate),
     )
     .map_err(pw_err)?;
 
@@ -1001,7 +1035,7 @@ fn run(
         .register()
         .map_err(pw_err)?;
 
-    let capture_format = audio_format_pod()?;
+    let capture_format = audio_format_pod(rate)?;
     let mut capture_params = [
         Pod::from_bytes(&capture_format).ok_or_else(|| MediaError::PipeWire("invalid capture format pod".into()))?
     ];
@@ -1019,7 +1053,7 @@ fn run(
     let playback_stream = pw::stream::StreamBox::new(
         &core,
         "OxideSip playback",
-        stream_properties("Playback", playback_target.as_deref(), label),
+        stream_properties("Playback", playback_target.as_deref(), label, rate),
     )
     .map_err(pw_err)?;
 
@@ -1028,7 +1062,8 @@ fn run(
         output_gain_bits,
         output_level_bits,
         stats,
-        state: PlaybackState::default(),
+        state: PlaybackState::new(rate),
+        rate,
         callback_count: 0,
         frames_since_stats: 0,
     };
@@ -1070,7 +1105,7 @@ fn run(
                 .store(user_data.state.underruns as u32, Ordering::Relaxed);
             user_data.callback_count += 1;
             user_data.frames_since_stats += fill.frames;
-            if user_data.frames_since_stats >= STATS_EVERY_FRAMES {
+            if user_data.frames_since_stats >= STATS_EVERY_SECS * user_data.rate as usize {
                 user_data.frames_since_stats = 0;
                 // `buffered_ms` is the receive-side latency this stream is
                 // adding right now; counterpart to send_loop's stats.
@@ -1078,8 +1113,8 @@ fn run(
                     callback_count = user_data.callback_count,
                     requested,
                     frames = fill.frames,
-                    buffered_ms = user_data.cons.occupied_len() * 1000 / SAMPLE_RATE as usize,
-                    margin_ms = user_data.state.margin * 1000 / SAMPLE_RATE as usize,
+                    buffered_ms = user_data.cons.occupied_len() * 1000 / user_data.rate as usize,
+                    margin_ms = user_data.state.margin * 1000 / user_data.rate as usize,
                     underruns = user_data.state.underruns,
                     stretched_samples = user_data.state.stretched_samples,
                     trimmed_samples = user_data.state.trimmed_samples,
@@ -1095,7 +1130,7 @@ fn run(
         .register()
         .map_err(pw_err)?;
 
-    let playback_format = audio_format_pod()?;
+    let playback_format = audio_format_pod(rate)?;
     let mut playback_params =
         [Pod::from_bytes(&playback_format)
             .ok_or_else(|| MediaError::PipeWire("invalid playback format pod".into()))?];
@@ -1433,6 +1468,31 @@ mod tests {
         );
         assert_eq!(state.margin, MARGIN_MIN);
         assert_eq!(state.underruns, 0);
+    }
+
+    #[test]
+    fn buffering_scales_with_the_sample_rate() {
+        // The same call at 16 kHz (G.722): twice the samples per packet and
+        // per callback, and the buffer must settle at the same *time* depth.
+        let (mut prod, mut cons) = HeapRb::<i16>::new(8_000).split();
+        let mut out = vec![0u8; 12_288 * STRIDE];
+        let mut state = PlaybackState::new(16_000);
+        push(&mut prod, (START_DEPTH + 600) * 2);
+        for _ in 0..PACKETS_PER_WINDOW * 3 {
+            push(&mut prod, PACKET_SAMPLES * 2);
+            for _ in 0..4 {
+                fill_playback(&mut cons, &mut state, &mut out, 80);
+            }
+        }
+        assert_eq!(cons.occupied_len(), MARGIN_START * 2);
+        assert_eq!(state.underruns, 0);
+        // And a gap is concealed over the same 60ms.
+        for _ in 0..(MARGIN_START * 2 / 80) {
+            fill_playback(&mut cons, &mut state, &mut out, 80);
+        }
+        fill_playback(&mut cons, &mut state, &mut out, (CONCEAL_SAMPLES * 2 + 80) as u64);
+        assert!(sample(&out, CONCEAL_SAMPLES * 2 - 100) > 0);
+        assert_eq!(sample(&out, CONCEAL_SAMPLES * 2), 0);
     }
 
     #[test]

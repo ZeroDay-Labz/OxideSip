@@ -5,6 +5,22 @@ All notable changes to OxideSip are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-18
+
+### Added
+- **HD voice: the G.722 codec** (16 kHz wideband). New accounts prefer it; existing accounts get
+  it at the bottom of their codec list — move it up under Settings ▸ Audio & codecs to use it
+  whenever the other side supports it. The call card shows which codec a call is using.
+
+### Changed
+- The audio path is no longer fixed at 8 kHz: microphone and speaker streams, buffering,
+  levelling and recordings all run at the negotiated codec's rate, so a G.722 call is recorded
+  at 16 kHz. Two lines joined into a conference may use different codecs.
+- A call that offers no codec OxideSip supports is refused (488) instead of being answered
+  with unintelligible audio.
+- A codec name this version does not know in `accounts.toml` is skipped rather than making the
+  file unreadable.
+
 ## [0.3.1] — 2026-11-18
 
 ### Changed
@@ -155,6 +171,7 @@ All notable changes to OxideSip are documented here. The format follows
 - Multi-account support, codec priority, SRTP, TLS, recording, contacts import / export,
   Flatpak / RPM / deb packaging, and the first incoming-call popup.
 
+[0.4.0]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.1...v0.2.2

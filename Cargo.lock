@@ -325,6 +325,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audio-codec"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5b4bcf12e399aa3ccb657b333de435dff5f1f3e73ec5a56d7c12b46fd5d6ad5"
+dependencies = [
+ "g729-sys",
+ "libm",
+ "opus-rs",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1426,6 +1437,12 @@ dependencies = [
  "pin-project-lite",
  "slab",
 ]
+
+[[package]]
+name = "g729-sys"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb7894cf6197466562c5e4cb9af817ec7fc20788b1a2f01e2a529a375d3df99c"
 
 [[package]]
 name = "generic-array"
@@ -3147,6 +3164,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "opus-rs"
+version = "0.1.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bafbcaf2ed381cdf68ced4ed8d16517de90ffd7424e36f0b9e45d67fbe30b1f9"
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4231,7 +4254,7 @@ dependencies = [
 
 [[package]]
 name = "softphone-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64",
  "dotenvy",
@@ -4251,9 +4274,10 @@ dependencies = [
 
 [[package]]
 name = "softphone-media"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aes",
+ "audio-codec",
  "base64",
  "ctr",
  "hmac",
@@ -4270,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "softphone-ui"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
  "dirs",

@@ -1,7 +1,8 @@
 use crate::agc::Agc;
-use crate::codec;
+use crate::codec::{AudioDecoder, AudioEncoder, CodecKind};
 use crate::error::MediaError;
 use crate::pipewire_io::{self, PipewireShared, PwThreadHandle};
+use crate::resample::LinearResampler;
 use crate::rtp::RtpHeader;
 use crate::srtp::SrtpContext;
 use crate::stats::{CallStats, ReceiverStats, StatsShared};
@@ -23,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 // RING_CAPACITY does. If a joined line's send_loop somehow stalls, letting
 // this fill and drop is the right failure mode — better than growing
 // latency on a live 3-way call.
-const BRIDGE_RING_CAPACITY: usize = 4_000; // ~0.5s of 8kHz mono i16 samples
+const BRIDGE_RING_MS: usize = 500;
 
 // Must comfortably exceed the deepest pipewire_io.rs's adaptive playback
 // buffer lets the ring get (MARGIN_MAX + a packet + BURST_HEADROOM, 320ms)
@@ -31,8 +32,40 @@ const BRIDGE_RING_CAPACITY: usize = 4_000; // ~0.5s of 8kHz mono i16 samples
 // can queue before that happens. Used for
 // both rings for simplicity; the capture side needs even less
 // (Notify-driven draining keeps it close to empty in steady state).
-const RING_CAPACITY: usize = 4_000; // 0.5s of 8kHz mono i16 samples
-const SAMPLES_PER_PACKET: usize = 160; // 20ms @ 8000Hz
+const RING_MS: usize = 500;
+/// RTP timestamp ticks per 20ms packet. The same for every codec this app
+/// supports (their RTP clocks are all 8000 Hz, G.722's included), and for
+/// RFC 4733 `telephone-event/8000`.
+const RTP_TICKS_PER_PACKET: u32 = 160;
+
+/// Ring size, in samples, for `ms` of audio at `rate`.
+fn ring_samples(rate: u32, ms: usize) -> usize {
+    rate as usize * ms / 1000
+}
+
+/// The sending end of a conference bridge between two lines: audio one
+/// call receives, on its way into what the other call sends. The two calls
+/// may be running at different sample rates.
+struct BridgeOut {
+    prod: HeapProd<i16>,
+    resampler: Option<LinearResampler>,
+    scratch: Vec<i16>,
+}
+
+impl BridgeOut {
+    fn push(&mut self, samples: &[i16]) {
+        match &mut self.resampler {
+            Some(resampler) => {
+                self.scratch.clear();
+                resampler.process(samples, &mut self.scratch);
+                self.prod.push_slice(&self.scratch);
+            }
+            None => {
+                self.prod.push_slice(samples);
+            }
+        }
+    }
+}
 const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 // How many packets may be held back waiting for a missing one. Every packet
 // held is 20ms the playback buffer isn't being fed, and that buffer runs
@@ -118,7 +151,7 @@ pub struct MediaSession {
     /// audio this call *receives* is forwarded here, for the other line's
     /// `send_loop` to mix into what it sends — so each remote party hears
     /// the other, not just us.
-    bridge_relay_out: Arc<Mutex<Option<HeapProd<i16>>>>,
+    bridge_relay_out: Arc<Mutex<Option<BridgeOut>>>,
     /// Set by `join_with` when conferenced: audio arriving from the other
     /// joined line, mixed into our own mic audio before it's sent.
     bridge_relay_in: Arc<Mutex<Option<HeapCons<i16>>>>,
@@ -167,6 +200,8 @@ pub struct MediaSession {
     /// The echo canceller this call runs through, if any. Stopped after the
     /// call's own streams.
     echo_cancel_pw: Option<PwThreadHandle>,
+    /// The negotiated audio codec.
+    kind: CodecKind,
 }
 
 /// One queued outbound DTMF digit, RFC 4733-style.
@@ -250,11 +285,15 @@ impl MediaSession {
             None => (None, None),
         };
         let encrypted = srtp.is_some();
+        // Everything downstream — sound streams, buffers, recording — runs
+        // at the negotiated codec's sample rate.
+        let kind = CodecKind::from_payload_type(payload_type).ok_or(MediaError::UnsupportedCodec(payload_type))?;
+        let rate = kind.sample_rate();
         reserved.socket.set_nonblocking(true)?;
         let socket = Arc::new(UdpSocket::from_std(reserved.socket)?);
 
-        let (capture_prod, capture_cons) = Arc::new(HeapRb::<i16>::new(RING_CAPACITY)).split();
-        let (playback_prod, playback_cons) = Arc::new(HeapRb::<i16>::new(RING_CAPACITY)).split();
+        let (capture_prod, capture_cons) = Arc::new(HeapRb::<i16>::new(ring_samples(rate, RING_MS))).split();
+        let (playback_prod, playback_cons) = Arc::new(HeapRb::<i16>::new(ring_samples(rate, RING_MS))).split();
 
         let notify = Arc::new(Notify::new());
         let mic_muted = Arc::new(AtomicBool::new(false));
@@ -295,9 +334,10 @@ impl MediaSession {
             capture_target,
             playback_target,
             label,
+            rate,
         )?;
         let cancel = CancellationToken::new();
-        let bridge_relay_out: Arc<Mutex<Option<HeapProd<i16>>>> = Arc::new(Mutex::new(None));
+        let bridge_relay_out: Arc<Mutex<Option<BridgeOut>>> = Arc::new(Mutex::new(None));
         let bridge_relay_in: Arc<Mutex<Option<HeapCons<i16>>>> = Arc::new(Mutex::new(None));
         let record_mixer: Arc<Mutex<Option<RecordMixer>>> = Arc::new(Mutex::new(None));
         let secondary_relay: Arc<Mutex<Option<HeapProd<i16>>>> = Arc::new(Mutex::new(None));
@@ -367,6 +407,7 @@ impl MediaSession {
             auto_level,
             remote_addr,
             echo_cancel_pw,
+            kind,
         })
     }
 
@@ -381,9 +422,19 @@ impl MediaSession {
         }
     }
 
+    /// The audio codec this call negotiated.
+    pub fn codec(&self) -> CodecKind {
+        self.kind
+    }
+
+    /// Sample rate of this call's audio, and so of `stop_recording`'s samples.
+    pub fn sample_rate(&self) -> u32 {
+        self.kind.sample_rate()
+    }
+
     /// How the incoming audio is doing right now: buffer delay, loss, jitter.
     pub fn stats(&self) -> CallStats {
-        self.stats.snapshot(pipewire_io::SAMPLE_RATE)
+        self.stats.snapshot(self.kind.sample_rate())
     }
 
     /// Turns automatic level control on or off for both directions (see
@@ -434,8 +485,9 @@ impl MediaSession {
         let Some(target) = target else {
             return Ok(());
         };
-        let (prod, cons) = HeapRb::<i16>::new(RING_CAPACITY).split();
-        let handle = pipewire_io::spawn_playback(cons, Some(target), label)?;
+        let rate = self.kind.sample_rate();
+        let (prod, cons) = HeapRb::<i16>::new(ring_samples(rate, RING_MS)).split();
+        let handle = pipewire_io::spawn_playback(cons, Some(target), label, rate)?;
         if let Ok(mut relay) = self.secondary_relay.lock() {
             *relay = Some(prod);
         }
@@ -466,8 +518,9 @@ impl MediaSession {
         let Some(target) = target else {
             return Ok(());
         };
-        let (prod, cons) = HeapRb::<i16>::new(RING_CAPACITY).split();
-        let handle = pipewire_io::spawn_capture(prod, Some(target), label)?;
+        let rate = self.kind.sample_rate();
+        let (prod, cons) = HeapRb::<i16>::new(ring_samples(rate, RING_MS)).split();
+        let handle = pipewire_io::spawn_capture(prod, Some(target), label, rate)?;
         if let Ok(mut relay) = self.secondary_input_relay.lock() {
             *relay = Some(cons);
         }
@@ -492,17 +545,28 @@ impl MediaSession {
     /// playback needs no special handling here: both lines' playback streams
     /// already mix naturally in PipeWire as long as neither is on hold.
     pub fn join_with(&self, other: &MediaSession) {
-        let (prod_self_to_other, cons_self_to_other) = HeapRb::<i16>::new(BRIDGE_RING_CAPACITY).split();
-        let (prod_other_to_self, cons_other_to_self) = HeapRb::<i16>::new(BRIDGE_RING_CAPACITY).split();
+        // Each ring holds audio at the rate of the call that will *send* it;
+        // if the two calls negotiated different codecs, it is converted on
+        // the way in.
+        let (rate_self, rate_other) = (self.kind.sample_rate(), other.kind.sample_rate());
+        let bridge = |from: u32, to: u32, prod: HeapProd<i16>| BridgeOut {
+            prod,
+            resampler: (from != to).then(|| LinearResampler::new(from, to)),
+            scratch: Vec::new(),
+        };
+        let (prod_self_to_other, cons_self_to_other) =
+            HeapRb::<i16>::new(ring_samples(rate_other, BRIDGE_RING_MS)).split();
+        let (prod_other_to_self, cons_other_to_self) =
+            HeapRb::<i16>::new(ring_samples(rate_self, BRIDGE_RING_MS)).split();
 
         if let Ok(mut relay) = self.bridge_relay_out.lock() {
-            *relay = Some(prod_self_to_other);
+            *relay = Some(bridge(rate_self, rate_other, prod_self_to_other));
         }
         if let Ok(mut relay) = other.bridge_relay_in.lock() {
             *relay = Some(cons_self_to_other);
         }
         if let Ok(mut relay) = other.bridge_relay_out.lock() {
-            *relay = Some(prod_other_to_self);
+            *relay = Some(bridge(rate_other, rate_self, prod_other_to_self));
         }
         if let Ok(mut relay) = self.bridge_relay_in.lock() {
             *relay = Some(cons_other_to_self);
@@ -647,12 +711,15 @@ async fn send_loop(
     mut dtmf_rx: mpsc::UnboundedReceiver<DtmfSend>,
     cancel: CancellationToken,
 ) {
-    let codec = codec::Codec::from_payload_type(payload_type);
-    let table = codec.build_decode_table();
+    // `start` already refused payload types without a codec.
+    let kind = CodecKind::from_payload_type(payload_type).unwrap_or(CodecKind::Ulaw);
+    let mut encoder = AudioEncoder::new(kind);
+    let samples_per_packet = kind.samples_per_packet();
     let mut sequence_number = rand::random::<u16>();
     let mut timestamp = rand::random::<u32>();
     let ssrc = rand::random::<u32>();
-    let mut scratch = [0i16; SAMPLES_PER_PACKET];
+    let mut scratch = vec![0i16; samples_per_packet];
+    let mut mix = vec![0i16; samples_per_packet];
     let mut sent_count: u64 = 0;
     let mut empty_wakes: u64 = 0;
     let mut agc = Agc::default();
@@ -676,11 +743,11 @@ async fn send_loop(
                 // calls made before we wake into a single permit, so
                 // failing to loop here would let backlog silently build up
                 // whenever PipeWire fires faster than we drain.
-                if capture_cons.occupied_len() < SAMPLES_PER_PACKET {
+                if capture_cons.occupied_len() < samples_per_packet {
                     empty_wakes += 1;
                 }
                 let Ok(remote_addr) = remote.read().map(|addr| *addr) else { break };
-                while capture_cons.occupied_len() >= SAMPLES_PER_PACKET {
+                while capture_cons.occupied_len() >= samples_per_packet {
                     let got = capture_cons.pop_slice(&mut scratch);
                     // The microphone's own processing, before anything else
                     // is mixed in: level it, apply the mic gain setting, and
@@ -702,7 +769,7 @@ async fn send_loop(
                     if let Ok(mut relay) = bridge_relay_in.lock()
                         && let Some(cons) = relay.as_mut()
                     {
-                        let mut foreign = [0i16; SAMPLES_PER_PACKET];
+                        let foreign = &mut mix;
                         let n = cons.pop_slice(&mut foreign[..got]);
                         for i in 0..n {
                             scratch[i] = (scratch[i] as i32 + foreign[i] as i32)
@@ -719,7 +786,7 @@ async fn send_loop(
                     if let Ok(mut relay) = secondary_input_relay.lock()
                         && let Some(cons) = relay.as_mut()
                     {
-                        let mut injected = [0i16; SAMPLES_PER_PACKET];
+                        let injected = &mut mix;
                         let n = cons.pop_slice(&mut injected[..got]);
                         if secondary_input_enabled.load(Ordering::Relaxed) {
                             for i in 0..n {
@@ -734,10 +801,7 @@ async fn send_loop(
                     {
                         mixer.mix_in(RecordChannel::Mic, &scratch[..got]);
                     }
-                    let payload: Vec<u8> = scratch[..got]
-                        .iter()
-                        .map(|&s| codec.encode(&table, s))
-                        .collect();
+                    let payload = encoder.encode(&scratch[..got]);
                     let header = RtpHeader {
                         marker: false,
                         payload_type,
@@ -747,7 +811,7 @@ async fn send_loop(
                     };
                     send_packet(&socket, remote_addr, header.build_packet(&payload), srtp.as_mut()).await;
                     sequence_number = sequence_number.wrapping_add(1);
-                    timestamp = timestamp.wrapping_add(got as u32);
+                    timestamp = timestamp.wrapping_add(RTP_TICKS_PER_PACKET);
                     sent_count += 1;
                     if sent_count.is_multiple_of(250) {
                         // Every ~5s at 20ms/packet: cheap visibility into
@@ -794,13 +858,14 @@ async fn recv_loop(
     mut playback_prod: ringbuf::HeapProd<i16>,
     stats: Arc<StatsShared>,
     auto_level: Arc<AtomicBool>,
-    bridge_relay_out: Arc<Mutex<Option<HeapProd<i16>>>>,
+    bridge_relay_out: Arc<Mutex<Option<BridgeOut>>>,
     record_mixer: Arc<Mutex<Option<RecordMixer>>>,
     secondary_relay: Arc<Mutex<Option<HeapProd<i16>>>>,
     received_dtmf: Arc<Mutex<VecDeque<char>>>,
     cancel: CancellationToken,
 ) {
-    let codec = codec::Codec::from_payload_type(payload_type);
+    let kind = CodecKind::from_payload_type(payload_type).unwrap_or(CodecKind::Ulaw);
+    let mut decoder = AudioDecoder::new(kind);
     let mut buf = [0u8; 2048];
     let mut reorder = ReorderBuffer::new();
     let mut received_count: u64 = 0;
@@ -896,15 +961,15 @@ async fn recv_loop(
                     header.sequence_number,
                     header.timestamp,
                     started.elapsed().as_secs_f64(),
-                    pipewire_io::SAMPLE_RATE,
+                    kind.rtp_clock_rate(),
                 );
                 stats.received.store(receiver_stats.received(), Ordering::Relaxed);
                 stats.lost.store(receiver_stats.lost(), Ordering::Relaxed);
                 stats
                     .jitter_ms_bits
-                    .store(receiver_stats.jitter_ms(pipewire_io::SAMPLE_RATE).to_bits(), Ordering::Relaxed);
+                    .store(receiver_stats.jitter_ms(kind.rtp_clock_rate()).to_bits(), Ordering::Relaxed);
 
-                let mut samples: Vec<i16> = payload.iter().map(|&b| codec.decode(b)).collect();
+                let mut samples = decoder.decode(payload);
                 // Bring the far end to a standard level before it goes
                 // anywhere (speakers, recording, a bridged line). The local
                 // volume setting is applied later, at playback.
@@ -914,9 +979,9 @@ async fn recv_loop(
                 let ready = reorder.push(header.sequence_number, samples);
                 if !ready.is_empty() {
                     if let Ok(mut relay) = bridge_relay_out.lock()
-                        && let Some(prod) = relay.as_mut()
+                        && let Some(bridge) = relay.as_mut()
                     {
-                        prod.push_iter(ready.iter().copied());
+                        bridge.push(&ready);
                     }
                     if let Ok(mut mixer) = record_mixer.lock()
                         && let Some(mixer) = mixer.as_mut()
@@ -1009,7 +1074,7 @@ impl DtmfEventState {
         // RTP clock is 8000Hz regardless of codec, so ms -> ticks is *8; at
         // least one packet's worth so a very short/zero duration still
         // produces a valid (marker + immediate end) packet train.
-        let total_ticks = (req.duration_ms * 8).max(SAMPLES_PER_PACKET as u32);
+        let total_ticks = (req.duration_ms * 8).max(RTP_TICKS_PER_PACKET);
         Self {
             event_code,
             start_timestamp,
@@ -1036,7 +1101,7 @@ impl DtmfEventState {
         self.marker_sent = true;
 
         if self.elapsed_ticks < self.total_ticks {
-            self.elapsed_ticks = (self.elapsed_ticks + SAMPLES_PER_PACKET as u32).min(self.total_ticks);
+            self.elapsed_ticks = (self.elapsed_ticks + RTP_TICKS_PER_PACKET).min(self.total_ticks);
         }
         let end = self.elapsed_ticks >= self.total_ticks;
         let duration = self.elapsed_ticks.min(u16::MAX as u32) as u16;

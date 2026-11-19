@@ -2879,6 +2879,7 @@ impl App {
     /// twice doesn't overwrite the first recording.
     fn save_recording_if_any(settings: &AppSettings, session: Option<&MediaSession>, number: &str, duration: Duration) {
         let Some(session) = session else { return };
+        let sample_rate = session.sample_rate();
         let Some(samples) = session.stop_recording() else {
             return;
         };
@@ -2907,7 +2908,11 @@ impl App {
         );
         let path = Path::new(dir).join(filename);
         tokio::spawn(async move {
-            match tokio::task::spawn_blocking(move || softphone_media::recording::write_wav(&path, &samples)).await {
+            match tokio::task::spawn_blocking(move || {
+                softphone_media::recording::write_wav(&path, &samples, sample_rate)
+            })
+            .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(%e, "failed to write call recording"),
                 Err(e) => tracing::warn!(%e, "recording write task panicked"),

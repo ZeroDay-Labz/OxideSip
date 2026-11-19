@@ -9,6 +9,7 @@
 //!
 //! Add `--srtp` anywhere to place the call with SRTP on, whatever the
 //! account's own setting is; both modes then encrypt and decrypt.
+//! `--codec=g722` (or `ulaw`, `alaw`) offers only that codec.
 //!
 //! - `rtp`: no audio devices. Sends silence with a short 1800Hz burst every
 //!   two seconds straight over RTP and times how long each burst takes to
@@ -21,8 +22,9 @@
 
 use softphone_core::SoftphoneCore;
 use softphone_core::config;
+use softphone_core::config::PreferredCodec;
 use softphone_core::events::{CallState, CoreCommand, CoreEvent, LocalMediaInfo, RemoteMediaInfo};
-use softphone_media::codec::Codec;
+use softphone_media::codec::{AudioDecoder, AudioEncoder, CodecKind};
 use softphone_media::rtp::RtpHeader;
 use softphone_media::srtp::SrtpContext;
 use softphone_media::{MediaParams, MediaSession, ReservedSocket, SrtpKeys};
@@ -32,7 +34,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-const SAMPLES_PER_PACKET: usize = 160;
 const BURST_HZ: f32 = 1800.0;
 const BURST_PACKETS: u32 = 3;
 const BURST_EVERY_PACKETS: u32 = 100; // 2s
@@ -41,7 +42,8 @@ const BURST_EVERY_PACKETS: u32 = 100; // 2s
 async fn main() {
     tracing_subscriber::fmt::init();
     let force_srtp = std::env::args().any(|a| a == "--srtp");
-    let mut args = std::env::args().skip(1).filter(|a| a != "--srtp");
+    let codec_arg = std::env::args().find_map(|a| a.strip_prefix("--codec=").map(str::to_string));
+    let mut args = std::env::args().skip(1).filter(|a| !a.starts_with("--"));
     let usage = "usage: echo_probe <account name> <number> <rtp|media> [seconds] [--srtp]";
     let account_name = args.next().expect(usage);
     let number = args.next().expect(usage);
@@ -57,6 +59,13 @@ async fn main() {
         .find(|a| a.name.eq_ignore_ascii_case(&account_name))
         .unwrap_or_else(|| panic!("no account named {account_name:?} in {}", path.display()));
     cfg.srtp |= force_srtp;
+    match codec_arg.as_deref() {
+        Some("g722") => cfg.preferred_codecs = vec![PreferredCodec::G722],
+        Some("alaw") => cfg.preferred_codecs = vec![PreferredCodec::Alaw],
+        Some("ulaw") => cfg.preferred_codecs = vec![PreferredCodec::Ulaw],
+        Some(other) => panic!("unknown codec {other:?}: use g722, ulaw or alaw"),
+        None => {}
+    }
 
     let (event_tx, mut event_rx) = mpsc::channel(32);
     let (command_tx, command_rx) = mpsc::channel(32);
@@ -127,10 +136,13 @@ async fn main() {
         }
     };
     println!(
-        "answered: {} to {} payload type {}; running {mode} for {seconds}s",
+        "answered: {} to {}, codec {}; running {mode} for {seconds}s",
         if srtp.is_some() { "SRTP" } else { "plain RTP" },
         remote.remote_addr,
-        remote.payload_type
+        softphone_media::CodecKind::from_payload_type(remote.payload_type).map_or_else(
+            || format!("payload type {}", remote.payload_type),
+            |c| c.name().to_string()
+        )
     );
 
     if let Some(reserved) = reserved {
@@ -162,8 +174,8 @@ async fn main() {
 
 /// Fraction of a packet's energy that sits at `BURST_HZ` (Goertzel): ~1.0
 /// for our burst, far lower for speech or silence.
-fn burst_purity(samples: &[i16]) -> f32 {
-    let coeff = 2.0 * (TAU * BURST_HZ / 8000.0).cos();
+fn burst_purity(samples: &[i16], rate: f32) -> f32 {
+    let coeff = 2.0 * (TAU * BURST_HZ / rate).cos();
     let (mut s1, mut s2, mut energy) = (0f32, 0f32, 0f32);
     for &x in samples {
         let x = x as f32;
@@ -187,8 +199,9 @@ async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, srtp: Option<Srt
         )
     });
     let mut rejected = 0u64;
-    let codec = Codec::from_payload_type(remote.payload_type);
-    let table = codec.build_decode_table();
+    let kind = CodecKind::from_payload_type(remote.payload_type).expect("the PBX chose a codec we don't have");
+    let (mut encoder, mut decoder) = (AudioEncoder::new(kind), AudioDecoder::new(kind));
+    let rate = kind.sample_rate() as f32;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let end = Instant::now() + Duration::from_secs(seconds);
@@ -209,13 +222,14 @@ async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, srtp: Option<Srt
                     burst_sent = Some(Instant::now());
                     phase = 0.0;
                 }
-                let payload: Vec<u8> = (0..SAMPLES_PER_PACKET)
+                let frame: Vec<i16> = (0..kind.samples_per_packet())
                     .map(|_| {
                         let s = if in_burst { (phase.sin() * 12_000.0) as i16 } else { 0 };
-                        phase += TAU * BURST_HZ / 8000.0;
-                        codec.encode(&table, s)
+                        phase += TAU * BURST_HZ / rate;
+                        s
                     })
                     .collect();
+                let payload = encoder.encode(&frame);
                 let header = RtpHeader {
                     marker: n == 0,
                     payload_type: remote.payload_type,
@@ -229,7 +243,7 @@ async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, srtp: Option<Srt
                 }
                 let _ = socket.send_to(&packet, remote.remote_addr).await;
                 seq = seq.wrapping_add(1);
-                ts = ts.wrapping_add(SAMPLES_PER_PACKET as u32);
+                ts = ts.wrapping_add(kind.rtp_ticks_per_packet());
                 n += 1;
             }
             result = socket.recv_from(&mut buf) => {
@@ -255,13 +269,13 @@ async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, srtp: Option<Srt
                 }
                 last_arrival = Some(now);
 
-                let samples: Vec<i16> = payload.iter().map(|&b| codec.decode(b)).collect();
+                let samples = decoder.decode(payload);
                 if let Some(sent) = burst_sent
-                    && burst_purity(&samples) > 0.5
+                    && burst_purity(&samples, rate) > 0.5
                 {
                     // Where in this packet the burst starts.
                     let onset = samples.iter().position(|s| s.unsigned_abs() > 2_000).unwrap_or(0);
-                    let ms = now.duration_since(sent).as_secs_f32() * 1000.0 + onset as f32 / 8.0;
+                    let ms = now.duration_since(sent).as_secs_f32() * 1000.0 + onset as f32 * 1000.0 / rate;
                     println!("burst came back after {ms:.0}ms");
                     round_trips.push(ms);
                     burst_sent = None;

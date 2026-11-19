@@ -20,6 +20,7 @@ ctr = "0.9"
 hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
+audio-codec = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

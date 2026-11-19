@@ -43,6 +43,8 @@ pub enum PreferredCodec {
     #[default]
     Ulaw,
     Alaw,
+    /// G.722: 16 kHz wideband ("HD voice") at G.711's bitrate.
+    G722,
 }
 
 impl PreferredCodec {
@@ -51,6 +53,7 @@ impl PreferredCodec {
         match self {
             PreferredCodec::Ulaw => 0,
             PreferredCodec::Alaw => 8,
+            PreferredCodec::G722 => 9,
         }
     }
 
@@ -58,6 +61,7 @@ impl PreferredCodec {
         match s.to_ascii_lowercase().as_str() {
             "ulaw" => Some(Self::Ulaw),
             "alaw" => Some(Self::Alaw),
+            "g722" => Some(Self::G722),
             _ => None,
         }
     }
@@ -68,11 +72,44 @@ impl std::fmt::Display for PreferredCodec {
         f.write_str(match self {
             PreferredCodec::Ulaw => "G.711 u-law (PCMU)",
             PreferredCodec::Alaw => "G.711 A-law (PCMA)",
+            PreferredCodec::G722 => "G.722 HD voice (wideband)",
         })
     }
 }
 
-pub const PREFERRED_CODECS: [PreferredCodec; 2] = [PreferredCodec::Ulaw, PreferredCodec::Alaw];
+/// Every codec, in the order a new account ranks them: wideband first.
+pub const PREFERRED_CODECS: [PreferredCodec; 3] = [PreferredCodec::G722, PreferredCodec::Ulaw, PreferredCodec::Alaw];
+
+/// Reads a codec list leniently: names this build doesn't know (a codec
+/// added by a newer version, then a downgrade; a typo) are skipped instead
+/// of making the whole accounts file unreadable, and codecs it doesn't list
+/// are appended.
+fn lenient_codecs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<PreferredCodec>, D::Error> {
+    use serde::Deserialize;
+    let names = Vec::<String>::deserialize(deserializer)?;
+    let mut codecs: Vec<PreferredCodec> = names
+        .iter()
+        .filter_map(|name| PreferredCodec::parse_env(name))
+        .collect();
+    // The list is a ranking of every codec, not a selection (the settings
+    // page only reorders). A codec this file doesn't mention — one added in
+    // a later version than wrote it — goes last: offered, but never ahead
+    // of what the account already ranked.
+    for codec in PREFERRED_CODECS {
+        if !codecs.contains(&codec) {
+            codecs.push(codec);
+        }
+    }
+    Ok(codecs)
+}
+
+fn lenient_codecs_opt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<PreferredCodec>>, D::Error> {
+    lenient_codecs(deserializer).map(Some)
+}
 
 /// Which DTMF transport to use during a call. `Auto` negotiates RFC 4733
 /// (RTP `telephone-event`) and falls back to SIP INFO when the peer doesn't
@@ -145,6 +182,7 @@ pub struct SipAccountConfig {
     /// there's no real invariant-violation risk worth the extra type
     /// ceremony here — the UI's codec list editor just always keeps at
     /// least one entry.
+    #[serde(deserialize_with = "lenient_codecs")]
     pub preferred_codecs: Vec<PreferredCodec>,
     /// Which DTMF transport to use during calls on this account. See
     /// `DtmfMode` for the tradeoffs of each option.
@@ -178,7 +216,7 @@ impl Default for SipAccountConfig {
             ca_cert_path: None,
             client_cert_path: None,
             client_key_path: None,
-            preferred_codecs: vec![PreferredCodec::Ulaw, PreferredCodec::Alaw],
+            preferred_codecs: PREFERRED_CODECS.to_vec(),
             dtmf_mode: DtmfMode::default(),
             reg_epoch: 0,
         }
@@ -199,6 +237,7 @@ struct RawConfig {
     ca_cert_path: Option<PathBuf>,
     client_cert_path: Option<PathBuf>,
     client_key_path: Option<PathBuf>,
+    #[serde(default, deserialize_with = "lenient_codecs_opt")]
     preferred_codecs: Option<Vec<PreferredCodec>>,
     dtmf_mode: Option<DtmfMode>,
 }
@@ -300,7 +339,7 @@ impl RawConfig {
             preferred_codecs: self
                 .preferred_codecs
                 .filter(|c| !c.is_empty())
-                .unwrap_or_else(|| vec![PreferredCodec::Ulaw, PreferredCodec::Alaw]),
+                .unwrap_or_else(|| PREFERRED_CODECS.to_vec()),
             dtmf_mode: self.dtmf_mode.unwrap_or_default(),
             reg_epoch: 0,
         })

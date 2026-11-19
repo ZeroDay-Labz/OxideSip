@@ -12,6 +12,9 @@ pub enum MediaError {
     #[error("unsupported rtp version {0}")]
     RtpBadVersion(u8),
 
+    #[error("unsupported audio codec (RTP payload type {0})")]
+    UnsupportedCodec(u8),
+
     #[error("srtp: {0}")]
     Srtp(&'static str),
 }

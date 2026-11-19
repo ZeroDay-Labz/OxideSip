@@ -205,6 +205,17 @@ async fn handle_dialog_state(
                 dlg.reject(Some(StatusCode::NotAcceptableHere), None).ok();
                 return;
             };
+            // Nothing in the offer we have a codec for (G.729-only, say):
+            // refuse now rather than ring for a call that can't have audio.
+            if !remote_offer
+                .payload_types
+                .iter()
+                .any(|pt| sdp::is_supported_payload_type(*pt))
+            {
+                warn!(offered = ?remote_offer.payload_types, "no supported codec in the offer, rejecting call");
+                dlg.reject(Some(StatusCode::NotAcceptableHere), None).ok();
+                return;
+            }
             // With SRTP switched on for this account, a caller offering
             // plain RTP is refused rather than answered unencrypted: the
             // setting means "my calls are encrypted", not "if convenient".

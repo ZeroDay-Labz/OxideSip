@@ -430,6 +430,7 @@ fn call_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<'
                     media_ready: app.media_ready(media),
                     encrypted: media.as_ref().is_some_and(|m| m.is_encrypted()),
                     stats: *stats,
+                    codec: media.as_ref().map(|m| m.codec()),
                     glow: avatar_glow.interpolate(0.0_f32, 1.0_f32, Instant::now()),
                     answered_at: *answered_at,
                     input_level: *input_level,
@@ -629,6 +630,7 @@ struct ActiveView<'a> {
     dtmf_feedback: &'a [char],
     encrypted: bool,
     stats: softphone_media::CallStats,
+    codec: Option<softphone_media::CodecKind>,
 }
 
 enum JoinUi {
@@ -685,7 +687,8 @@ fn active_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens, v: ActiveV
                     muted(t)
                 };
                 text(format!(
-                    "Buffer {} ms · jitter {:.0} ms · loss {:.1}%",
+                    "{} · buffer {} ms · jitter {:.0} ms · loss {:.1}%",
+                    v.codec.map_or("Audio", |c| c.name()),
                     v.stats.buffer_ms,
                     v.stats.jitter_ms,
                     v.stats.loss_percent()
