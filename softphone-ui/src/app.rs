@@ -5,6 +5,7 @@ use crate::history;
 use crate::screenshot::{ShotPage, ShotPlan};
 use crate::theme::{self, ThemeSetting, ToastKind};
 use crate::toast::Toast;
+use crate::updater::{self, InstallKind, UpdateState};
 use crate::{branding, bridge, demo, incoming, notify, number, ui, ui_state};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::{Element, Subscription, Task, window};
@@ -649,6 +650,13 @@ pub struct App {
     ui_state: ui_state::UiState,
     /// When `ui_state` last changed and still needs writing (debounced).
     ui_state_dirty_at: Option<Instant>,
+    /// The updater's state, shown under Settings ▸ About.
+    pub(crate) update: UpdateState,
+    /// How this copy was installed (decides how it can be updated).
+    pub(crate) install_kind: InstallKind,
+    /// The executable's path at startup, for restarting after an update
+    /// (afterwards `current_exe` names a deleted file).
+    exe_path: Option<std::path::PathBuf>,
     /// Running against the scripted demo backend (see `demo.rs`).
     pub(crate) demo: bool,
     /// Phase of the fake level meters in demo mode.
@@ -884,6 +892,16 @@ pub enum Message {
     QuitCancelled,
     OpenUrl(String),
     OpenConfigFolder,
+    UpdateCheckPressed,
+    /// `silent`: the startup check, which only speaks up for a new version.
+    UpdateChecked {
+        result: Result<Option<updater::Release>, String>,
+        silent: bool,
+    },
+    UpdateInstallPressed,
+    UpdateInstalled(Result<String, String>),
+    UpdateRestartPressed,
+    UpdateAutoCheckToggled(bool),
     TestRingPressed,
     TestRingStop,
     /// Screenshot run: stage the next page.
@@ -1068,6 +1086,13 @@ impl App {
             last_escape: None,
             ui_state: saved_ui.clone(),
             ui_state_dirty_at: None,
+            update: UpdateState::Idle,
+            install_kind: if demo {
+                InstallKind::Unmanaged
+            } else {
+                InstallKind::detect()
+            },
+            exe_path: std::env::current_exe().ok(),
             demo,
             demo_phase: 0.0,
             frozen_clock: screenshot_run.then(|| Instant::now() + Duration::from_secs(3)),
@@ -1121,6 +1146,12 @@ impl App {
         ];
         if !demo {
             startup.push(tone_task);
+            if app.settings.check_updates {
+                startup.push(Task::perform(updater::check(), |result| Message::UpdateChecked {
+                    result,
+                    silent: true,
+                }));
+            }
         }
         let _ = screenshot_run;
         (app, Task::batch(startup))
@@ -1938,6 +1969,7 @@ impl App {
                     notify_incoming: self.settings_form.notify_incoming,
                     auto_level: self.settings_form.auto_level,
                     echo_cancel: self.settings_form.echo_cancel,
+                    check_updates: self.settings.check_updates,
                     theme: self.settings_form.theme,
                     recording_enabled: self.settings_form.recording_enabled,
                     recording_path: self.settings_form.recording_path.trim().to_string(),
@@ -2275,6 +2307,97 @@ impl App {
             }
             Message::OpenConfigFolder => {
                 open_external(&crate::paths::config_file("").to_string_lossy());
+                Task::none()
+            }
+            Message::UpdateCheckPressed => {
+                if matches!(self.update, UpdateState::Checking | UpdateState::Working(..)) {
+                    return Task::none();
+                }
+                self.update = UpdateState::Checking;
+                Task::perform(updater::check(), |result| Message::UpdateChecked {
+                    result,
+                    silent: false,
+                })
+            }
+            Message::UpdateChecked { result, silent } => {
+                // A manual check or an update may have started meanwhile.
+                if silent && !matches!(self.update, UpdateState::Idle) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(Some(release)) => {
+                        if silent {
+                            self.push_toast(
+                                ToastKind::Info,
+                                format!("OxideSip {} is available", release.version()),
+                                Some("Update from Settings ▸ About.".to_string()),
+                            );
+                        }
+                        self.update = UpdateState::Available(release);
+                    }
+                    Ok(None) if !silent => self.update = UpdateState::UpToDate,
+                    Err(e) if !silent => self.update = UpdateState::Failed(e),
+                    Ok(None) => {}
+                    Err(e) => tracing::info!(%e, "startup update check failed"),
+                }
+                Task::none()
+            }
+            Message::UpdateInstallPressed => {
+                let UpdateState::Available(release) = &self.update else {
+                    return Task::none();
+                };
+                if !self.install_kind.can_self_update() {
+                    open_external(&release.page);
+                    return Task::none();
+                }
+                let release = release.clone();
+                let progress = Arc::new(updater::Progress::default());
+                self.update = UpdateState::Working(release.clone(), progress.clone());
+                Task::perform(
+                    updater::download_and_install(release, self.install_kind.clone(), progress),
+                    Message::UpdateInstalled,
+                )
+            }
+            Message::UpdateInstalled(result) => {
+                match result {
+                    Ok(version) => {
+                        self.push_toast(
+                            ToastKind::Success,
+                            format!("OxideSip {version} installed"),
+                            Some("Restart to start using it.".to_string()),
+                        );
+                        self.update = UpdateState::Installed(version);
+                    }
+                    Err(e) => {
+                        self.push_toast(ToastKind::Error, "Update failed", Some(e.clone()));
+                        self.update = UpdateState::Failed(e);
+                    }
+                }
+                Task::none()
+            }
+            Message::UpdateRestartPressed => {
+                if self.any_call_in_progress() {
+                    self.push_toast(ToastKind::Warning, "Finish the call before restarting", None);
+                    return Task::none();
+                }
+                let Some(exe) = self.exe_path.clone() else {
+                    self.toast_error("Could not find the program to restart; close and reopen OxideSip.");
+                    return Task::none();
+                };
+                self.flush_ui_state();
+                match updater::relaunch(&exe) {
+                    Ok(()) => iced::exit(),
+                    Err(e) => {
+                        self.toast_error(format!("Could not restart ({e}); close and reopen OxideSip."));
+                        Task::none()
+                    }
+                }
+            }
+            Message::UpdateAutoCheckToggled(enabled) => {
+                self.settings.check_updates = enabled;
+                if let Err(e) = app_settings::save(&self.settings) {
+                    self.toast_error(format!("Could not save settings: {e}"));
+                }
                 Task::none()
             }
             Message::TestRingPressed => {
@@ -3770,6 +3893,16 @@ impl App {
             }
             ShotPage::SettingsCalls => {
                 tasks.push(self.update_inner(Message::SettingsSectionSelected(SettingsSection::Calls)))
+            }
+            ShotPage::SettingsAbout => {
+                self.install_kind = InstallKind::Rpm;
+                self.update = UpdateState::Available(updater::Release {
+                    tag: "v9.9.9".into(),
+                    page: updater::RELEASES_PAGE.into(),
+                    assets: Vec::new(),
+                });
+                self.navigate(Page::Settings);
+                tasks.push(self.update_inner(Message::SettingsSectionSelected(SettingsSection::About)))
             }
         }
         Task::batch(tasks)

@@ -37,6 +37,9 @@ pub struct AppSettings {
     /// a headset). Off by default: a headset doesn't need it.
     #[serde(default)]
     pub echo_cancel: bool,
+    /// Ask GitHub once at startup whether a newer release exists.
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
     #[serde(default)]
     pub recording_enabled: bool,
     #[serde(default)]
@@ -82,6 +85,7 @@ impl Default for AppSettings {
             notify_incoming: true,
             auto_level: true,
             echo_cancel: false,
+            check_updates: true,
             recording_enabled: false,
             recording_path: String::new(),
             secondary_output_target: None,

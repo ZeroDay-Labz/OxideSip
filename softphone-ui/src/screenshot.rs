@@ -15,6 +15,8 @@ pub enum ShotPage {
     SettingsAccounts,
     SettingsAudio,
     SettingsCalls,
+    /// About, with an update on offer (not part of `all`).
+    SettingsAbout,
     /// The compact call bar (an active call shrunk).
     Compact,
     /// Back to the full window after a compact round trip.
@@ -45,6 +47,7 @@ impl ShotPage {
             "settings" | "settings-accounts" => vec![ShotPage::SettingsAccounts],
             "settings-audio" => vec![ShotPage::SettingsAudio],
             "settings-calls" => vec![ShotPage::SettingsCalls],
+            "settings-about" => vec![ShotPage::SettingsAbout],
             "compact" => vec![ShotPage::Compact],
             "compact-restored" => vec![ShotPage::CompactRestored],
             _ => return None,
@@ -61,6 +64,7 @@ impl ShotPage {
             ShotPage::SettingsAccounts => "settings-accounts",
             ShotPage::SettingsAudio => "settings-audio",
             ShotPage::SettingsCalls => "settings-calls",
+            ShotPage::SettingsAbout => "settings-about",
             ShotPage::Compact => "compact",
             ShotPage::CompactRestored => "compact-restored",
         }

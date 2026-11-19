@@ -5,6 +5,16 @@ All notable changes to OxideSip are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-11-19
+
+### Added
+- **In-app updates** (Settings ▸ About). "Check for updates" asks GitHub for the latest release;
+  "Update now" downloads the package matching how OxideSip was installed (RPM, deb or the
+  standalone binary), verifies it against the release's `SHA256SUMS`, installs it — through the
+  system's password prompt for the RPM and deb — and offers a restart. A startup check (on by
+  default, can be switched off) only announces that a newer version exists. The Flatpak and
+  source builds are pointed at the download page instead.
+
 ## [0.4.0] — 2026-11-18
 
 ### Added

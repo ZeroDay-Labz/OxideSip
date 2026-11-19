@@ -67,6 +67,19 @@ The packages install the app, its launcher and icons, and declare their shared-l
 dependencies (PipeWire and friends) from the binary itself. A `SHA256SUMS` file sits next to
 every release asset.
 
+### Updating
+
+**Settings ▸ About ▸ Check for updates** asks GitHub for the latest release. If there is one,
+**Update now** downloads the package matching your install (RPM, deb or the standalone binary),
+checks it against the release's `SHA256SUMS`, and installs it — for the RPM and deb through your
+system's own password prompt (`pkexec`), so nothing is installed without your say-so. Then
+**Restart now** starts the new version. OxideSip also checks once at startup and tells you if a
+newer version exists; that check can be switched off on the same page, and nothing is ever
+downloaded or installed on its own.
+
+The Flatpak cannot replace itself from inside its sandbox, and a build from source is not a
+release package: for those the button opens the download page instead.
+
 ### Requirements
 
 | | |

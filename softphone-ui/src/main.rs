@@ -17,6 +17,7 @@ mod theme;
 mod toast;
 mod ui;
 mod ui_state;
+mod updater;
 
 use app::{App, BootOptions};
 use clap::Parser;

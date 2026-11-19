@@ -39,6 +39,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 clap = { version = "4", features = ["derive"] }
 # Desktop notification (with Answer/Decline actions) for incoming calls.
 notify-rust = "4"
+# In-app updater (`updater.rs`): HTTPS to GitHub's release API with the
+# rustls/ring stack already in the tree (via rsipstack), and the SHA-256
+# check of what it downloads.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha2 = "0.10"
 
 # Consumed by `cargo generate-rpm` (see .github/workflows/release.yml) to
 # build a Fedora-installable RPM from the release binary. Deliberately
