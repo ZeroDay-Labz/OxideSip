@@ -1,4 +1,4 @@
-use softphone_media::{MediaSession, ReservedSocket};
+use softphone_media::{MediaParams, MediaSession, ReservedSocket, SrtpKeys};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -12,7 +12,19 @@ async fn main() {
 
     let remote: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let playback_target = std::env::var("SMOKE_PLAYBACK_TARGET").ok();
-    let session = MediaSession::start(reserved, remote, 0, None, None, playback_target, "OxideSip".into())
+    // SMOKE_SRTP=1 loops the audio back encrypted (same key both ways,
+    // since this session is its own peer).
+    let srtp = std::env::var("SMOKE_SRTP").is_ok().then(|| SrtpKeys {
+        local: "WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz".into(),
+        remote: "WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz".into(),
+    });
+    let params = MediaParams {
+        remote_addr: remote,
+        payload_type: 0,
+        telephone_event_pt: None,
+        srtp,
+    };
+    let session = MediaSession::start(reserved, params, None, playback_target, "OxideSip".into())
         .await
         .expect("start media session");
     println!("media session started, sleeping 20s — check `pw-top` now for steady I/O with no starvation pattern");

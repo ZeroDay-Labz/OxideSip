@@ -84,6 +84,11 @@
     <content_attribute id="social-contacts">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.2.2" date="2026-11-18">
+      <description>
+        <p>SRTP media encryption now really encrypts call audio, incoming calls use the codec that was negotiated, and phone numbers can be copied from the dial field and the call card.</p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-11-18">
       <description>
         <p>Much lower call latency: far-end audio no longer plays seconds late, and an adaptive jitter buffer keeps the delay as small as the network allows.</p>

@@ -73,6 +73,9 @@ struct CurrentCall {
     direction: Direction,
     remote: Option<RemoteMediaInfo>,
     local_crypto_key: Option<String>,
+    /// The `a=crypto` tag of the line an inbound caller offered, echoed in
+    /// our answer (RFC 4568 §5.1). 1 for outbound calls, where we offer.
+    remote_crypto_tag: u32,
     /// Our local RTP port, needed to re-offer the same media socket on a
     /// hold/resume re-INVITE. `None` until the media offer/answer is built
     /// (set alongside `local_crypto_key` in the `PlaceCall`/`AnswerCall`
@@ -151,7 +154,7 @@ pub async fn dialog_state_loop(
         tokio::select! {
             state = state_rx.recv() => {
                 let Some(state) = state else { break };
-                handle_dialog_state(&dialog_layer, &mut tracker, &event_tx, state).await;
+                handle_dialog_state(&dialog_layer, &mut tracker, &event_tx, &config, state).await;
             }
             cmd = command_rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -168,6 +171,7 @@ async fn handle_dialog_state(
     dialog_layer: &Arc<DialogLayer>,
     tracker: &mut DialogTracker,
     event_tx: &mpsc::Sender<CoreEvent>,
+    config: &SipAccountConfig,
     state: DialogState,
 ) {
     match state {
@@ -197,6 +201,14 @@ async fn handle_dialog_state(
                 dlg.reject(Some(StatusCode::NotAcceptableHere), None).ok();
                 return;
             };
+            // With SRTP switched on for this account, a caller offering
+            // plain RTP is refused rather than answered unencrypted: the
+            // setting means "my calls are encrypted", not "if convenient".
+            if config.srtp && remote_offer.crypto_key.is_none() {
+                warn!("SRTP is required for this account but the caller offered plain RTP, rejecting call");
+                dlg.reject(Some(StatusCode::NotAcceptableHere), None).ok();
+                return;
+            }
             // A placeholder pick (just their first-listed codec) purely for
             // the informational `IncomingCall` event/`CurrentCall.remote`
             // seed — the *real* selection against our own preference order
@@ -218,6 +230,7 @@ async fn handle_dialog_state(
                     direction: Direction::Inbound,
                     remote: Some(remote_info.clone()),
                     local_crypto_key: None,
+                    remote_crypto_tag: remote_offer.crypto_tag,
                     local_rtp_port: None,
                     dtmf_tx: None,
                     remote_payload_types: remote_offer.payload_types,
@@ -238,7 +251,7 @@ async fn handle_dialog_state(
             dlg.ringing(None, None).ok();
         }
         DialogState::Early(id, resp) => {
-            if find_outbound_line(tracker, &id).is_some() {
+            if let Some(line) = find_outbound_line(tracker, &id) {
                 match resp.status_code {
                     StatusCode::Ringing => {
                         event_tx
@@ -273,7 +286,15 @@ async fn handle_dialog_state(
                             event_tx
                                 .send(CoreEvent::CallStateChanged {
                                     id: id.call_id.clone(),
-                                    state: CallState::EarlyMedia { remote: remote_info },
+                                    state: CallState::EarlyMedia {
+                                        local: LocalMediaInfo {
+                                            crypto_key: tracker
+                                                .lines
+                                                .get(&line)
+                                                .and_then(|c| c.local_crypto_key.clone()),
+                                        },
+                                        remote: remote_info,
+                                    },
                                 })
                                 .await
                                 .ok();
@@ -521,7 +542,7 @@ async fn handle_command(
             let preferred_payload_types: Vec<u8> = config.preferred_codecs.iter().map(|c| c.payload_type()).collect();
             let local_offer = sdp::generate_offer(
                 local_rtp_port,
-                srtp,
+                srtp.then(sdp::new_crypto_key),
                 false,
                 &preferred_payload_types,
                 config.dtmf_mode != DtmfMode::InfoOnly,
@@ -573,6 +594,7 @@ async fn handle_command(
                     direction: Direction::Outbound,
                     remote: None,
                     local_crypto_key,
+                    remote_crypto_tag: 1,
                     local_rtp_port: Some(local_rtp_port),
                     dtmf_tx: None,
                     // Not meaningful for an outbound call — we're the
@@ -634,6 +656,7 @@ async fn handle_command(
             };
             let remote_payload_types = current.remote_payload_types.clone();
             let remote_telephone_event_pt = current.remote_telephone_event_pt;
+            let remote_crypto_tag = current.remote_crypto_tag;
             let Some(Dialog::ServerInvite(dlg)) = dialog_layer.get_dialog(&dialog_id) else {
                 return;
             };
@@ -653,13 +676,17 @@ async fn handle_command(
             // only advertise telephone-event back if the caller offered it
             // *and* our own mode allows it.
             let answer_telephone_event = remote_telephone_event_pt.is_some() && config.dtmf_mode != DtmfMode::InfoOnly;
-            let local_offer = sdp::generate_offer(
+            // Encrypted exactly when the caller offered it — an answer can't
+            // add or drop SRTP (RFC 4568 §7.1.2), and a plain offer to an
+            // SRTP-required account was already refused when it arrived.
+            let mut local_offer = sdp::generate_offer(
                 local_rtp_port,
-                srtp,
+                remote.crypto_key.is_some().then(sdp::new_crypto_key),
                 false,
                 &[answer_payload_type],
                 answer_telephone_event,
             );
+            local_offer.crypto_tag = remote_crypto_tag;
             let local_crypto_key = local_offer.crypto_key.clone();
             let answer_sdp = sdp::build_sdp(local_media_addr, &local_offer).to_string();
             let headers = vec![Header::ContentType("application/sdp".into())];
@@ -667,19 +694,17 @@ async fn handle_command(
                 warn!(error = %e, "failed to accept call");
                 return;
             }
-            if let Some(current) = tracker.find_mut(&id) {
-                current.local_crypto_key = local_crypto_key.clone();
-                current.local_rtp_port = Some(local_rtp_port);
-            }
-
             // `remote` still carries whatever the caller *offered* —
-            // override its `telephone_event_pt` with what our own answer
+            // override its `payload_type` with the codec our answer actually
+            // selected (the caller's first-listed one is not necessarily
+            // it), and its `telephone_event_pt` with what our own answer
             // actually declared (`answer_telephone_event`, computed above
             // per RFC 3264 and honoring `config.dtmf_mode`), so the UI
             // (which uses this field to pick RTP telephone-event vs. SIP
             // INFO for outgoing DTMF on this call) doesn't send RFC 4733
             // packets our SDP answer never negotiated.
             let remote = RemoteMediaInfo {
+                payload_type: answer_payload_type,
                 telephone_event_pt: if answer_telephone_event {
                     remote_telephone_event_pt
                 } else {
@@ -687,6 +712,11 @@ async fn handle_command(
                 },
                 ..remote
             };
+            if let Some(current) = tracker.find_mut(&id) {
+                current.local_crypto_key = local_crypto_key.clone();
+                current.local_rtp_port = Some(local_rtp_port);
+                current.remote = Some(remote.clone());
+            }
             event_tx
                 .send(CoreEvent::CallStateChanged {
                     id,
@@ -701,10 +731,10 @@ async fn handle_command(
                 .ok();
         }
         CoreCommand::HoldCall(id) => {
-            handle_hold_resume(dialog_layer, tracker, event_tx, config, local_media_addr, id, true).await;
+            handle_hold_resume(dialog_layer, tracker, event_tx, local_media_addr, id, true).await;
         }
         CoreCommand::ResumeCall(id) => {
-            handle_hold_resume(dialog_layer, tracker, event_tx, config, local_media_addr, id, false).await;
+            handle_hold_resume(dialog_layer, tracker, event_tx, local_media_addr, id, false).await;
         }
         CoreCommand::BlindTransfer { id, target } => {
             let Some(current) = tracker.find(&id) else {
@@ -851,7 +881,6 @@ async fn handle_hold_resume(
     dialog_layer: &Arc<DialogLayer>,
     tracker: &mut DialogTracker,
     event_tx: &mpsc::Sender<CoreEvent>,
-    config: &SipAccountConfig,
     local_media_addr: IpAddr,
     id: CallId,
     hold: bool,
@@ -867,6 +896,9 @@ async fn handle_hold_resume(
         return;
     };
     let dialog_id = current.dialog_id.clone();
+    // Same key as the rest of the call: the peer keeps decrypting with the
+    // one it already has, and our own SRTP state carries straight on.
+    let local_crypto_key = current.local_crypto_key.clone();
     let Some(dialog) = dialog_layer.get_dialog(&dialog_id) else {
         return;
     };
@@ -880,21 +912,13 @@ async fn handle_hold_resume(
     let active_telephone_event = remote.telephone_event_pt.is_some();
     let local_offer = sdp::generate_offer(
         local_rtp_port,
-        config.srtp,
+        local_crypto_key.clone(),
         hold,
         &[active_payload_type],
         active_telephone_event,
     );
-    let local_crypto_key = local_offer.crypto_key.clone();
     let body = sdp::build_sdp(local_media_addr, &local_offer).to_string().into_bytes();
     let headers = vec![Header::ContentType("application/sdp".into())];
-
-    // `local_crypto_key` is *our own* freshly-generated offer, not something
-    // that depends on the re-INVITE's response, so it's safe (and correct)
-    // to record it right away rather than waiting on the network round trip.
-    if let Some(current) = tracker.find_mut(&id) {
-        current.local_crypto_key = local_crypto_key.clone();
-    }
 
     // The actual `reinvite().await` is spawned, not awaited inline — same
     // reasoning as `SendDtmf`/`HangUp` above: this function runs inside

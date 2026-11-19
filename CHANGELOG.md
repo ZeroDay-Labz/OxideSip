@@ -5,6 +5,29 @@ All notable changes to OxideSip are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-11-18
+
+### Fixed
+- **SRTP now actually encrypts.** With "SRTP media encryption" on, the call was negotiated as
+  encrypted but the audio was still sent as plain RTP. Audio is now encrypted and authenticated
+  (AES-CM-128 with HMAC-SHA1-80, RFC 3711) in both directions, and packets that fail the check
+  are dropped.
+- Incoming calls could start audio with the caller's first-listed codec instead of the one the
+  answer selected from your codec priority.
+- Hold and resume no longer change the SRTP key in the middle of a call.
+
+### Changed
+- With SRTP on, a call that cannot be encrypted is refused or ended with a message instead of
+  silently continuing unencrypted. Incoming encrypted calls are accepted even when the setting
+  is off.
+- SRTP offers from the other side are checked properly: only `AES_CM_128_HMAC_SHA1_80` is
+  accepted, key lifetimes are tolerated, and the answer echoes the offered crypto tag.
+
+### Added
+- Copy buttons for the number in the dial field and on the call card.
+- A lock indicator on the call card while a call is encrypted.
+- `echo_probe --srtp` to place an encrypted test call.
+
 ## [0.2.1] — 2026-11-18
 
 ### Fixed
@@ -91,6 +114,7 @@ All notable changes to OxideSip are documented here. The format follows
 - Multi-account support, codec priority, SRTP, TLS, recording, contacts import / export,
   Flatpak / RPM / deb packaging, and the first incoming-call popup.
 
+[0.2.2]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/ZeroDay-Labz/OxideSip/releases/tag/v0.1.8

@@ -78,7 +78,15 @@ fn dial_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<'
         app.dial_history_open,
         Some(Message::DialHistoryToggled),
     );
-    let input_row = row![field, recent].spacing(theme::space::SM).align_y(Alignment::Center);
+    let copy = components::icon_button(
+        icons::copy(16.0, muted(t)),
+        "Copy number",
+        false,
+        (!app.dial_input.is_empty()).then(|| Message::CopyNumber(app.dial_input.clone())),
+    );
+    let input_row = row![field, copy, recent]
+        .spacing(theme::space::SM)
+        .align_y(Alignment::Center);
 
     let has_last_outgoing = app.call_history.iter().any(|e| e.direction == CallDirection::Outgoing);
     let redial = circle_button(icons::refresh(18.0, t.text), 52.0, theme::circle(false));
@@ -418,6 +426,7 @@ fn call_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<'
                     number,
                     remote_name: remote_name.as_deref(),
                     media_ready: app.media_ready(media),
+                    encrypted: media.as_ref().is_some_and(|m| m.is_encrypted()),
                     glow: avatar_glow.interpolate(0.0_f32, 1.0_f32, Instant::now()),
                     answered_at: *answered_at,
                     input_level: *input_level,
@@ -490,24 +499,32 @@ fn identity_block<'a>(
     t: &Tokens,
 ) -> Element<'a, Message> {
     let mut col = column![].spacing(2);
-    match name {
+    // The number is always followed by a copy button, whichever line it
+    // ends up on.
+    let copy = components::icon_button(
+        icons::copy(14.0, muted(t)),
+        "Copy number",
+        false,
+        Some(Message::CopyNumber(number.to_string())),
+    );
+    let number_text = match name {
         Some(name) => {
-            col = col
-                .push(
-                    text(name)
-                        .size(theme::text_size::TITLE + 2.0)
-                        .font(branding::UI_FONT_SEMIBOLD),
-                )
-                .push(text(number).size(theme::text_size::BODY).color(muted(t)));
-        }
-        None => {
             col = col.push(
-                text(number)
+                text(name)
                     .size(theme::text_size::TITLE + 2.0)
                     .font(branding::UI_FONT_SEMIBOLD),
-            )
+            );
+            text(number).size(theme::text_size::BODY).color(muted(t))
         }
-    }
+        None => text(number)
+            .size(theme::text_size::TITLE + 2.0)
+            .font(branding::UI_FONT_SEMIBOLD),
+    };
+    col = col.push(
+        row![number_text, copy]
+            .spacing(theme::space::XS)
+            .align_y(Alignment::Center),
+    );
     col.push(text(status).size(theme::text_size::BODY).color(status_color))
         .into()
 }
@@ -605,6 +622,7 @@ struct ActiveView<'a> {
     on_hold: bool,
     transfer_input: Option<&'a str>,
     dtmf_feedback: &'a [char],
+    encrypted: bool,
 }
 
 enum JoinUi {
@@ -643,7 +661,16 @@ fn active_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens, v: ActiveV
     let seed = name.unwrap_or(v.number);
     let header = row![
         avatar(seed, call_avatar_label(&app.contacts, v.number), 72.0, v.glow),
-        identity_block(name, v.number, status, status_color, t),
+        column![identity_block(name, v.number, status, status_color, t)]
+            .push(v.encrypted.then(|| {
+                row![
+                    icons::lock(12.0, t.success),
+                    text("Encrypted (SRTP)").size(theme::text_size::CAPTION).color(muted(t)),
+                ]
+                .spacing(theme::space::XS)
+                .align_y(Alignment::Center)
+            }))
+            .spacing(2),
     ]
     .spacing(theme::space::LG)
     .align_y(Alignment::Center);

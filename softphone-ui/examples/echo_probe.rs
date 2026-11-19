@@ -7,6 +7,9 @@
 //! cargo run -p softphone-ui --example echo_probe -- "<account name>" '*43' media 30
 //! ```
 //!
+//! Add `--srtp` anywhere to place the call with SRTP on, whatever the
+//! account's own setting is; both modes then encrypt and decrypt.
+//!
 //! - `rtp`: no audio devices. Sends silence with a short 1800Hz burst every
 //!   two seconds straight over RTP and times how long each burst takes to
 //!   come back, plus how unevenly the PBX's packets arrive. That is the
@@ -18,10 +21,11 @@
 
 use softphone_core::SoftphoneCore;
 use softphone_core::config;
-use softphone_core::events::{CallState, CoreCommand, CoreEvent, RemoteMediaInfo};
+use softphone_core::events::{CallState, CoreCommand, CoreEvent, LocalMediaInfo, RemoteMediaInfo};
 use softphone_media::codec::Codec;
 use softphone_media::rtp::RtpHeader;
-use softphone_media::{MediaSession, ReservedSocket};
+use softphone_media::srtp::SrtpContext;
+use softphone_media::{MediaParams, MediaSession, ReservedSocket, SrtpKeys};
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -36,8 +40,9 @@ const BURST_EVERY_PACKETS: u32 = 100; // 2s
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    let mut args = std::env::args().skip(1);
-    let usage = "usage: echo_probe <account name> <number> <rtp|media> [seconds]";
+    let force_srtp = std::env::args().any(|a| a == "--srtp");
+    let mut args = std::env::args().skip(1).filter(|a| a != "--srtp");
+    let usage = "usage: echo_probe <account name> <number> <rtp|media> [seconds] [--srtp]";
     let account_name = args.next().expect(usage);
     let number = args.next().expect(usage);
     let mode = args.next().expect(usage);
@@ -46,11 +51,12 @@ async fn main() {
     let path = dirs::config_dir()
         .expect("no config dir")
         .join("oxidesip/accounts.toml");
-    let cfg = config::load_accounts(&path)
+    let mut cfg = config::load_accounts(&path)
         .expect("failed to read accounts.toml")
         .into_iter()
         .find(|a| a.name.eq_ignore_ascii_case(&account_name))
         .unwrap_or_else(|| panic!("no account named {account_name:?} in {}", path.display()));
+    cfg.srtp |= force_srtp;
 
     let (event_tx, mut event_rx) = mpsc::channel(32);
     let (command_tx, command_rx) = mpsc::channel(32);
@@ -82,7 +88,7 @@ async fn main() {
     let mut placed = false;
     let deadline = tokio::time::sleep(Duration::from_secs(30));
     tokio::pin!(deadline);
-    let remote: RemoteMediaInfo = loop {
+    let (local, remote): (LocalMediaInfo, RemoteMediaInfo) = loop {
         tokio::select! {
             _ = &mut deadline => { eprintln!("timed out waiting for the call to be answered"); std::process::exit(1); }
             event = event_rx.recv() => match event.expect("core stopped") {
@@ -95,7 +101,7 @@ async fn main() {
                         .ok();
                 }
                 CoreEvent::OutgoingCallStarted { id, .. } => call_id = Some(id),
-                CoreEvent::CallStateChanged { state: CallState::Answered { remote, .. }, .. } => break remote,
+                CoreEvent::CallStateChanged { state: CallState::Answered { local, remote }, .. } => break (local, remote),
                 CoreEvent::CallStateChanged { state: CallState::Terminated(why), .. } => {
                     eprintln!("call ended before answer: {why}");
                     std::process::exit(1);
@@ -112,27 +118,35 @@ async fn main() {
             }
         }
     };
+    let srtp = match (local.crypto_key, remote.crypto_key.clone()) {
+        (Some(local), Some(remote)) => Some(SrtpKeys { local, remote }),
+        (None, None) => None,
+        _ => {
+            eprintln!("only one side offered an SRTP key; not sending audio");
+            std::process::exit(1);
+        }
+    };
     println!(
-        "answered: rtp to {} payload type {}; running {mode} for {seconds}s",
-        remote.remote_addr, remote.payload_type
+        "answered: {} to {} payload type {}; running {mode} for {seconds}s",
+        if srtp.is_some() { "SRTP" } else { "plain RTP" },
+        remote.remote_addr,
+        remote.payload_type
     );
 
     if let Some(reserved) = reserved {
-        let session = MediaSession::start(
-            reserved,
-            remote.remote_addr,
-            remote.payload_type,
-            remote.telephone_event_pt,
-            None,
-            None,
-            "OxideSip echo probe".into(),
-        )
-        .await
-        .expect("start media session");
+        let params = MediaParams {
+            remote_addr: remote.remote_addr,
+            payload_type: remote.payload_type,
+            telephone_event_pt: remote.telephone_event_pt,
+            srtp,
+        };
+        let session = MediaSession::start(reserved, params, None, None, "OxideSip echo probe".into())
+            .await
+            .expect("start media session");
         tokio::time::sleep(Duration::from_secs(seconds)).await;
         session.stop().await;
     } else if let Some(socket) = raw_socket {
-        rtp_probe(socket, &remote, seconds).await;
+        rtp_probe(socket, &remote, srtp, seconds).await;
     }
 
     if let Some(id) = call_id {
@@ -164,7 +178,14 @@ fn burst_purity(samples: &[i16]) -> f32 {
     power / (energy * samples.len() as f32 / 2.0)
 }
 
-async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, seconds: u64) {
+async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, srtp: Option<SrtpKeys>, seconds: u64) {
+    let mut contexts = srtp.map(|keys| {
+        (
+            SrtpContext::new(&keys.local).expect("local srtp key"),
+            SrtpContext::new(&keys.remote).expect("remote srtp key"),
+        )
+    });
+    let mut rejected = 0u64;
     let codec = Codec::from_payload_type(remote.payload_type);
     let table = codec.build_decode_table();
     let mut tick = tokio::time::interval(Duration::from_millis(20));
@@ -201,7 +222,11 @@ async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, seconds: u64) {
                     timestamp: ts,
                     ssrc: 0x0DE5_1B43,
                 };
-                let _ = socket.send_to(&header.build_packet(&payload), remote.remote_addr).await;
+                let mut packet = header.build_packet(&payload);
+                if let Some((tx, _)) = contexts.as_mut() {
+                    tx.protect(&mut packet).expect("srtp protect");
+                }
+                let _ = socket.send_to(&packet, remote.remote_addr).await;
                 seq = seq.wrapping_add(1);
                 ts = ts.wrapping_add(SAMPLES_PER_PACKET as u32);
                 n += 1;
@@ -210,6 +235,13 @@ async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, seconds: u64) {
                 let now = Instant::now();
                 let Ok((len, from)) = result else { continue };
                 if from.ip() != remote.remote_addr.ip() { continue }
+                let len = match contexts.as_mut() {
+                    Some((_, rx)) => match rx.unprotect(&mut buf[..len]) {
+                        Ok(plain_len) => plain_len,
+                        Err(_) => { rejected += 1; continue }
+                    },
+                    None => len,
+                };
                 let Ok((header, payload)) = RtpHeader::decode(&buf[..len]) else { continue };
                 if header.payload_type != remote.payload_type { continue }
                 received += 1;
@@ -238,6 +270,9 @@ async fn rtp_probe(socket: UdpSocket, remote: &RemoteMediaInfo, seconds: u64) {
     }
 
     println!("\nreceived {received} packets, {lost} lost");
+    if contexts.is_some() {
+        println!("SRTP: every one of those authenticated and decrypted; {rejected} packets failed the check");
+    }
     if !gaps_ms.is_empty() {
         let mut late: Vec<f32> = gaps_ms.iter().map(|g| g - 20.0).collect();
         late.sort_by(f32::total_cmp);

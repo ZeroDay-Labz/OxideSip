@@ -62,6 +62,8 @@ icon_fn!(clock, "clock.svg");
 icon_fn!(arrow_left, "arrow-left.svg");
 icon_fn!(book_user, "book-user.svg");
 icon_fn!(layout_grid, "layout-grid.svg");
+icon_fn!(copy, "copy.svg");
+icon_fn!(lock, "lock.svg");
 
 /// The app logo glyph (handset + signal arcs), tinted.
 pub fn logo<'a>(size: f32, color: Color) -> Element<'a, Message> {

@@ -9,8 +9,10 @@ use crate::{branding, bridge, demo, incoming, notify, number, ui, ui_state};
 use iced::keyboard::{self, Key, Modifiers};
 use iced::{Element, Subscription, Task, window};
 use softphone_core::config::{DtmfMode, PREFERRED_CODECS, PreferredCodec, SipAccountConfig, SipTransport};
-use softphone_core::events::{CallId, CallState, CoreCommand, CoreEvent, RejectReason, RemoteMediaInfo, RemoteParty};
-use softphone_media::{AudioDevice, DtmfTonePlayer, MediaSession, ReservedSocket};
+use softphone_core::events::{
+    CallId, CallState, CoreCommand, CoreEvent, LocalMediaInfo, RejectReason, RemoteMediaInfo, RemoteParty,
+};
+use softphone_media::{AudioDevice, DtmfTonePlayer, MediaParams, MediaSession, ReservedSocket, SrtpKeys};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -758,6 +760,9 @@ pub enum Message {
     /// field without playing a dial tone per pasted character, since a
     /// pasted number wasn't actually dialed.
     DialInputPasted(String),
+    /// Put a phone number (from the dial field or a call card) on the
+    /// clipboard.
+    CopyNumber(String),
     DialHistoryToggled,
     DialHistorySelected(String),
     DialpadPressed(char),
@@ -781,7 +786,7 @@ pub enum Message {
     /// Lifecycle of the desktop notification shown for a ringing call.
     Notification(CallId, notify::Event),
     HangUpPressed,
-    MediaReady(usize, CallId, Result<Arc<Mutex<Option<MediaSession>>>, String>),
+    MediaReady(usize, CallId, Result<SharedMediaSession, String>),
     OpenSipSettings,
     OpenAudioSettings,
     SipSettingsNameChanged(String),
@@ -1604,7 +1609,7 @@ impl App {
             }
             Message::MediaReady(account, id, Err(reason)) => {
                 tracing::warn!(%reason, "failed to start media session, hanging up");
-                self.toast_error(format!("audio pipeline failed: {reason}"));
+                self.toast_error(format!("Call audio failed: {reason}"));
                 if let Some(acc) = self.accounts.get(account) {
                     acc.send_command(CoreCommand::HangUp(id));
                 }
@@ -2164,6 +2169,10 @@ impl App {
             Message::DialBackspace => {
                 self.dial_input.pop();
                 Task::none()
+            }
+            Message::CopyNumber(number) => {
+                self.toast_success(format!("Copied {number}"));
+                iced::clipboard::write(number)
             }
             Message::KeypadToggled => {
                 self.keypad_open = !self.keypad_open;
@@ -3021,7 +3030,7 @@ impl App {
                 }
                 Task::none()
             }
-            CallState::EarlyMedia { remote } => {
+            CallState::EarlyMedia { local, remote } => {
                 if let Some(player) = &self.tone_player {
                     player.stop_ringback();
                 }
@@ -3053,23 +3062,13 @@ impl App {
                 if self.demo {
                     return Task::none();
                 }
+                let params = media_params(&local, &remote);
                 Task::future(async move {
-                    let result = MediaSession::start(
-                        reserved,
-                        remote.remote_addr,
-                        remote.payload_type,
-                        remote.telephone_event_pt,
-                        capture_target,
-                        playback_target,
-                        label,
-                    )
-                    .await
-                    .map(|session| Arc::new(Mutex::new(Some(session))))
-                    .map_err(|e| e.to_string());
+                    let result = start_media(reserved, params, capture_target, playback_target, label).await;
                     Message::MediaReady(account, id, result)
                 })
             }
-            CallState::Answered { remote, .. } => {
+            CallState::Answered { local, remote } => {
                 let Some(idx) = acc.line_index_for_call(&id) else {
                     tracing::warn!("answered event for a call we're not tracking");
                     return Task::none();
@@ -3216,24 +3215,14 @@ impl App {
                 let label = format!("OxideSip Acct{} Line {}", account + 1, idx + 1);
                 let post_dial_id = id.clone();
                 let demo = self.demo;
+                let params = media_params(&local, &remote);
                 let media_task = Task::future(async move {
                     if demo {
                         // No audio in demo mode; the pending socket is just
                         // dropped. `media_ready` reports true for demo calls.
                         return Message::Tick;
                     }
-                    let result = MediaSession::start(
-                        reserved,
-                        remote.remote_addr,
-                        remote.payload_type,
-                        remote.telephone_event_pt,
-                        capture_target,
-                        playback_target,
-                        label,
-                    )
-                    .await
-                    .map(|session| Arc::new(Mutex::new(Some(session))))
-                    .map_err(|e| e.to_string());
+                    let result = start_media(reserved, params, capture_target, playback_target, label).await;
                     Message::MediaReady(account, id, result)
                 });
                 if has_post_dial {
@@ -3990,4 +3979,41 @@ fn open_external(target: &str) {
     if let Err(e) = std::process::Command::new("xdg-open").arg(target).spawn() {
         tracing::warn!(%e, target, "xdg-open failed");
     }
+}
+
+/// The audio parameters for a call from what signaling negotiated. SRTP is
+/// on exactly when both sides put a key in their SDP; one side only (we
+/// offered encryption and the answer came back without it) is an error, so
+/// the call fails instead of quietly running unencrypted.
+fn media_params(local: &LocalMediaInfo, remote: &RemoteMediaInfo) -> Result<MediaParams, String> {
+    let srtp = match (&local.crypto_key, &remote.crypto_key) {
+        (Some(local), Some(remote)) => Some(SrtpKeys {
+            local: local.clone(),
+            remote: remote.clone(),
+        }),
+        (None, None) => None,
+        (Some(_), None) => return Err("the other side did not accept SRTP encryption".into()),
+        (None, Some(_)) => return Err("the other side requires SRTP encryption".into()),
+    };
+    Ok(MediaParams {
+        remote_addr: remote.remote_addr,
+        payload_type: remote.payload_type,
+        telephone_event_pt: remote.telephone_event_pt,
+        srtp,
+    })
+}
+
+type SharedMediaSession = Arc<Mutex<Option<MediaSession>>>;
+
+async fn start_media(
+    reserved: ReservedSocket,
+    params: Result<MediaParams, String>,
+    capture_target: Option<String>,
+    playback_target: Option<String>,
+    label: String,
+) -> Result<SharedMediaSession, String> {
+    MediaSession::start(reserved, params?, capture_target, playback_target, label)
+        .await
+        .map(|session| Arc::new(Mutex::new(Some(session))))
+        .map_err(|e| e.to_string())
 }

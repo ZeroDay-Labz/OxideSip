@@ -14,6 +14,18 @@ use vec1::vec1;
 /// other dynamic payload type today, so collision risk is negligible.
 pub const TELEPHONE_EVENT_PT: u8 = 101;
 
+/// The one SDES-SRTP crypto suite (RFC 4568 §6.2) this app implements.
+pub const SRTP_SUITE: &str = "AES_CM_128_HMAC_SHA1_80";
+/// Length of that suite's master key (16) + master salt (14).
+const SRTP_KEY_AND_SALT_LEN: usize = 30;
+
+/// A fresh random SRTP master key + salt, base64-encoded for `a=crypto`.
+pub fn new_crypto_key() -> String {
+    let mut key_and_salt = [0u8; SRTP_KEY_AND_SALT_LEN];
+    rand::fill(&mut key_and_salt);
+    base64::engine::general_purpose::STANDARD.encode(key_and_salt)
+}
+
 /// Negotiated audio media parameters. `port` is a placeholder until
 /// softphone-media reserves a real local port (see `dialog.rs`'s deferred
 /// answer-SDP construction); no RTP/SRTP socket is opened by this crate.
@@ -35,6 +47,9 @@ pub struct MediaOffer {
     /// base64-encoded 30-byte AES_CM_128_HMAC_SHA1_80 master key + salt.
     /// `None` when negotiating plain RTP (no SDES-SRTP, RFC 4568).
     pub crypto_key: Option<String>,
+    /// The `a=crypto` tag that goes with `crypto_key` (RFC 4568 §5.1). An
+    /// answer must echo the tag of the offered line it accepted.
+    pub crypto_tag: u32,
     /// The peer's RTP socket address, parsed from their SDP connection line.
     /// `None` when building our own offer (no remote to speak of yet).
     pub remote_addr: Option<SocketAddr>,
@@ -44,17 +59,22 @@ pub struct MediaOffer {
     pub hold: bool,
 }
 
-pub fn generate_offer(port: u16, srtp: bool, hold: bool, payload_types: &[u8], telephone_event: bool) -> MediaOffer {
-    let crypto_key = srtp.then(|| {
-        let mut key_and_salt = [0u8; 30];
-        rand::fill(&mut key_and_salt);
-        base64::engine::general_purpose::STANDARD.encode(key_and_salt)
-    });
+/// `crypto_key` is our SRTP key for this call (see `new_crypto_key`), or
+/// `None` for plain RTP. It is passed in rather than generated here because
+/// one call keeps one key: hold/resume re-INVITEs must re-offer the same one.
+pub fn generate_offer(
+    port: u16,
+    crypto_key: Option<String>,
+    hold: bool,
+    payload_types: &[u8],
+    telephone_event: bool,
+) -> MediaOffer {
     MediaOffer {
         port,
         payload_types: payload_types.to_vec(),
         telephone_event_pt: telephone_event.then_some(TELEPHONE_EVENT_PT),
         crypto_key,
+        crypto_tag: 1,
         remote_addr: None,
         hold,
     }
@@ -127,7 +147,7 @@ pub fn build_sdp(local_addr: IpAddr, offer: &MediaOffer) -> SessionDescription {
     if let Some(crypto_key) = &offer.crypto_key {
         attributes.push(Attribute::Other(
             "crypto".into(),
-            Some(format!("1 AES_CM_128_HMAC_SHA1_80 inline:{crypto_key}")),
+            Some(format!("{} {SRTP_SUITE} inline:{crypto_key}", offer.crypto_tag)),
         ));
     }
     if offer.hold {
@@ -187,7 +207,8 @@ pub fn build_sdp(local_addr: IpAddr, offer: &MediaOffer) -> SessionDescription {
 
 /// Parse the `m=audio`/`a=rtpmap`/`a=crypto` fields out of a peer's SDP body.
 /// A missing `a=crypto` line is not an error — it just means the peer offered
-/// plain RTP.
+/// plain RTP. An `RTP/SAVP` media line without a crypto line we can use *is*
+/// one: the peer wants encryption and we can't key it.
 pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
     let sdp =
         SessionDescription::try_from(sdp_text).map_err(|e| CoreError::Sdp(format!("failed to parse SDP: {e}")))?;
@@ -221,13 +242,19 @@ pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
         return Err(CoreError::Sdp("empty or invalid fmt list".into()));
     }
 
-    let crypto_key = media.attributes.iter().find_map(|attr| match attr {
-        Attribute::Other(key, Some(value)) if key == "crypto" => value
-            .split("inline:")
-            .nth(1)
-            .map(|s| s.split_whitespace().next().unwrap_or(s).to_string()),
+    let crypto = media.attributes.iter().find_map(|attr| match attr {
+        Attribute::Other(key, Some(value)) if key == "crypto" => parse_crypto(value),
         _ => None,
     });
+    if media.media.proto == ProtoType::RtpSavp && crypto.is_none() {
+        return Err(CoreError::Sdp(format!(
+            "RTP/SAVP without a usable {SRTP_SUITE} crypto line"
+        )));
+    }
+    let (crypto_tag, crypto_key) = match crypto {
+        Some((tag, key)) => (tag, Some(key)),
+        None => (1, None),
+    };
 
     let ip = media
         .connections
@@ -242,9 +269,31 @@ pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
         payload_types,
         telephone_event_pt,
         crypto_key,
+        crypto_tag,
         remote_addr,
         hold: false,
     })
+}
+
+/// Parses one `a=crypto` value (`<tag> <suite> inline:<key>[|lifetime][|MKI]
+/// [session params]`, RFC 4568 §9.1) into `(tag, base64 key)`. Returns `None`
+/// for any suite other than `SRTP_SUITE`, for a key that isn't 30 bytes, and
+/// for a line carrying an MKI (`|<id>:<len>`), which would change the packet
+/// format in a way we don't implement — so a peer listing several lines gets
+/// the first one we can actually honour.
+fn parse_crypto(value: &str) -> Option<(u32, String)> {
+    let mut parts = value.split_whitespace();
+    let tag: u32 = parts.next()?.parse().ok()?;
+    if parts.next()? != SRTP_SUITE {
+        return None;
+    }
+    let mut key_params = parts.next()?.strip_prefix("inline:")?.split('|');
+    let key = key_params.next()?;
+    if key_params.any(|p| p.contains(':')) {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD.decode(key).ok()?;
+    (decoded.len() == SRTP_KEY_AND_SALT_LEN).then(|| (tag, key.to_string()))
 }
 
 #[cfg(test)]
@@ -254,7 +303,7 @@ mod tests {
 
     #[test]
     fn build_and_parse_round_trip_without_telephone_event() {
-        let offer = generate_offer(10000, false, false, &[0, 8], false);
+        let offer = generate_offer(10000, None, false, &[0, 8], false);
         let sdp = build_sdp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), &offer);
         let parsed = parse_offer(&sdp.to_string()).unwrap();
         assert_eq!(parsed.payload_types, vec![0, 8]);
@@ -263,7 +312,7 @@ mod tests {
 
     #[test]
     fn build_and_parse_round_trip_with_telephone_event() {
-        let offer = generate_offer(10000, false, false, &[0, 8], true);
+        let offer = generate_offer(10000, None, false, &[0, 8], true);
         assert_eq!(offer.telephone_event_pt, Some(TELEPHONE_EVENT_PT));
 
         let sdp = build_sdp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), &offer);
@@ -305,5 +354,59 @@ mod tests {
             a=fmtp:101 0-15\r\n";
         let err = parse_offer(sdp_text).unwrap_err();
         assert!(matches!(err, CoreError::Sdp(_)));
+    }
+
+    const KEY: &str = "WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz";
+
+    fn offer_with(media_line: &str, attrs: &str) -> String {
+        format!("v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\n{media_line}\r\n{attrs}")
+    }
+
+    #[test]
+    fn crypto_line_with_lifetime_and_extra_suites_is_parsed() {
+        let sdp = offer_with(
+            "m=audio 4000 RTP/SAVP 0",
+            &format!(
+                "a=crypto:1 AES_256_CM_HMAC_SHA1_80 inline:{KEY}\r\n\
+                 a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:{KEY}|2^31 UNENCRYPTED_SRTCP\r\n\
+                 a=crypto:3 AES_CM_128_HMAC_SHA1_32 inline:{KEY}\r\n"
+            ),
+        );
+        let parsed = parse_offer(&sdp).unwrap();
+        assert_eq!(parsed.crypto_key.as_deref(), Some(KEY));
+        assert_eq!(parsed.crypto_tag, 2);
+    }
+
+    #[test]
+    fn savp_without_a_usable_crypto_line_is_rejected() {
+        for attrs in [
+            String::new(),
+            format!("a=crypto:1 AES_CM_128_HMAC_SHA1_32 inline:{KEY}\r\n"),
+            format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{KEY}|2^31|1:4\r\n"),
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:dG9vIHNob3J0\r\n".to_string(),
+        ] {
+            let sdp = offer_with("m=audio 4000 RTP/SAVP 0", &attrs);
+            assert!(
+                matches!(parse_offer(&sdp), Err(CoreError::Sdp(_))),
+                "accepted: {attrs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_echoes_the_offered_crypto_tag() {
+        let mut answer = generate_offer(10000, Some(new_crypto_key()), false, &[0], false);
+        answer.crypto_tag = 2;
+        let text = build_sdp("192.168.1.50".parse().unwrap(), &answer).to_string();
+        assert!(text.contains("RTP/SAVP"));
+        assert!(text.contains("a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:"));
+    }
+
+    #[test]
+    fn our_preference_order_picks_the_codec() {
+        assert_eq!(select_payload_type(&[0, 8], &[8, 0]), Some(8));
+        assert_eq!(select_payload_type(&[9, 8], &[0, 8]), Some(8));
+        assert_eq!(select_payload_type(&[9], &[0, 8]), Some(9));
+        assert_eq!(select_payload_type(&[], &[0, 8]), None);
     }
 }

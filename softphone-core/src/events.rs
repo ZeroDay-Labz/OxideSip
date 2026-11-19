@@ -31,6 +31,7 @@ pub enum CallState {
     /// OK — the far end offered early media (e.g. an in-band ringback or
     /// announcement) and we can already open an RTP stream toward it.
     EarlyMedia {
+        local: LocalMediaInfo,
         remote: RemoteMediaInfo,
     },
     Answered {

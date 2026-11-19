@@ -2,6 +2,7 @@ use crate::codec;
 use crate::error::MediaError;
 use crate::pipewire_io::{self, PipewireShared, PwThreadHandle};
 use crate::rtp::RtpHeader;
+use crate::srtp::SrtpContext;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::collections::VecDeque;
@@ -64,6 +65,36 @@ impl ReservedSocket {
     }
 }
 
+/// What signaling negotiated for one call's audio.
+#[derive(Debug, Clone)]
+pub struct MediaParams {
+    /// Where the peer wants its RTP.
+    pub remote_addr: SocketAddr,
+    /// The negotiated audio codec's RTP payload type.
+    pub payload_type: u8,
+    /// The negotiated RFC 4733 `telephone-event` payload type, if any.
+    pub telephone_event_pt: Option<u8>,
+    /// `Some` when the call negotiated SDES-SRTP: every packet sent is then
+    /// encrypted, and every packet received must authenticate.
+    pub srtp: Option<SrtpKeys>,
+}
+
+/// The two base64 `a=crypto` keys of an SRTP call.
+#[derive(Clone)]
+pub struct SrtpKeys {
+    /// Ours: what we encrypt with.
+    pub local: String,
+    /// The peer's: what we decrypt with.
+    pub remote: String,
+}
+
+impl std::fmt::Debug for SrtpKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the keys themselves — this ends up in logs.
+        f.write_str("SrtpKeys(..)")
+    }
+}
+
 pub struct MediaSession {
     cancel: CancellationToken,
     pw_handle: Option<PwThreadHandle>,
@@ -118,6 +149,7 @@ pub struct MediaSession {
     /// Digits `recv_loop` has decoded from the peer's RFC 4733 event
     /// packets, since the last `drain_received_dtmf` call.
     received_dtmf: Arc<Mutex<VecDeque<char>>>,
+    encrypted: bool,
 }
 
 /// One queued outbound DTMF digit, RFC 4733-style.
@@ -179,13 +211,27 @@ impl MediaSession {
     /// streams are distinguishable in pw-top/pavucontrol.
     pub async fn start(
         reserved: ReservedSocket,
-        remote_addr: SocketAddr,
-        payload_type: u8,
-        telephone_event_pt: Option<u8>,
+        params: MediaParams,
         capture_target: Option<String>,
         playback_target: Option<String>,
         label: String,
     ) -> Result<Self, MediaError> {
+        let MediaParams {
+            remote_addr,
+            payload_type,
+            telephone_event_pt,
+            srtp,
+        } = params;
+        // Built before anything is started: a call that negotiated SRTP but
+        // has an unusable key must fail here, never fall back to plain RTP.
+        let (send_srtp, recv_srtp) = match &srtp {
+            Some(keys) => (
+                Some(SrtpContext::new(&keys.local)?),
+                Some(SrtpContext::new(&keys.remote)?),
+            ),
+            None => (None, None),
+        };
+        let encrypted = srtp.is_some();
         reserved.socket.set_nonblocking(true)?;
         let socket = Arc::new(UdpSocket::from_std(reserved.socket)?);
 
@@ -230,6 +276,7 @@ impl MediaSession {
             remote_addr,
             payload_type,
             telephone_event_pt,
+            send_srtp,
             capture_cons,
             notify,
             bridge_relay_in.clone(),
@@ -244,6 +291,7 @@ impl MediaSession {
             remote_addr.ip(),
             payload_type,
             telephone_event_pt,
+            recv_srtp,
             playback_prod,
             output_gain_bits.clone(),
             bridge_relay_out.clone(),
@@ -274,7 +322,13 @@ impl MediaSession {
             telephone_event_pt,
             dtmf_send_tx,
             received_dtmf,
+            encrypted,
         })
+    }
+
+    /// Whether this call's audio is SRTP-encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
     }
 
     /// Starts accumulating a recording of this call — safe to call multiple
@@ -508,6 +562,7 @@ async fn send_loop(
     remote_addr: SocketAddr,
     payload_type: u8,
     telephone_event_pt: Option<u8>,
+    mut srtp: Option<SrtpContext>,
     mut capture_cons: ringbuf::HeapCons<i16>,
     notify: Arc<Notify>,
     bridge_relay_in: Arc<Mutex<Option<HeapCons<i16>>>>,
@@ -600,7 +655,7 @@ async fn send_loop(
                         timestamp,
                         ssrc,
                     };
-                    let _ = socket.send_to(&header.build_packet(&payload), remote_addr).await;
+                    send_packet(&socket, remote_addr, header.build_packet(&payload), srtp.as_mut()).await;
                     sequence_number = sequence_number.wrapping_add(1);
                     timestamp = timestamp.wrapping_add(got as u32);
                     sent_count += 1;
@@ -627,7 +682,7 @@ async fn send_loop(
                     }
                     if let Some(state) = dtmf_active.as_mut() {
                         let done = state
-                            .send_next(&socket, remote_addr, pt, ssrc, &mut sequence_number)
+                            .send_next(&socket, remote_addr, pt, ssrc, &mut sequence_number, srtp.as_mut())
                             .await;
                         if done {
                             dtmf_active = None;
@@ -645,6 +700,7 @@ async fn recv_loop(
     remote_ip: std::net::IpAddr,
     payload_type: u8,
     telephone_event_pt: Option<u8>,
+    mut srtp: Option<SrtpContext>,
     mut playback_prod: ringbuf::HeapProd<i16>,
     output_gain_bits: Arc<AtomicU32>,
     bridge_relay_out: Arc<Mutex<Option<HeapProd<i16>>>>,
@@ -657,6 +713,7 @@ async fn recv_loop(
     let mut buf = [0u8; 2048];
     let mut reorder = ReorderBuffer::new();
     let mut received_count: u64 = 0;
+    let mut rejected_count: u64 = 0;
     // Dedups a digit to one `received_dtmf` push per key press, keyed by
     // (event code, timestamp) — timestamp, not sequence number, is what the
     // sender holds frozen across the `DTMF_END_PACKET_REPEATS` redundant end
@@ -677,6 +734,21 @@ async fn recv_loop(
                 if from.ip() != remote_ip {
                     continue;
                 }
+                // On an SRTP call nothing is looked at, let alone played,
+                // before it has authenticated under the peer's key.
+                let n = match srtp.as_mut() {
+                    Some(ctx) => match ctx.unprotect(&mut buf[..n]) {
+                        Ok(plain_len) => plain_len,
+                        Err(e) => {
+                            rejected_count += 1;
+                            if rejected_count == 1 || rejected_count.is_multiple_of(250) {
+                                tracing::warn!(error = %e, rejected_count, "dropping packet that failed SRTP checks");
+                            }
+                            continue;
+                        }
+                    },
+                    None => n,
+                };
                 let Ok((header, payload)) = RtpHeader::decode(&buf[..n]) else { continue };
                 if Some(header.payload_type) == telephone_event_pt {
                     if let [event_code, byte1, ..] = *payload {
@@ -735,6 +807,17 @@ async fn recv_loop(
             }
         }
     }
+}
+
+/// Sends one RTP packet, encrypting it first on an SRTP call. A packet that
+/// can't be encrypted is dropped, never sent in the clear.
+async fn send_packet(socket: &UdpSocket, remote_addr: SocketAddr, mut packet: Vec<u8>, srtp: Option<&mut SrtpContext>) {
+    if let Some(ctx) = srtp
+        && ctx.protect(&mut packet).is_err()
+    {
+        return;
+    }
+    let _ = socket.send_to(&packet, remote_addr).await;
 }
 
 /// One RFC 4733 telephone-event 4-byte payload:
@@ -821,6 +904,7 @@ impl DtmfEventState {
         payload_type: u8,
         ssrc: u32,
         sequence_number: &mut u16,
+        srtp: Option<&mut SrtpContext>,
     ) -> bool {
         let marker = !self.marker_sent;
         self.marker_sent = true;
@@ -839,7 +923,7 @@ impl DtmfEventState {
             timestamp: self.start_timestamp,
             ssrc,
         };
-        let _ = socket.send_to(&header.build_packet(&payload), remote_addr).await;
+        send_packet(socket, remote_addr, header.build_packet(&payload), srtp).await;
         *sequence_number = sequence_number.wrapping_add(1);
 
         if end {
@@ -976,7 +1060,9 @@ mod tests {
         let mut out = Vec::new();
         for _ in 0..packets {
             let marker_before = !state.marker_sent;
-            let done = state.send_next(&socket, remote_addr, 101, 0xdead_beef, &mut seq).await;
+            let done = state
+                .send_next(&socket, remote_addr, 101, 0xdead_beef, &mut seq, None)
+                .await;
             out.push((marker_before, done, state.elapsed_ticks as u16));
         }
         out
@@ -1010,7 +1096,7 @@ mod tests {
         let remote_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut seq = 0u16;
         for _ in 0..5 {
-            state.send_next(&socket, remote_addr, 101, 1, &mut seq).await;
+            state.send_next(&socket, remote_addr, 101, 1, &mut seq, None).await;
             assert_eq!(state.start_timestamp, 42_000);
         }
     }
@@ -1031,7 +1117,7 @@ mod tests {
         let mut seq = 0u16;
         let mut done_at = None;
         for i in 1..=20 {
-            let done = state.send_next(&socket, remote_addr, 101, 1, &mut seq).await;
+            let done = state.send_next(&socket, remote_addr, 101, 1, &mut seq, None).await;
             if done {
                 done_at = Some(i);
                 break;
@@ -1057,7 +1143,7 @@ mod tests {
         let mut seq = 0u16;
         let mut completed = false;
         for _ in 0..(DTMF_END_PACKET_REPEATS as usize + 1) {
-            if state.send_next(&socket, remote_addr, 101, 1, &mut seq).await {
+            if state.send_next(&socket, remote_addr, 101, 1, &mut seq, None).await {
                 completed = true;
                 break;
             }
