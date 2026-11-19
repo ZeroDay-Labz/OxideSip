@@ -154,7 +154,7 @@ pub async fn dialog_state_loop(
         tokio::select! {
             state = state_rx.recv() => {
                 let Some(state) = state else { break };
-                handle_dialog_state(&dialog_layer, &mut tracker, &event_tx, &config, state).await;
+                handle_dialog_state(&dialog_layer, &mut tracker, &event_tx, &config, local_media_addr, state).await;
             }
             cmd = command_rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -172,6 +172,7 @@ async fn handle_dialog_state(
     tracker: &mut DialogTracker,
     event_tx: &mpsc::Sender<CoreEvent>,
     config: &SipAccountConfig,
+    local_media_addr: IpAddr,
     state: DialogState,
 ) {
     match state {
@@ -346,6 +347,114 @@ async fn handle_dialog_state(
                             crypto_key: local_crypto_key,
                         },
                         remote: remote_info,
+                    },
+                })
+                .await
+                .ok();
+        }
+        DialogState::Updated(id, request, handle) => {
+            // A re-INVITE or UPDATE from the other side: remote hold/resume,
+            // a media address change, or a session refresh. Left unanswered
+            // the stack replies 501, which a PBX may treat as a dead call.
+            let Some(current) = tracker.find_mut(&id.call_id) else {
+                handle.reply(StatusCode::CallTransactionDoesNotExist).await.ok();
+                return;
+            };
+            let (Some(local_rtp_port), Some(remote)) = (current.local_rtp_port, current.remote.clone()) else {
+                // Not answered yet: nothing to renegotiate against.
+                handle.reply(StatusCode::RequestPending).await.ok();
+                return;
+            };
+            let headers = Some(vec![Header::ContentType("application/sdp".into())]);
+
+            if request.body.is_empty() {
+                // No offer in the request. An UPDATE like that is a plain
+                // session refresh; a re-INVITE wants *our* offer in the 200.
+                if request.method == rsipstack::sip::Method::Invite {
+                    let offer = sdp::generate_offer(
+                        local_rtp_port,
+                        current.local_crypto_key.clone(),
+                        false,
+                        &[remote.payload_type],
+                        remote.telephone_event_pt.is_some(),
+                    );
+                    let body = sdp::build_sdp(local_media_addr, &offer).to_string().into_bytes();
+                    handle.respond(StatusCode::OK, headers, Some(body)).await.ok();
+                } else {
+                    handle.reply(StatusCode::OK).await.ok();
+                }
+                return;
+            }
+
+            let offer = match sdp::parse_offer(&String::from_utf8_lossy(&request.body)) {
+                Ok(offer) => offer,
+                Err(e) => {
+                    warn!(error = %e, "unusable SDP in re-INVITE/UPDATE, refusing it");
+                    handle.reply(StatusCode::NotAcceptableHere).await.ok();
+                    return;
+                }
+            };
+            let Some(remote_addr) = offer.remote_addr else {
+                handle.reply(StatusCode::NotAcceptableHere).await.ok();
+                return;
+            };
+            // Encryption can't be dropped mid-call.
+            if remote.crypto_key.is_some() && offer.crypto_key.is_none() {
+                warn!("re-INVITE/UPDATE tried to turn SRTP off, refusing it");
+                handle.reply(StatusCode::NotAcceptableHere).await.ok();
+                return;
+            }
+
+            // Stay on the codec the call is using if it is still offered.
+            let payload_type = if offer.payload_types.contains(&remote.payload_type) {
+                remote.payload_type
+            } else {
+                let preferred: Vec<u8> = config.preferred_codecs.iter().map(|c| c.payload_type()).collect();
+                sdp::select_payload_type(&offer.payload_types, &preferred).unwrap_or(remote.payload_type)
+            };
+            let telephone_event = offer.telephone_event_pt.is_some() && remote.telephone_event_pt.is_some();
+            let mut answer = sdp::generate_offer(
+                local_rtp_port,
+                offer
+                    .crypto_key
+                    .is_some()
+                    .then(|| current.local_crypto_key.clone())
+                    .flatten(),
+                false,
+                &[payload_type],
+                telephone_event,
+            );
+            answer.crypto_tag = offer.crypto_tag;
+            answer.direction = offer.direction.answer();
+            let body = sdp::build_sdp(local_media_addr, &answer).to_string().into_bytes();
+            if handle.respond(StatusCode::OK, headers, Some(body)).await.is_err() {
+                return;
+            }
+
+            let remote_hold = offer.puts_us_on_hold();
+            let updated = RemoteMediaInfo {
+                // A hold with `c=0.0.0.0` names no real address; keep the
+                // one we have for when the call is taken back.
+                remote_addr: if remote_addr.ip().is_unspecified() {
+                    remote.remote_addr
+                } else {
+                    remote_addr
+                },
+                payload_type,
+                telephone_event_pt: if telephone_event {
+                    offer.telephone_event_pt
+                } else {
+                    None
+                },
+                crypto_key: offer.crypto_key,
+            };
+            current.remote = Some(updated.clone());
+            event_tx
+                .send(CoreEvent::CallStateChanged {
+                    id: id.call_id.clone(),
+                    state: CallState::RemoteUpdated {
+                        remote: updated,
+                        remote_hold,
                     },
                 })
                 .await

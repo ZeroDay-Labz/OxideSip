@@ -39,6 +39,14 @@ pub enum CallState {
         remote: RemoteMediaInfo,
     },
     Held,
+    /// The other side changed the call's media with a re-INVITE or UPDATE
+    /// (which we accepted): it may have moved its RTP address, and
+    /// `remote_hold` says whether it has stopped listening to us (put us on
+    /// hold). Sent again with `remote_hold: false` when it takes us back.
+    RemoteUpdated {
+        remote: RemoteMediaInfo,
+        remote_hold: bool,
+    },
     Rejected,
     Terminated(String),
 }

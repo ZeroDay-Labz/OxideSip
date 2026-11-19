@@ -414,8 +414,10 @@ fn call_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<'
             output_volume,
             input_volume,
             on_hold,
+            remote_hold,
             transfer_input,
             avatar_glow,
+            stats,
             ..
         } => (
             active_card(
@@ -427,6 +429,7 @@ fn call_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<'
                     remote_name: remote_name.as_deref(),
                     media_ready: app.media_ready(media),
                     encrypted: media.as_ref().is_some_and(|m| m.is_encrypted()),
+                    stats: *stats,
                     glow: avatar_glow.interpolate(0.0_f32, 1.0_f32, Instant::now()),
                     answered_at: *answered_at,
                     input_level: *input_level,
@@ -435,6 +438,7 @@ fn call_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens) -> Element<'
                     output_volume: *output_volume,
                     input_volume: *input_volume,
                     on_hold: *on_hold,
+                    remote_hold: *remote_hold,
                     transfer_input: transfer_input.as_deref(),
                     dtmf_feedback,
                 },
@@ -620,9 +624,11 @@ struct ActiveView<'a> {
     output_volume: f32,
     input_volume: f32,
     on_hold: bool,
+    remote_hold: bool,
     transfer_input: Option<&'a str>,
     dtmf_feedback: &'a [char],
     encrypted: bool,
+    stats: softphone_media::CallStats,
 }
 
 enum JoinUi {
@@ -655,6 +661,7 @@ fn active_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens, v: ActiveV
         (JoinUi::Joined { partner }, _, _) => (format!("Joined with line {partner}"), t.success),
         (_, false, _) => ("Connecting audio…".to_string(), t.warning),
         (_, _, true) => ("On hold".to_string(), t.warning),
+        _ if v.remote_hold => ("On hold by the other side".to_string(), t.warning),
         _ => (format_elapsed(app.elapsed(v.answered_at)), t.success),
     };
     let name = contact_name_for(&app.contacts, v.number).or(v.remote_name);
@@ -669,6 +676,22 @@ fn active_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens, v: ActiveV
                 ]
                 .spacing(theme::space::XS)
                 .align_y(Alignment::Center)
+            }))
+            .push((v.stats.received > 0).then(|| {
+                // Receive side only: what this app can measure directly.
+                let quality_color = if v.stats.loss_percent() >= 3.0 || v.stats.jitter_ms >= 40.0 {
+                    t.warning
+                } else {
+                    muted(t)
+                };
+                text(format!(
+                    "Buffer {} ms · jitter {:.0} ms · loss {:.1}%",
+                    v.stats.buffer_ms,
+                    v.stats.jitter_ms,
+                    v.stats.loss_percent()
+                ))
+                .size(theme::text_size::CAPTION)
+                .color(quality_color)
             }))
             .spacing(2),
     ]
@@ -825,6 +848,20 @@ fn active_card<'a>(app: &'a App, acc: &'a AccountSession, t: &Tokens, v: ActiveV
 }
 
 /// A live level meter fused with the gain slider that controls it.
+/// How far along a meter a 0.0–1.0 peak amplitude should reach. Meters are
+/// drawn on a decibel scale (-48 dBFS at the left edge, full scale at the
+/// right) because that is how loudness is heard: on a linear scale ordinary
+/// speech, which peaks around a tenth of full scale, would barely move the
+/// bar off zero.
+fn meter_fraction(level: f32) -> f32 {
+    const FLOOR_DB: f32 = -48.0;
+    if level <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * level.log10();
+    ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
+}
+
 fn meter_slider<'a>(
     t: &Tokens,
     label: &'a str,
@@ -833,12 +870,13 @@ fn meter_slider<'a>(
     on_change: impl Fn(f32) -> Message + 'a,
 ) -> Element<'a, Message> {
     let height = 22.0;
+    let level = meter_fraction(level);
     let fill = container(text(""))
-        .width(Length::FillPortion((level.clamp(0.0, 1.0) * 1000.0) as u16 + 1))
+        .width(Length::FillPortion((level * 1000.0) as u16 + 1))
         .height(Length::Fill)
         .style(theme::led(t.success));
     let empty = container(text(""))
-        .width(Length::FillPortion(((1.0 - level.clamp(0.0, 1.0)) * 1000.0) as u16 + 1))
+        .width(Length::FillPortion(((1.0 - level) * 1000.0) as u16 + 1))
         .height(Length::Fill);
     let track = container(row![fill, empty])
         .width(Length::Fill)
@@ -846,6 +884,7 @@ fn meter_slider<'a>(
         .padding(3)
         .style(theme::raised);
     let handle = slider(0.0..=2.0, value, on_change)
+        .on_release(Message::VolumeSliderReleased)
         .step(0.05_f32)
         .width(Length::Fill)
         .style(theme::meter_slider);

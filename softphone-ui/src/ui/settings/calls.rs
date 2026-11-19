@@ -30,6 +30,20 @@ pub fn view<'a>(app: &'a App, t: &Tokens) -> Element<'a, Message> {
             form.notify_incoming,
             Message::SettingsNotifyToggled,
         ),
+        toggle_row(
+            t,
+            "Automatic volume levelling",
+            "Brings quiet callers up and loud ones down to one standard level, and does the same for your microphone.",
+            form.auto_level,
+            Message::SettingsAutoLevelToggled,
+        ),
+        toggle_row(
+            t,
+            "Echo cancellation",
+            "For speakers instead of a headset: stops the other side hearing themselves. Uses PipeWire's echo canceller; applies from the next call.",
+            form.echo_cancel,
+            Message::SettingsEchoCancelToggled,
+        ),
     ]
     .spacing(theme::space::LG);
 

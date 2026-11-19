@@ -26,6 +26,30 @@ pub fn new_crypto_key() -> String {
     base64::engine::general_purpose::STANDARD.encode(key_and_salt)
 }
 
+/// Which way audio flows, from the point of view of whoever wrote the SDP
+/// (RFC 3264 §5.1). `SendRecv` is the default when no attribute is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaDirection {
+    #[default]
+    SendRecv,
+    /// "I will send but not listen": how a party puts the other on hold.
+    SendOnly,
+    RecvOnly,
+    Inactive,
+}
+
+impl MediaDirection {
+    /// The direction to answer an offer of `self` with: the mirror image.
+    pub fn answer(self) -> Self {
+        match self {
+            MediaDirection::SendRecv => MediaDirection::SendRecv,
+            MediaDirection::SendOnly => MediaDirection::RecvOnly,
+            MediaDirection::RecvOnly => MediaDirection::SendOnly,
+            MediaDirection::Inactive => MediaDirection::Inactive,
+        }
+    }
+}
+
 /// Negotiated audio media parameters. `port` is a placeholder until
 /// softphone-media reserves a real local port (see `dialog.rs`'s deferred
 /// answer-SDP construction); no RTP/SRTP socket is opened by this crate.
@@ -53,10 +77,19 @@ pub struct MediaOffer {
     /// The peer's RTP socket address, parsed from their SDP connection line.
     /// `None` when building our own offer (no remote to speak of yet).
     pub remote_addr: Option<SocketAddr>,
-    /// `true` marks this offer as a hold re-INVITE (`a=sendonly`); `false` is
-    /// the normal `sendrecv` case (attribute omitted, matching prior wire
-    /// behavior exactly).
-    pub hold: bool,
+    /// `SendOnly` is how we put a call on hold; `SendRecv` is the normal case
+    /// (attribute omitted on the wire). For a parsed SDP, what the peer
+    /// declared — see `puts_us_on_hold`.
+    pub direction: MediaDirection,
+}
+
+impl MediaOffer {
+    /// Whether this (peer's) SDP stops them listening to us: `sendonly` or
+    /// `inactive`, or the older `c=0.0.0.0` convention (RFC 2543).
+    pub fn puts_us_on_hold(&self) -> bool {
+        matches!(self.direction, MediaDirection::SendOnly | MediaDirection::Inactive)
+            || self.remote_addr.is_some_and(|a| a.ip().is_unspecified())
+    }
 }
 
 /// `crypto_key` is our SRTP key for this call (see `new_crypto_key`), or
@@ -76,7 +109,11 @@ pub fn generate_offer(
         crypto_key,
         crypto_tag: 1,
         remote_addr: None,
-        hold,
+        direction: if hold {
+            MediaDirection::SendOnly
+        } else {
+            MediaDirection::SendRecv
+        },
     }
 }
 
@@ -150,8 +187,13 @@ pub fn build_sdp(local_addr: IpAddr, offer: &MediaOffer) -> SessionDescription {
             Some(format!("{} {SRTP_SUITE} inline:{crypto_key}", offer.crypto_tag)),
         ));
     }
-    if offer.hold {
-        attributes.push(Attribute::Sendonly);
+    match offer.direction {
+        MediaDirection::SendRecv => {}
+        MediaDirection::SendOnly => attributes.push(Attribute::Sendonly),
+        MediaDirection::RecvOnly => attributes.push(Attribute::Recvonly),
+        // Not `Attribute::Inactive`: sdp-rs 0.2.1 only recognises that
+        // variant under a misspelt name, so spell the attribute out.
+        MediaDirection::Inactive => attributes.push(Attribute::Other("inactive".into(), None)),
     }
 
     SessionDescription {
@@ -256,6 +298,21 @@ pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
         None => (1, None),
     };
 
+    // Media-level direction wins over session-level (RFC 4566 §6).
+    let direction_of = |attrs: &[Attribute]| {
+        attrs.iter().find_map(|attr| match attr {
+            Attribute::Sendonly => Some(MediaDirection::SendOnly),
+            Attribute::Recvonly => Some(MediaDirection::RecvOnly),
+            Attribute::Sendrecv => Some(MediaDirection::SendRecv),
+            Attribute::Inactive => Some(MediaDirection::Inactive),
+            Attribute::Other(key, None) if key == "inactive" => Some(MediaDirection::Inactive),
+            _ => None,
+        })
+    };
+    let direction = direction_of(&media.attributes)
+        .or_else(|| direction_of(&sdp.attributes))
+        .unwrap_or_default();
+
     let ip = media
         .connections
         .first()
@@ -271,7 +328,7 @@ pub fn parse_offer(sdp_text: &str) -> Result<MediaOffer> {
         crypto_key,
         crypto_tag,
         remote_addr,
-        hold: false,
+        direction,
     })
 }
 
@@ -408,5 +465,32 @@ mod tests {
         assert_eq!(select_payload_type(&[9, 8], &[0, 8]), Some(8));
         assert_eq!(select_payload_type(&[9], &[0, 8]), Some(9));
         assert_eq!(select_payload_type(&[], &[0, 8]), None);
+    }
+
+    #[test]
+    fn direction_round_trips_and_detects_hold() {
+        for (direction, held) in [
+            (MediaDirection::SendRecv, false),
+            (MediaDirection::SendOnly, true),
+            (MediaDirection::RecvOnly, false),
+            (MediaDirection::Inactive, true),
+        ] {
+            let mut offer = generate_offer(10000, None, false, &[0], false);
+            offer.direction = direction;
+            let text = build_sdp("192.168.1.50".parse().unwrap(), &offer).to_string();
+            let parsed = parse_offer(&text).unwrap();
+            assert_eq!(parsed.direction, direction, "{text}");
+            assert_eq!(parsed.puts_us_on_hold(), held);
+        }
+        assert_eq!(MediaDirection::SendOnly.answer(), MediaDirection::RecvOnly);
+        assert_eq!(MediaDirection::Inactive.answer(), MediaDirection::Inactive);
+    }
+
+    #[test]
+    fn session_level_direction_and_zero_address_mean_hold() {
+        let session_level = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\na=sendonly\r\nm=audio 4000 RTP/AVP 0\r\n";
+        assert!(parse_offer(session_level).unwrap().puts_us_on_hold());
+        let zero = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\n";
+        assert!(parse_offer(zero).unwrap().puts_us_on_hold());
     }
 }

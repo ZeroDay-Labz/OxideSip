@@ -12,7 +12,7 @@ use softphone_core::config::{DtmfMode, PREFERRED_CODECS, PreferredCodec, SipAcco
 use softphone_core::events::{
     CallId, CallState, CoreCommand, CoreEvent, LocalMediaInfo, RejectReason, RemoteMediaInfo, RemoteParty,
 };
-use softphone_media::{AudioDevice, DtmfTonePlayer, MediaParams, MediaSession, ReservedSocket, SrtpKeys};
+use softphone_media::{AudioDevice, CallStats, DtmfTonePlayer, MediaParams, MediaSession, ReservedSocket, SrtpKeys};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -49,6 +49,9 @@ pub enum RegistrationStatus {
     },
 }
 
+// One slot per line (five in all), each rewritten in place as a call moves
+// through its states; boxing the big variants would only add indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum CallUiState {
     Idle,
     Incoming {
@@ -91,6 +94,8 @@ pub enum CallUiState {
         direction: history::CallDirection,
         media: Option<MediaSession>,
         dtmf_feedback: Vec<char>,
+        /// Latest receive-quality snapshot from the media session.
+        stats: CallStats,
         answered_at: Instant,
         input_level: f32,
         output_level: f32,
@@ -98,6 +103,8 @@ pub enum CallUiState {
         output_volume: f32,
         input_volume: f32,
         on_hold: bool,
+        /// The other side has put us on hold (see `CallState::RemoteUpdated`).
+        remote_hold: bool,
         /// Output volume to restore on resume — the actual applied gain is
         /// forced to 0 while `on_hold`, independent of what the slider shows.
         pre_hold_output_volume: f32,
@@ -315,6 +322,8 @@ pub struct SettingsForm {
     pub deny_list: Vec<String>,
     pub deny_list_input: String,
     pub notify_incoming: bool,
+    pub auto_level: bool,
+    pub echo_cancel: bool,
     pub theme: ThemeSetting,
     pub recording_enabled: bool,
     pub recording_path: String,
@@ -330,6 +339,8 @@ impl SettingsForm {
             deny_list: settings.deny_list.clone(),
             deny_list_input: String::new(),
             notify_incoming: settings.notify_incoming,
+            auto_level: settings.auto_level,
+            echo_cancel: settings.echo_cancel,
             theme: settings.theme,
             recording_enabled: settings.recording_enabled,
             recording_path: settings.recording_path.clone(),
@@ -818,6 +829,10 @@ pub enum Message {
     SettingsDndToggled(bool),
     SettingsAutoAnswerToggled(bool),
     SettingsNotifyToggled(bool),
+    SettingsAutoLevelToggled(bool),
+    SettingsEchoCancelToggled(bool),
+    /// A volume slider was let go of: remember where it was left.
+    VolumeSliderReleased,
     SettingsDenyListInputChanged(String),
     SettingsDenyListAddPressed,
     SettingsDenyListRemovePressed(usize),
@@ -1570,6 +1585,7 @@ impl App {
                     && *current == id
                 {
                     if let Some(session) = &session {
+                        session.set_auto_level(self.settings.auto_level);
                         if self.settings.recording_enabled && !self.settings.recording_path.trim().is_empty() {
                             session.start_recording();
                         }
@@ -1592,14 +1608,20 @@ impl App {
                         on_hold,
                         avatar_glow,
                         secondary_input_on,
+                        output_volume,
+                        input_volume,
                         ..
                     } = &mut acc.lines[idx]
                     {
                         avatar_glow.go_mut(avatar_live(media.is_some(), *on_hold), Instant::now());
-                        if let Some(session) = media.as_ref()
-                            && *secondary_input_on
-                        {
-                            session.set_secondary_input_enabled(true);
+                        if let Some(session) = media.as_ref() {
+                            // A new session starts at unity gain: bring it
+                            // to where this call's sliders already are.
+                            session.set_output_volume(if *on_hold { 0.0 } else { slider_gain(*output_volume) });
+                            session.set_input_gain(slider_gain(*input_volume));
+                            if *secondary_input_on {
+                                session.set_secondary_input_enabled(true);
+                            }
                         }
                     }
                 }
@@ -1844,6 +1866,18 @@ impl App {
                 self.settings_form.notify_incoming = enabled;
                 Task::none()
             }
+            Message::SettingsAutoLevelToggled(enabled) => {
+                self.settings_form.auto_level = enabled;
+                Task::none()
+            }
+            Message::SettingsEchoCancelToggled(enabled) => {
+                self.settings_form.echo_cancel = enabled;
+                Task::none()
+            }
+            Message::VolumeSliderReleased => {
+                self.mark_ui_state_dirty();
+                Task::none()
+            }
             Message::SettingsAutoAnswerToggled(enabled) => {
                 self.settings_form.auto_answer = enabled;
                 Task::none()
@@ -1904,6 +1938,8 @@ impl App {
                     forwarding_number: self.settings.forwarding_number.clone(),
                     deny_list: self.settings_form.deny_list.clone(),
                     notify_incoming: self.settings_form.notify_incoming,
+                    auto_level: self.settings_form.auto_level,
+                    echo_cancel: self.settings_form.echo_cancel,
                     theme: self.settings_form.theme,
                     recording_enabled: self.settings_form.recording_enabled,
                     recording_path: self.settings_form.recording_path.trim().to_string(),
@@ -2035,6 +2071,7 @@ impl App {
                         input_level,
                         output_level,
                         dtmf_feedback,
+                        stats,
                         ..
                     } = &mut acc.lines[idx]
                     {
@@ -2046,8 +2083,20 @@ impl App {
                         // factor still reaches near the true value within a
                         // couple of ticks instead of trailing noticeably behind.
                         const SMOOTHING: f32 = 0.55;
-                        *input_level += (session.input_level() - *input_level) * SMOOTHING;
-                        *output_level += (session.output_level() - *output_level) * SMOOTHING;
+                        // `input_level()`/`output_level()` are the peak since
+                        // the previous tick. Rise to it at once (so speech
+                        // registers the moment it starts), fall back smoothly.
+                        for (shown, peak) in [
+                            (&mut *input_level, session.input_level()),
+                            (&mut *output_level, session.output_level()),
+                        ] {
+                            *shown = if peak > *shown {
+                                peak
+                            } else {
+                                *shown + (peak - *shown) * SMOOTHING
+                            };
+                        }
+                        *stats = session.stats();
                         // Digits the peer sent us via RFC 4733 — shares the
                         // same on-screen feedback trail as digits we sent,
                         // same as a real desk phone's display.
@@ -2101,10 +2150,11 @@ impl App {
                         if let Some(session) = media
                             && !*on_hold
                         {
-                            session.set_output_volume(gain);
+                            session.set_output_volume(slider_gain(gain));
                         }
                     }
                 }
+                self.ui_state.output_volume = Some(gain);
                 Task::none()
             }
             Message::InputVolumeChanged(gain) => {
@@ -2116,10 +2166,11 @@ impl App {
                     {
                         *input_volume = gain;
                         if let Some(session) = media {
-                            session.set_input_gain(gain);
+                            session.set_input_gain(slider_gain(gain));
                         }
                     }
                 }
+                self.ui_state.input_volume = Some(gain);
                 Task::none()
             }
 
@@ -3062,13 +3113,16 @@ impl App {
                 if self.demo {
                     return Task::none();
                 }
-                let params = media_params(&local, &remote);
+                let params = media_params(&local, &remote, self.settings.echo_cancel);
                 Task::future(async move {
                     let result = start_media(reserved, params, capture_target, playback_target, label).await;
                     Message::MediaReady(account, id, result)
                 })
             }
             CallState::Answered { local, remote } => {
+                // Every call starts where the sliders were last left.
+                let start_output_volume = self.ui_state.output_volume.unwrap_or(1.0).clamp(0.0, 2.0);
+                let start_input_volume = self.ui_state.input_volume.unwrap_or(1.0).clamp(0.0, 2.0);
                 let Some(idx) = acc.line_index_for_call(&id) else {
                     tracing::warn!("answered event for a call we're not tracking");
                     return Task::none();
@@ -3095,7 +3149,7 @@ impl App {
                     avatar_glow.go_mut(avatar_live(media.is_some(), false), Instant::now());
                     if let Some(session) = media {
                         session.set_mic_muted(*muted);
-                        session.set_output_volume(*output_volume);
+                        session.set_output_volume(slider_gain(*output_volume));
                     }
                     return Task::none();
                 }
@@ -3131,14 +3185,16 @@ impl App {
                             direction: history::CallDirection::Outgoing,
                             media,
                             dtmf_feedback: Vec::new(),
+                            stats: CallStats::default(),
                             answered_at: Instant::now(),
                             input_level: 0.0,
                             output_level: 0.0,
                             muted: false,
-                            output_volume: 1.0,
-                            input_volume: 1.0,
+                            output_volume: start_output_volume,
+                            input_volume: start_input_volume,
                             on_hold: false,
-                            pre_hold_output_volume: 1.0,
+                            remote_hold: false,
+                            pre_hold_output_volume: start_output_volume,
                             secondary_input_on: false,
                             transfer_input: None,
                             post_dial,
@@ -3193,6 +3249,7 @@ impl App {
                     direction,
                     media: None,
                     dtmf_feedback: Vec::new(),
+                    stats: CallStats::default(),
                     answered_at: if self.demo {
                         Instant::now() - Duration::from_secs(134)
                     } else {
@@ -3201,10 +3258,11 @@ impl App {
                     input_level: 0.0,
                     output_level: 0.0,
                     muted: false,
-                    output_volume: 1.0,
-                    input_volume: 1.0,
+                    output_volume: start_output_volume,
+                    input_volume: start_input_volume,
                     on_hold: false,
-                    pre_hold_output_volume: 1.0,
+                    remote_hold: false,
+                    pre_hold_output_volume: start_output_volume,
                     secondary_input_on: false,
                     transfer_input: None,
                     post_dial,
@@ -3215,7 +3273,7 @@ impl App {
                 let label = format!("OxideSip Acct{} Line {}", account + 1, idx + 1);
                 let post_dial_id = id.clone();
                 let demo = self.demo;
-                let params = media_params(&local, &remote);
+                let params = media_params(&local, &remote, self.settings.echo_cancel);
                 let media_task = Task::future(async move {
                     if demo {
                         // No audio in demo mode; the pending socket is just
@@ -3257,6 +3315,29 @@ impl App {
                     if let Some(session) = media {
                         session.set_mic_muted(true);
                         session.set_output_volume(0.0);
+                    }
+                }
+                Task::none()
+            }
+            CallState::RemoteUpdated {
+                remote: updated,
+                remote_hold: held,
+            } => {
+                if let Some(idx) = acc.line_index_for_call(&id) {
+                    match &mut acc.lines[idx] {
+                        CallUiState::Active { media, remote_hold, .. } => {
+                            *remote_hold = held;
+                            if let Some(session) = media {
+                                session.set_remote_addr(updated.remote_addr);
+                            }
+                        }
+                        CallUiState::EarlyMedia { media, remote, .. } => {
+                            if let Some(session) = media {
+                                session.set_remote_addr(updated.remote_addr);
+                            }
+                            *remote = updated;
+                        }
+                        _ => {}
                     }
                 }
                 Task::none()
@@ -3981,11 +4062,20 @@ fn open_external(target: &str) {
     }
 }
 
+/// Slider position (0.0–2.0, shown as 0–200%) to linear gain. Squared, so
+/// the slider tracks how loud things sound rather than raw amplitude: 100%
+/// is unchanged, 50% is a quarter of the amplitude (-12 dB), and 200% is
+/// four times (+12 dB) — real headroom for a quiet caller.
+fn slider_gain(position: f32) -> f32 {
+    let position = position.clamp(0.0, 2.0);
+    position * position
+}
+
 /// The audio parameters for a call from what signaling negotiated. SRTP is
 /// on exactly when both sides put a key in their SDP; one side only (we
 /// offered encryption and the answer came back without it) is an error, so
 /// the call fails instead of quietly running unencrypted.
-fn media_params(local: &LocalMediaInfo, remote: &RemoteMediaInfo) -> Result<MediaParams, String> {
+fn media_params(local: &LocalMediaInfo, remote: &RemoteMediaInfo, echo_cancel: bool) -> Result<MediaParams, String> {
     let srtp = match (&local.crypto_key, &remote.crypto_key) {
         (Some(local), Some(remote)) => Some(SrtpKeys {
             local: local.clone(),
@@ -4000,6 +4090,7 @@ fn media_params(local: &LocalMediaInfo, remote: &RemoteMediaInfo) -> Result<Medi
         payload_type: remote.payload_type,
         telephone_event_pt: remote.telephone_event_pt,
         srtp,
+        echo_cancel,
     })
 }
 

@@ -139,6 +139,7 @@ async fn main() {
             payload_type: remote.payload_type,
             telephone_event_pt: remote.telephone_event_pt,
             srtp,
+            echo_cancel: std::env::var("ECHO_CANCEL").is_ok(),
         };
         let session = MediaSession::start(reserved, params, None, None, "OxideSip echo probe".into())
             .await

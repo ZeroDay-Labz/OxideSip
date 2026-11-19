@@ -218,7 +218,9 @@ tarball, RPM, deb and Flatpak bundle and attaches them to the GitHub release.
 ## Known limitations
 
 - **No STUN / ICE.** Works on a LAN or over a VPN to the PBX; NAT traversal is not handled.
-- **No echo cancellation.** Use a headset, or rely on the PBX / the other side's AEC.
+- **Echo cancellation is opt-in** (Settings ▸ Calls). It uses PipeWire's echo-cancel module, so it
+  needs that module installed and may be unavailable inside the Flatpak sandbox; a headset needs
+  neither.
 - **Blind transfer reports "requested", not "completed".** `rsipstack` exposes whether the REFER
   was accepted but not the follow-up NOTIFY that would say whether the target answered.
 - **Call forwarding is not implemented** (the stack cannot send a SIP 3xx yet); the old toggle

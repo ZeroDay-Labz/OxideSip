@@ -1,14 +1,16 @@
+use crate::agc::Agc;
 use crate::codec;
 use crate::error::MediaError;
 use crate::pipewire_io::{self, PipewireShared, PwThreadHandle};
 use crate::rtp::RtpHeader;
 use crate::srtp::SrtpContext;
+use crate::stats::{CallStats, ReceiverStats, StatsShared};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
@@ -32,12 +34,15 @@ const BRIDGE_RING_CAPACITY: usize = 4_000; // ~0.5s of 8kHz mono i16 samples
 const RING_CAPACITY: usize = 4_000; // 0.5s of 8kHz mono i16 samples
 const SAMPLES_PER_PACKET: usize = 160; // 20ms @ 8000Hz
 const NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
-// 5 packets = 100ms of reordering tolerance. Clock drift/backlog growth is
-// handled separately by `pipewire_io.rs`'s buffer-depth catch-up, so this
-// window only needs to cover genuine short-range
+// How many packets may be held back waiting for a missing one. Every packet
+// held is 20ms the playback buffer isn't being fed, and that buffer runs
+// only a few tens of ms deep, so this is deliberately one: a packet that
+// arrives one place out of order is put back in order, and anything later
+// than that is treated as lost and concealed (see `ReorderBuffer`). It
+// only needs to cover genuine short-range
 // out-of-order arrival — keeping it modest bounds the worst-case latency a
 // real gap can add.
-const REORDER_WINDOW: usize = 5;
+const REORDER_WINDOW: usize = 1;
 
 // RFC 4733 §2.5.1.3: send the "end" packet multiple times in case one is
 // lost — 3 is the commonly-used redundancy count (matches most SIP stacks).
@@ -77,6 +82,10 @@ pub struct MediaParams {
     /// `Some` when the call negotiated SDES-SRTP: every packet sent is then
     /// encrypted, and every packet received must authenticate.
     pub srtp: Option<SrtpKeys>,
+    /// Run the call through PipeWire's echo canceller, so the far end does
+    /// not hear itself when you use speakers instead of a headset. If the
+    /// canceller can't be started the call goes ahead without it.
+    pub echo_cancel: bool,
 }
 
 /// The two base64 `a=crypto` keys of an SRTP call.
@@ -150,6 +159,14 @@ pub struct MediaSession {
     /// packets, since the last `drain_received_dtmf` call.
     received_dtmf: Arc<Mutex<VecDeque<char>>>,
     encrypted: bool,
+    stats: Arc<StatsShared>,
+    auto_level: Arc<AtomicBool>,
+    /// Where RTP is sent, and whose packets are accepted. Shared with both
+    /// loops so `set_remote_addr` can move a running call.
+    remote_addr: Arc<RwLock<SocketAddr>>,
+    /// The echo canceller this call runs through, if any. Stopped after the
+    /// call's own streams.
+    echo_cancel_pw: Option<PwThreadHandle>,
 }
 
 /// One queued outbound DTMF digit, RFC 4733-style.
@@ -221,6 +238,7 @@ impl MediaSession {
             payload_type,
             telephone_event_pt,
             srtp,
+            echo_cancel,
         } = params;
         // Built before anything is started: a call that negotiated SRTP but
         // has an unusable key must fail here, never fall back to plain RTP.
@@ -245,12 +263,29 @@ impl MediaSession {
         let input_level_bits = Arc::new(AtomicU32::new(0));
         let output_level_bits = Arc::new(AtomicU32::new(0));
 
+        let stats = Arc::new(StatsShared::default());
+        let auto_level = Arc::new(AtomicBool::new(true));
+
         let shared = PipewireShared {
             notify: notify.clone(),
             mic_muted: mic_muted.clone(),
-            input_gain_bits: input_gain_bits.clone(),
-            input_level_bits: input_level_bits.clone(),
+            output_gain_bits: output_gain_bits.clone(),
             output_level_bits: output_level_bits.clone(),
+            stats: stats.clone(),
+        };
+
+        // With echo cancellation the call talks to the canceller's virtual
+        // devices and the canceller talks to the real ones.
+        let (echo_cancel_pw, capture_target, playback_target) = if echo_cancel {
+            match pipewire_io::spawn_echo_cancel(capture_target.clone(), playback_target.clone(), &label) {
+                Ok(ec) => (Some(ec.handle), Some(ec.source), Some(ec.sink)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "echo cancellation unavailable, continuing without it");
+                    (None, capture_target, playback_target)
+                }
+            }
+        } else {
+            (None, capture_target, playback_target)
         };
 
         let pw_handle = pipewire_io::spawn(
@@ -271,13 +306,17 @@ impl MediaSession {
         let (dtmf_send_tx, dtmf_send_rx) = mpsc::unbounded_channel::<DtmfSend>();
         let received_dtmf: Arc<Mutex<VecDeque<char>>> = Arc::new(Mutex::new(VecDeque::new()));
 
+        let remote_addr = Arc::new(RwLock::new(remote_addr));
         let send_task = tokio::spawn(send_loop(
             socket.clone(),
-            remote_addr,
+            remote_addr.clone(),
             payload_type,
             telephone_event_pt,
             send_srtp,
             capture_cons,
+            input_gain_bits.clone(),
+            input_level_bits.clone(),
+            auto_level.clone(),
             notify,
             bridge_relay_in.clone(),
             record_mixer.clone(),
@@ -288,12 +327,13 @@ impl MediaSession {
         ));
         let recv_task = tokio::spawn(recv_loop(
             socket,
-            remote_addr.ip(),
+            remote_addr.clone(),
             payload_type,
             telephone_event_pt,
             recv_srtp,
             playback_prod,
-            output_gain_bits.clone(),
+            stats.clone(),
+            auto_level.clone(),
             bridge_relay_out.clone(),
             record_mixer.clone(),
             secondary_relay.clone(),
@@ -323,7 +363,33 @@ impl MediaSession {
             dtmf_send_tx,
             received_dtmf,
             encrypted,
+            stats,
+            auto_level,
+            remote_addr,
+            echo_cancel_pw,
         })
+    }
+
+    /// Points a running call at a new RTP address — the other side moved its
+    /// media with a re-INVITE. Takes effect on the next packet either way.
+    pub fn set_remote_addr(&self, addr: SocketAddr) {
+        if let Ok(mut current) = self.remote_addr.write()
+            && *current != addr
+        {
+            tracing::info!(%addr, "remote media address changed");
+            *current = addr;
+        }
+    }
+
+    /// How the incoming audio is doing right now: buffer delay, loss, jitter.
+    pub fn stats(&self) -> CallStats {
+        self.stats.snapshot(pipewire_io::SAMPLE_RATE)
+    }
+
+    /// Turns automatic level control on or off for both directions (see
+    /// `agc.rs`). On by default; takes effect on the next 20ms frame.
+    pub fn set_auto_level(&self, enabled: bool) {
+        self.auto_level.store(enabled, Ordering::Relaxed);
     }
 
     /// Whether this call's audio is SRTP-encrypted.
@@ -469,6 +535,9 @@ impl MediaSession {
         if let Some(h) = self.pw_handle.take() {
             let _ = tokio::task::spawn_blocking(move || h.stop()).await;
         }
+        if let Some(h) = self.echo_cancel_pw.take() {
+            let _ = tokio::task::spawn_blocking(move || h.stop()).await;
+        }
         let secondary_pw = self.secondary_pw.lock().ok().and_then(|mut g| g.take());
         if let Some(h) = secondary_pw {
             let _ = tokio::task::spawn_blocking(move || h.stop()).await;
@@ -488,8 +557,10 @@ impl MediaSession {
         self.mic_muted.load(Ordering::Relaxed)
     }
 
-    /// `gain` is a linear multiplier applied to decoded playback samples
-    /// (1.0 = unchanged); negative values are clamped to 0.
+    /// `gain` is a linear multiplier applied to what the local speakers play
+    /// (1.0 = unchanged); negative values are clamped to 0. Applied in the
+    /// playback callback, so it is heard immediately and does not change
+    /// recordings, bridged lines or the secondary output.
     pub fn set_output_volume(&self, gain: f32) {
         tracing::info!(gain, "set_output_volume");
         self.output_gain_bits.store(gain.max(0.0).to_bits(), Ordering::Relaxed);
@@ -503,16 +574,17 @@ impl MediaSession {
         self.input_gain_bits.store(gain.max(0.0).to_bits(), Ordering::Relaxed);
     }
 
-    /// Normalized 0.0-1.0 peak amplitude of the most recently captured
-    /// microphone chunk.
+    /// Normalized 0.0-1.0 peak amplitude of what was sent (after levelling
+    /// and mic gain) since the last call to this. Reading resets it, so poll
+    /// it from one place.
     pub fn input_level(&self) -> f32 {
-        f32::from_bits(self.input_level_bits.load(Ordering::Relaxed))
+        f32::from_bits(self.input_level_bits.swap(0, Ordering::Relaxed))
     }
 
-    /// Normalized 0.0-1.0 peak amplitude of the most recently played-back
-    /// audio chunk.
+    /// Normalized 0.0-1.0 peak amplitude of what was played (after the
+    /// volume setting) since the last call to this. Reading resets it.
     pub fn output_level(&self) -> f32 {
-        f32::from_bits(self.output_level_bits.load(Ordering::Relaxed))
+        f32::from_bits(self.output_level_bits.swap(0, Ordering::Relaxed))
     }
 
     /// Queues `digit` to be sent as an RFC 4733 RTP telephone-event train.
@@ -559,11 +631,14 @@ async fn wait_for_data(notify: &Notify) {
 #[allow(clippy::too_many_arguments)]
 async fn send_loop(
     socket: Arc<UdpSocket>,
-    remote_addr: SocketAddr,
+    remote: Arc<RwLock<SocketAddr>>,
     payload_type: u8,
     telephone_event_pt: Option<u8>,
     mut srtp: Option<SrtpContext>,
     mut capture_cons: ringbuf::HeapCons<i16>,
+    input_gain_bits: Arc<AtomicU32>,
+    input_level_bits: Arc<AtomicU32>,
+    auto_level: Arc<AtomicBool>,
     notify: Arc<Notify>,
     bridge_relay_in: Arc<Mutex<Option<HeapCons<i16>>>>,
     record_mixer: Arc<Mutex<Option<RecordMixer>>>,
@@ -580,6 +655,7 @@ async fn send_loop(
     let mut scratch = [0i16; SAMPLES_PER_PACKET];
     let mut sent_count: u64 = 0;
     let mut empty_wakes: u64 = 0;
+    let mut agc = Agc::default();
     // Digits queued but not yet in flight — serialized one at a time (like
     // dialog.rs's SIP-INFO worker) so a burst of key presses doesn't
     // interleave multiple events' packets together.
@@ -603,8 +679,22 @@ async fn send_loop(
                 if capture_cons.occupied_len() < SAMPLES_PER_PACKET {
                     empty_wakes += 1;
                 }
+                let Ok(remote_addr) = remote.read().map(|addr| *addr) else { break };
                 while capture_cons.occupied_len() >= SAMPLES_PER_PACKET {
                     let got = capture_cons.pop_slice(&mut scratch);
+                    // The microphone's own processing, before anything else
+                    // is mixed in: level it, apply the mic gain setting, and
+                    // meter the result — what the far end hears of our voice.
+                    if auto_level.load(Ordering::Relaxed) {
+                        agc.process(&mut scratch[..got]);
+                    }
+                    let gain = f32::from_bits(input_gain_bits.load(Ordering::Relaxed));
+                    let mut peak = 0u16;
+                    for sample in &mut scratch[..got] {
+                        *sample = (f32::from(*sample) * gain).clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+                        peak = peak.max(sample.unsigned_abs());
+                    }
+                    pipewire_io::store_peak(&input_level_bits, peak);
                     // If this call is conferenced with another line, mix in
                     // whatever audio that line's recv_loop has forwarded us
                     // — this is what lets the two remote parties hear each
@@ -697,12 +787,13 @@ async fn send_loop(
 #[allow(clippy::too_many_arguments)]
 async fn recv_loop(
     socket: Arc<UdpSocket>,
-    remote_ip: std::net::IpAddr,
+    remote: Arc<RwLock<SocketAddr>>,
     payload_type: u8,
     telephone_event_pt: Option<u8>,
     mut srtp: Option<SrtpContext>,
     mut playback_prod: ringbuf::HeapProd<i16>,
-    output_gain_bits: Arc<AtomicU32>,
+    stats: Arc<StatsShared>,
+    auto_level: Arc<AtomicBool>,
     bridge_relay_out: Arc<Mutex<Option<HeapProd<i16>>>>,
     record_mixer: Arc<Mutex<Option<RecordMixer>>>,
     secondary_relay: Arc<Mutex<Option<HeapProd<i16>>>>,
@@ -714,6 +805,9 @@ async fn recv_loop(
     let mut reorder = ReorderBuffer::new();
     let mut received_count: u64 = 0;
     let mut rejected_count: u64 = 0;
+    let mut receiver_stats = ReceiverStats::default();
+    let mut agc = Agc::default();
+    let started = std::time::Instant::now();
     // Dedups a digit to one `received_dtmf` push per key press, keyed by
     // (event code, timestamp) — timestamp, not sequence number, is what the
     // sender holds frozen across the `DTMF_END_PACKET_REPEATS` redundant end
@@ -731,7 +825,7 @@ async fn recv_loop(
                 // not just the peer this call actually negotiated with.
                 // Comparing IP only (not port) tolerates a peer behind a
                 // NAT that rewrites its source port mid-call.
-                if from.ip() != remote_ip {
+                if remote.read().map_or(true, |addr| from.ip() != addr.ip()) {
                     continue;
                 }
                 // On an SRTP call nothing is looked at, let alone played,
@@ -777,14 +871,25 @@ async fn recv_loop(
                 if received_count.is_multiple_of(250) {
                     tracing::info!(received_count, "recv_loop stats");
                 }
-                let gain = f32::from_bits(output_gain_bits.load(Ordering::Relaxed));
-                let samples: Vec<i16> = payload
-                    .iter()
-                    .map(|&b| {
-                        let s = codec.decode(b) as f32 * gain;
-                        s.clamp(i16::MIN as f32, i16::MAX as f32) as i16
-                    })
-                    .collect();
+                receiver_stats.on_packet(
+                    header.sequence_number,
+                    header.timestamp,
+                    started.elapsed().as_secs_f64(),
+                    pipewire_io::SAMPLE_RATE,
+                );
+                stats.received.store(receiver_stats.received(), Ordering::Relaxed);
+                stats.lost.store(receiver_stats.lost(), Ordering::Relaxed);
+                stats
+                    .jitter_ms_bits
+                    .store(receiver_stats.jitter_ms(pipewire_io::SAMPLE_RATE).to_bits(), Ordering::Relaxed);
+
+                let mut samples: Vec<i16> = payload.iter().map(|&b| codec.decode(b)).collect();
+                // Bring the far end to a standard level before it goes
+                // anywhere (speakers, recording, a bridged line). The local
+                // volume setting is applied later, at playback.
+                if auto_level.load(Ordering::Relaxed) {
+                    agc.process(&mut samples);
+                }
                 let ready = reorder.push(header.sequence_number, samples);
                 if !ready.is_empty() {
                     if let Ok(mut relay) = bridge_relay_out.lock()
@@ -935,16 +1040,25 @@ impl DtmfEventState {
     }
 }
 
-/// Small RTP-sequence-aware reorder/loss-tolerant buffer sitting in front of
-/// the playback ring buffer. Not a full RFC 3550 jitter buffer — just enough
-/// to stop minor arrival jitter (normal even on a LAN) from producing an
-/// audible gap on every out-of-order packet. Buffers up to `REORDER_WINDOW`
-/// packets waiting for a gap to fill; if the gap doesn't fill in time (real
-/// loss, not just reordering), forces the window forward rather than
-/// stalling playback indefinitely.
+/// How many lost packets in a row get a concealment packet (a fading replay
+/// of the last good one); the rest of a longer gap is silence.
+const CONCEALED_PACKETS: usize = 3;
+/// Longest gap that is filled in at all, so a sequence-number jump (a new
+/// stream after hold, a restarted sender) can't inject seconds of silence.
+const MAX_FILLED_PACKETS: usize = 10;
+
+/// Small RTP-sequence-aware reorder/loss-tolerant stage in front of the
+/// playback ring buffer. In-order packets pass straight through. A packet
+/// arriving ahead of a missing one is held (up to `REORDER_WINDOW` packets)
+/// in case the missing one is merely late; if it still hasn't come, it is
+/// lost, and its place in the timeline is filled — first with a fading
+/// replay of the last good packet, then with silence — so loss costs a soft
+/// dip rather than making the playback buffer run dry.
 struct ReorderBuffer {
     expected: Option<u16>,
     pending: Vec<(u16, Vec<i16>)>,
+    /// The last packet released, for concealment.
+    last: Vec<i16>,
 }
 
 impl ReorderBuffer {
@@ -952,6 +1066,7 @@ impl ReorderBuffer {
         Self {
             expected: None,
             pending: Vec::new(),
+            last: Vec::new(),
         }
     }
 
@@ -967,24 +1082,29 @@ impl ReorderBuffer {
         self.pending.push((seq, samples));
         self.pending.sort_unstable_by_key(|(s, _)| s.wrapping_sub(expected));
 
-        if self.pending.len() > REORDER_WINDOW {
-            // Real loss, not just reordering: force the window forward to
-            // whatever the earliest still-pending packet is, rather than
-            // waiting forever for a gap that may never fill.
-            tracing::info!(
-                expected,
-                forced_to = self.pending[0].0,
-                window = REORDER_WINDOW,
-                "reorder buffer: forcing window forward, gap never filled"
-            );
-            self.expected = Some(self.pending[0].0);
+        let mut out = Vec::new();
+        let earliest = self.pending[0].0;
+        if self.pending.len() > REORDER_WINDOW && earliest != expected {
+            // Real loss, not just reordering: stop waiting, and stand in
+            // for what never came.
+            let missing = earliest.wrapping_sub(expected) as usize;
+            tracing::debug!(expected, missing, "reorder buffer: concealing lost packets");
+            for i in 0..missing.min(MAX_FILLED_PACKETS) {
+                let gain = CONCEALED_PACKETS.saturating_sub(i + 1) as i32;
+                out.extend(
+                    self.last
+                        .iter()
+                        .map(|&s| (i32::from(s) * gain / CONCEALED_PACKETS as i32) as i16),
+                );
+            }
+            self.expected = Some(earliest);
         }
 
-        let mut out = Vec::new();
-        while let Some(pos) = self.pending.iter().position(|(s, _)| *s == self.expected.unwrap()) {
-            let (_, samples) = self.pending.remove(pos);
-            out.extend(samples);
-            self.expected = Some(self.expected.unwrap().wrapping_add(1));
+        while let Some(pos) = self.pending.iter().position(|(s, _)| Some(*s) == self.expected) {
+            let (seq, samples) = self.pending.remove(pos);
+            out.extend_from_slice(&samples);
+            self.last = samples;
+            self.expected = Some(seq.wrapping_add(1));
         }
         out
     }
@@ -1017,21 +1137,45 @@ mod tests {
     }
 
     #[test]
-    fn sustained_loss_forces_window_forward() {
+    fn a_lost_packet_is_concealed_once_the_next_one_arrives() {
         let mut rb = ReorderBuffer::new();
-        assert_eq!(rb.push(0, vec![1]), vec![1]); // expected -> 1
-        // 1 is missing; push enough successors to fill the window exactly
-        // (pending.len() == REORDER_WINDOW is still tolerated)...
-        let last_tolerated = 1 + REORDER_WINDOW as u16;
-        for seq in 2..=last_tolerated {
-            assert!(rb.push(seq, vec![seq as i16]).is_empty());
-        }
-        // ...one more tips pending.len() past the window: force forward,
-        // releasing everything buffered plus this packet, in order.
-        let overflow_seq = last_tolerated + 1;
-        let released = rb.push(overflow_seq, vec![overflow_seq as i16]);
-        let expected: Vec<i16> = (2..=overflow_seq).map(|s| s as i16).collect();
-        assert_eq!(released, expected);
+        assert_eq!(rb.push(0, vec![300, -300]), vec![300, -300]);
+        // 1 never arrives. 2 is held in case 1 is only late...
+        assert!(rb.push(2, vec![2, 2]).is_empty());
+        // ...and when 3 comes instead, 1's place is filled with a quieter
+        // replay of packet 0, followed by the real audio in order.
+        assert_eq!(rb.push(3, vec![3, 3]), vec![200, -200, 2, 2, 3, 3]);
+        // Back to passing straight through.
+        assert_eq!(rb.push(4, vec![4, 4]), vec![4, 4]);
+    }
+
+    #[test]
+    fn a_burst_of_loss_fades_out_and_keeps_its_length() {
+        let mut rb = ReorderBuffer::new();
+        rb.push(0, vec![300]);
+        // 1..=5 lost: five packets' worth comes out ahead of 6 and 7, fading
+        // over the first three (two thirds, one third, nothing).
+        assert!(rb.push(6, vec![6]).is_empty());
+        assert_eq!(rb.push(7, vec![7]), vec![200, 100, 0, 0, 0, 6, 7]);
+    }
+
+    #[test]
+    fn a_sequence_jump_is_not_filled_with_seconds_of_silence() {
+        let mut rb = ReorderBuffer::new();
+        rb.push(0, vec![300]);
+        assert!(rb.push(5_000, vec![1]).is_empty());
+        let out = rb.push(5_001, vec![2]);
+        assert_eq!(out.len(), MAX_FILLED_PACKETS + 2);
+        assert_eq!(&out[MAX_FILLED_PACKETS..], &[1, 2]);
+    }
+
+    #[test]
+    fn a_late_packet_after_being_concealed_is_dropped() {
+        let mut rb = ReorderBuffer::new();
+        rb.push(0, vec![300]);
+        rb.push(2, vec![2]);
+        rb.push(3, vec![3]);
+        assert!(rb.push(1, vec![1]).is_empty());
     }
 
     #[test]

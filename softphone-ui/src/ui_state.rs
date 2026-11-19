@@ -24,6 +24,12 @@ pub struct UiState {
     pub sidebar_collapsed: bool,
     #[serde(default)]
     pub contacts_io_path: Option<String>,
+    /// Where the in-call Speaker and Mic sliders were last left (1.0 = 100%),
+    /// so every call starts at the volume the previous one ended on.
+    #[serde(default)]
+    pub output_volume: Option<f32>,
+    #[serde(default)]
+    pub input_volume: Option<f32>,
 }
 
 pub fn load() -> UiState {

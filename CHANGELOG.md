@@ -5,6 +5,33 @@ All notable changes to OxideSip are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-18
+
+### Added
+- **Automatic volume levelling** (Settings ▸ Calls, on by default). Quiet callers are brought up
+  and loud ones down to one standard level, without amplifying background noise or clipping;
+  your microphone gets the same treatment before it is sent.
+- **Live call quality** on the call card: receive buffer delay, jitter and packet loss.
+- **Loss concealment.** A lost or late packet is covered by a short fading replay of the audio
+  before it instead of a hard gap.
+- **Echo cancellation** (Settings ▸ Calls, off by default) through PipeWire's echo canceller, for
+  using speakers instead of a headset.
+- "On hold by the other side" when the far end holds the call.
+
+### Fixed
+- The microphone and speaker level bars barely moved during normal speech. They now show the
+  peak since the last screen update on a decibel scale, so they follow your voice.
+- The speaker volume slider changed what was recorded and what a conferenced line heard. It now
+  acts only on what you hear, and takes effect immediately.
+- Re-INVITE and UPDATE requests from the PBX (remote hold and resume, a moved media address,
+  session refresh) were answered with 501. They are now accepted and applied to the running
+  call.
+- A single lost packet stalled playback for up to 100 ms while later packets were held back.
+
+### Changed
+- Volume sliders follow perceived loudness: 100% is unchanged and 200% is now four times the
+  amplitude (+12 dB) rather than twice. Slider positions are remembered between calls.
+
 ## [0.2.2] — 2026-11-18
 
 ### Fixed
@@ -114,6 +141,7 @@ All notable changes to OxideSip are documented here. The format follows
 - Multi-account support, codec priority, SRTP, TLS, recording, contacts import / export,
   Flatpak / RPM / deb packaging, and the first incoming-call popup.
 
+[0.3.0]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.1.8...v0.2.0

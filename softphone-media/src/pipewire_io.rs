@@ -6,6 +6,7 @@
 //! an independent timer.
 
 use crate::error::MediaError;
+use crate::stats::StatsShared;
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use ringbuf::traits::{Consumer, Observer, Producer};
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Once};
 use tokio::sync::Notify;
 
-const SAMPLE_RATE: u32 = 8000;
+pub(crate) const SAMPLE_RATE: u32 = 8000;
 const CHANNELS: u32 = 1;
 // SPA_AUDIO_CHANNEL_MONO. Confirmed from the generated libspa-sys bindgen
 // output (target/debug/build/libspa-sys-*/out/bindings.rs) since the
@@ -84,6 +85,10 @@ const SKIP_ABOVE: usize = 200; // 25ms
 // 1ms per 32s, so a 10ms raise is held for about five minutes.
 const DECAY_EVERY_WINDOWS: u32 = 16;
 const MARGIN_DECAY: usize = 8; // 1ms
+// When the ring runs dry mid-call, the last packet's worth of audio is
+// replayed, fading to silence over this long, instead of cutting straight to
+// silence: a short gap then sounds like a soft dip rather than a click.
+const CONCEAL_SAMPLES: usize = 480; // 60ms
 // Frames to write if a server doesn't report `requested` (it has since
 // PipeWire 0.3.49): one RTP packet's worth, never the whole buffer.
 const FALLBACK_FRAMES: usize = 160;
@@ -140,22 +145,49 @@ impl Drop for PwThreadHandle {
 pub(crate) struct PipewireShared {
     pub notify: Arc<Notify>,
     pub mic_muted: Arc<AtomicBool>,
-    pub input_gain_bits: Arc<AtomicU32>,
-    pub input_level_bits: Arc<AtomicU32>,
+    /// Linear playback volume, applied in the playback callback itself so a
+    /// change is heard on the next graph cycle and touches nothing but what
+    /// comes out of the local speakers (not recordings or bridged lines).
+    pub output_gain_bits: Arc<AtomicU32>,
+    /// Peak level played since the UI last read it (see `store_peak`).
     pub output_level_bits: Arc<AtomicU32>,
+    pub stats: Arc<StatsShared>,
+}
+
+/// Records a 0.0–1.0 peak level for a meter as "highest since last read":
+/// the reader swaps it back to zero. A plain store would hand the UI
+/// whichever few-millisecond chunk happened to be last, which is most often
+/// a quiet instant between syllables even while someone is speaking.
+/// (Non-negative `f32` bit patterns order the same way the values do.)
+pub(crate) fn store_peak(level_bits: &AtomicU32, peak: u16) {
+    let level = f32::from(peak) / f32::from(i16::MAX);
+    level_bits.fetch_max(level.to_bits(), Ordering::Relaxed);
+}
+
+/// Scales the first `frames` S16LE samples of `out` by `gain` in place and
+/// returns their peak afterwards.
+fn apply_gain(out: &mut [u8], frames: usize, gain: f32) -> u16 {
+    let mut peak = 0u16;
+    for bytes in out[..frames * STRIDE].chunks_exact_mut(STRIDE) {
+        let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
+        let scaled = (f32::from(sample) * gain).clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+        bytes.copy_from_slice(&scaled.to_le_bytes());
+        peak = peak.max(scaled.unsigned_abs());
+    }
+    peak
 }
 
 struct CaptureUserData {
     prod: HeapProd<i16>,
     notify: Arc<Notify>,
     mic_muted: Arc<AtomicBool>,
-    input_gain_bits: Arc<AtomicU32>,
-    input_level_bits: Arc<AtomicU32>,
 }
 
 struct PlaybackUserData {
     cons: HeapCons<i16>,
+    output_gain_bits: Arc<AtomicU32>,
     output_level_bits: Arc<AtomicU32>,
+    stats: Arc<StatsShared>,
     state: PlaybackState,
     callback_count: u64,
     frames_since_stats: usize,
@@ -179,6 +211,12 @@ struct PlaybackState {
     slew_credit: usize,
     /// Last sample played, for repeating.
     last_sample: i16,
+    /// The most recent `PACKET_SAMPLES` of real audio played (a ring;
+    /// `history_pos` is the oldest sample / next write), and how many
+    /// concealment samples the current gap has been given from it.
+    history: [i16; PACKET_SAMPLES],
+    history_pos: usize,
+    concealed: usize,
     /// Consecutive windows without an underrun, for `margin`'s decay.
     clean_windows: u32,
     /// Set by an underrun until audio arrives again; `dry_samples` counts
@@ -203,6 +241,9 @@ impl Default for PlaybackState {
             slew: 0,
             slew_credit: 0,
             last_sample: 0,
+            history: [0; PACKET_SAMPLES],
+            history_pos: 0,
+            concealed: 0,
             clean_windows: 0,
             recovering: false,
             dry_samples: 0,
@@ -306,8 +347,27 @@ fn fill_playback(cons: &mut HeapCons<i16>, state: &mut PlaybackState, out: &mut 
         } else {
             0
         };
-        // Underrun or not-yet-prebuffered: silence-fill rather than block.
-        scratch[got..want].fill(0);
+        for &sample in &scratch[..got] {
+            state.history[state.history_pos] = sample;
+            state.history_pos = (state.history_pos + 1) % PACKET_SAMPLES;
+        }
+        if got > 0 {
+            state.concealed = 0;
+        }
+        // Whatever the ring couldn't supply: concealment while a gap that
+        // opened mid-playback is still fresh, silence otherwise (start of
+        // call, or a gap longer than CONCEAL_SAMPLES).
+        let in_gap = state.recovering || (state.prebuffered && got < want);
+        for sample in &mut scratch[got..want] {
+            *sample = if in_gap && state.concealed < CONCEAL_SAMPLES {
+                let replay = state.history[(state.history_pos + state.concealed) % PACKET_SAMPLES];
+                let gain = (CONCEAL_SAMPLES - state.concealed) as i32;
+                state.concealed += 1;
+                (i32::from(replay) * gain / CONCEAL_SAMPLES as i32) as i16
+            } else {
+                0
+            };
+        }
         if state.prebuffered && got < want {
             // Ran dry. Go back to prebuffering so the cushion is rebuilt
             // once, instead of running at zero depth and clicking on every
@@ -403,6 +463,109 @@ pub fn spawn(
         }),
         Ok(Err(e)) => Err(MediaError::PipeWire(e)),
         Err(_) => Err(MediaError::PipeWire("pipewire thread exited before starting".into())),
+    }
+}
+
+/// A running echo canceller: the names of the virtual microphone and
+/// speaker it provides, and the handle keeping it alive.
+pub struct EchoCancel {
+    pub handle: PwThreadHandle,
+    /// Capture from this instead of the real microphone...
+    pub source: String,
+    /// ...and play to this instead of the real speakers.
+    pub sink: String,
+}
+
+/// Loads PipeWire's own echo-cancel module (WebRTC audio processing) into a
+/// context of ours, the same way `pw-loopback` hosts the loopback module. It
+/// sits between the real devices and the call: what we play to its sink goes
+/// on to the speakers and is also used as the reference to subtract from the
+/// microphone signal, which comes out of its source with the far end's
+/// voice removed. Everything is torn down when the handle is stopped.
+///
+/// `capture_target`/`playback_target` are the real devices (`None` = system
+/// default). Fails if this PipeWire build has no echo-cancel module.
+pub fn spawn_echo_cancel(
+    capture_target: Option<String>,
+    playback_target: Option<String>,
+    label: &str,
+) -> Result<EchoCancel, MediaError> {
+    ensure_init();
+
+    // Node names must be unique in the graph: two lines can be in a call at
+    // once, each with its own canceller.
+    let id = format!("oxidesip-ec-{:08x}", rand::random::<u32>());
+    let (source, sink) = (format!("{id}-source"), format!("{id}-sink"));
+    let target = |t: &Option<String>| match t {
+        Some(name) => format!(" target.object = \"{}\"", name.replace('"', "")),
+        None => String::new(),
+    };
+    let description = label.replace('"', "");
+    let args = format!(
+        "{{ library.name = aec/libspa-aec-webrtc \
+           monitor.mode = false \
+           capture.props = {{ node.name = \"{id}-capture\" node.passive = true{} }} \
+           source.props = {{ node.name = \"{source}\" node.description = \"{description} (echo-cancelled mic)\" }} \
+           sink.props = {{ node.name = \"{sink}\" node.description = \"{description} (echo-cancel speaker)\" }} \
+           playback.props = {{ node.name = \"{id}-playback\" node.passive = true{} }} }}",
+        target(&capture_target),
+        target(&playback_target),
+    );
+
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<PwCommand>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let thread = std::thread::Builder::new()
+        .name("pipewire-io-aec".into())
+        .spawn(move || {
+            let run = || -> Result<(), MediaError> {
+                // SAFETY: `pw::init()` was called via `ensure_init()` above.
+                let thread_loop =
+                    unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io-aec"), None) }.map_err(pw_err)?;
+                let context_props = properties! { *pw::keys::CONFIG_NAME => "client.conf" };
+                let context = pw::context::ContextRc::new(&thread_loop, Some(context_props)).map_err(pw_err)?;
+                let name = c"libpipewire-module-echo-cancel";
+                let args = std::ffi::CString::new(args)
+                    .map_err(|_| MediaError::PipeWire("echo-cancel arguments contain a NUL byte".into()))?;
+                // SAFETY: `context` is a live pw_context for the whole call;
+                // both strings are NUL-terminated and outlive it; the loop
+                // is not running yet, so nothing else is using the context.
+                // The module is owned by the context and freed with it.
+                let module = unsafe {
+                    pw::sys::pw_context_load_module(
+                        context.as_raw_ptr(),
+                        name.as_ptr(),
+                        args.as_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if module.is_null() {
+                    return Err(MediaError::PipeWire(
+                        "could not load PipeWire's echo-cancel module (is it installed?)".into(),
+                    ));
+                }
+                let _ = ready_tx.send(Ok(()));
+                thread_loop.start();
+                let _ = shutdown_rx.recv();
+                thread_loop.stop();
+                Ok(())
+            };
+            if let Err(e) = run() {
+                let _ = ready_tx.send(Err(e.to_string()));
+            }
+        })
+        .map_err(MediaError::Io)?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(EchoCancel {
+            handle: PwThreadHandle {
+                thread: Some(thread),
+                shutdown: shutdown_tx,
+            },
+            source,
+            sink,
+        }),
+        Ok(Err(e)) => Err(MediaError::PipeWire(e)),
+        Err(_) => Err(MediaError::PipeWire("echo-cancel thread exited before starting".into())),
     }
 }
 
@@ -717,9 +880,9 @@ fn run(
     let PipewireShared {
         notify,
         mic_muted,
-        input_gain_bits,
-        input_level_bits,
+        output_gain_bits,
         output_level_bits,
+        stats,
     } = shared;
 
     // SAFETY: `pw::init()` has already been called via `ensure_init()` in
@@ -752,8 +915,6 @@ fn run(
         prod: capture_prod,
         notify,
         mic_muted,
-        input_gain_bits,
-        input_level_bits,
     };
 
     let _capture_listener = capture_stream
@@ -772,22 +933,14 @@ fn run(
                 return;
             };
             let n_bytes = n_bytes.min(samples.len());
+            // Levelling, mic gain and the level meter all happen in
+            // `session.rs`'s send loop, on whole 20ms frames; only mute is
+            // applied here.
             let muted = user_data.mic_muted.load(Ordering::Relaxed);
-            let gain = f32::from_bits(user_data.input_gain_bits.load(Ordering::Relaxed));
-            let mut peak: u16 = 0;
-            let iter = samples[..n_bytes].chunks_exact(2).map(|b| {
-                let s = if muted {
-                    0
-                } else {
-                    let raw = i16::from_le_bytes([b[0], b[1]]) as f32 * gain;
-                    raw.clamp(i16::MIN as f32, i16::MAX as f32) as i16
-                };
-                peak = peak.max(s.unsigned_abs());
-                s
-            });
+            let iter = samples[..n_bytes]
+                .chunks_exact(2)
+                .map(|b| if muted { 0 } else { i16::from_le_bytes([b[0], b[1]]) });
             user_data.prod.push_iter(iter);
-            let level = peak as f32 / i16::MAX as f32;
-            user_data.input_level_bits.store(level.to_bits(), Ordering::Relaxed);
             user_data.notify.notify_one();
         })
         .register()
@@ -817,7 +970,9 @@ fn run(
 
     let playback_user_data = PlaybackUserData {
         cons: playback_cons,
+        output_gain_bits,
         output_level_bits,
+        stats,
         state: PlaybackState::default(),
         callback_count: 0,
         frames_since_stats: 0,
@@ -839,11 +994,25 @@ fn run(
             }
             let data = &mut datas[0];
             let fill = match data.data() {
-                Some(slice) => fill_playback(&mut user_data.cons, &mut user_data.state, slice, requested),
+                Some(slice) => {
+                    let mut fill = fill_playback(&mut user_data.cons, &mut user_data.state, slice, requested);
+                    let gain = f32::from_bits(user_data.output_gain_bits.load(Ordering::Relaxed));
+                    fill.peak = apply_gain(slice, fill.frames, gain);
+                    fill
+                }
                 None => PlaybackFill::default(),
             };
-            let level = fill.peak as f32 / i16::MAX as f32;
-            user_data.output_level_bits.store(level.to_bits(), Ordering::Relaxed);
+            store_peak(&user_data.output_level_bits, fill.peak);
+            let stats = &user_data.stats;
+            stats
+                .buffered_samples
+                .store(user_data.cons.occupied_len() as u32, Ordering::Relaxed);
+            stats
+                .margin_samples
+                .store(user_data.state.margin as u32, Ordering::Relaxed);
+            stats
+                .underruns
+                .store(user_data.state.underruns as u32, Ordering::Relaxed);
             user_data.callback_count += 1;
             user_data.frames_since_stats += fill.frames;
             if user_data.frames_since_stats >= STATS_EVERY_FRAMES {
@@ -1102,7 +1271,10 @@ mod tests {
             assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 40).peak, 1000);
         }
         for _ in 0..3 {
-            assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 40).peak, 0);
+            // Nothing from the ring: what plays is fading concealment.
+            let peak = fill_playback(&mut cons, &mut state, &mut out, 40).peak;
+            assert!(peak > 0 && peak <= 1000, "peak {peak}");
+            assert_eq!(cons.occupied_len(), 0);
         }
         assert_eq!(state.underruns, 1);
 
@@ -1131,6 +1303,37 @@ mod tests {
         push(&mut prod, PACKET_SAMPLES);
         fill_playback(&mut cons, &mut state, &mut out, 43);
         assert_eq!(state.margin, MARGIN_START + MARGIN_STEP);
+    }
+
+    #[test]
+    fn a_gap_is_concealed_with_a_fading_replay_then_silence() {
+        let (_prod, mut cons, mut out) = setup(START_DEPTH);
+        let mut state = PlaybackState::default();
+        for _ in 0..8 {
+            fill_playback(&mut cons, &mut state, &mut out, 40);
+        }
+        // Dry from here. The replayed audio starts at full level and fades
+        // linearly to nothing over CONCEAL_SAMPLES.
+        fill_playback(&mut cons, &mut state, &mut out, CONCEAL_SAMPLES as u64 + 40);
+        assert_eq!(sample(&out, 0), 1000);
+        assert_eq!(sample(&out, CONCEAL_SAMPLES / 2), 500);
+        let mut previous = i16::MAX;
+        for frame in 0..CONCEAL_SAMPLES {
+            let s = sample(&out, frame);
+            assert!(s <= previous && s >= 0, "frame {frame}: {s} after {previous}");
+            previous = s;
+        }
+        assert_eq!(sample(&out, CONCEAL_SAMPLES), 0);
+        assert_eq!(sample(&out, CONCEAL_SAMPLES + 39), 0);
+        // And stays silent for as long as the gap lasts.
+        assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 40).peak, 0);
+    }
+
+    #[test]
+    fn nothing_is_concealed_before_the_call_has_audio() {
+        let (_prod, mut cons, mut out) = setup(0);
+        let mut state = PlaybackState::default();
+        assert_eq!(fill_playback(&mut cons, &mut state, &mut out, 171).peak, 0);
     }
 
     #[test]

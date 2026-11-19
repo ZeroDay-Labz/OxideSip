@@ -23,6 +23,8 @@ async fn main() {
         payload_type: 0,
         telephone_event_pt: None,
         srtp,
+        // SMOKE_AEC=1 routes the loopback through the echo canceller.
+        echo_cancel: std::env::var("SMOKE_AEC").is_ok(),
     };
     let session = MediaSession::start(reserved, params, None, playback_target, "OxideSip".into())
         .await

@@ -29,6 +29,14 @@ pub struct AppSettings {
     /// incoming call, in addition to the always-on-top window.
     #[serde(default = "default_true")]
     pub notify_incoming: bool,
+    /// Automatically bring both sides of a call to a standard loudness
+    /// (see `softphone_media::agc`).
+    #[serde(default = "default_true")]
+    pub auto_level: bool,
+    /// Run calls through PipeWire's echo canceller (for speakers instead of
+    /// a headset). Off by default: a headset doesn't need it.
+    #[serde(default)]
+    pub echo_cancel: bool,
     #[serde(default)]
     pub recording_enabled: bool,
     #[serde(default)]
@@ -72,6 +80,8 @@ impl Default for AppSettings {
             forwarding_number: String::new(),
             deny_list: Vec::new(),
             notify_incoming: true,
+            auto_level: true,
+            echo_cancel: false,
             recording_enabled: false,
             recording_path: String::new(),
             secondary_output_target: None,

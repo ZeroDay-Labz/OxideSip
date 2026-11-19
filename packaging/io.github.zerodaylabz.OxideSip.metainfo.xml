@@ -84,6 +84,11 @@
     <content_attribute id="social-contacts">intense</content_attribute>
   </content_rating>
   <releases>
+    <release version="0.3.0" date="2026-11-18">
+      <description>
+        <p>Automatic volume levelling, level meters that follow your voice, live call quality, loss concealment, optional echo cancellation, and proper handling of hold and media changes from the other side.</p>
+      </description>
+    </release>
     <release version="0.2.2" date="2026-11-18">
       <description>
         <p>SRTP media encryption now really encrypts call audio, incoming calls use the codec that was negotiated, and phone numbers can be copied from the dial field and the call card.</p>
