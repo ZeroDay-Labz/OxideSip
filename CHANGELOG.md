@@ -5,6 +5,20 @@ All notable changes to OxideSip are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-18
+
+### Changed
+- **Works better from behind NAT.** Audio is sent to wherever the other side's audio actually
+  comes from (symmetric RTP), the registrar is sent a keepalive every 25 s over UDP so incoming
+  calls keep getting through, and calls advertise the address the registrar sees rather than
+  the local one.
+- Registration follows the lifetime the server grants (it used to re-register every 37 s
+  regardless), refreshing at most every two minutes, and the app unregisters when it exits.
+- Dial tones, ringback and the ringtone play through the app's own PipeWire stream instead of a
+  `pw-play` helper process, so `pipewire-utils` is no longer needed at run time, and they switch
+  to a newly chosen output device as soon as you save.
+- The SIP User-Agent reports the real version (it said 0.1.6).
+
 ## [0.3.0] — 2026-11-18
 
 ### Added
@@ -141,6 +155,7 @@ All notable changes to OxideSip are documented here. The format follows
 - Multi-account support, codec priority, SRTP, TLS, recording, contacts import / export,
   Flatpak / RPM / deb packaging, and the first incoming-call popup.
 
+[0.3.1]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ZeroDay-Labz/OxideSip/compare/v0.2.0...v0.2.1

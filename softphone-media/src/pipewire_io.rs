@@ -576,6 +576,37 @@ fn pw_err(e: pw::Error) -> MediaError {
 struct SecondaryPlaybackUserData {
     cons: HeapCons<i16>,
     state: PlaybackState,
+    /// `true` plays whatever is in the ring as-is (see `fill_direct`).
+    direct: bool,
+}
+
+/// The playback fill for locally generated sound (tones): plays what the
+/// ring holds and silence when it is empty, nothing more. None of
+/// `fill_playback`'s jitter handling applies — the producer is a task in
+/// this process pacing itself against the ring, not a network — and its
+/// trimming and concealment would only distort a pure tone.
+fn fill_direct(cons: &mut HeapCons<i16>, out: &mut [u8], requested: u64) -> PlaybackFill {
+    let max_frames = out.len() / STRIDE;
+    let frames = if requested > 0 {
+        usize::try_from(requested).unwrap_or(usize::MAX).min(max_frames)
+    } else {
+        max_frames.min(FALLBACK_FRAMES)
+    };
+    let mut scratch = [0i16; 256];
+    let mut written = 0usize;
+    let mut peak = 0u16;
+    while written < frames {
+        let want = (frames - written).min(scratch.len());
+        let got = cons.pop_slice(&mut scratch[..want]);
+        scratch[got..want].fill(0);
+        for (i, &sample) in scratch[..want].iter().enumerate() {
+            peak = peak.max(sample.unsigned_abs());
+            let start = (written + i) * STRIDE;
+            out[start..start + STRIDE].copy_from_slice(&sample.to_le_bytes());
+        }
+        written += want;
+    }
+    PlaybackFill { frames, peak }
 }
 
 /// Spawns a playback-*only* PipeWire stream on its own thread — no capture
@@ -589,6 +620,27 @@ pub fn spawn_playback(
     target: Option<String>,
     label: String,
 ) -> Result<PwThreadHandle, MediaError> {
+    spawn_playback_stream(playback_cons, target, label, false)
+}
+
+/// A playback-only stream for sound generated in this process (dial tones,
+/// ringing): the ring is played exactly as written, with silence whenever it
+/// is empty, so the stream — and the output device — stays open between
+/// sounds. The writer is responsible for not queuing far ahead.
+pub fn spawn_tone_playback(
+    playback_cons: HeapCons<i16>,
+    target: Option<String>,
+    label: String,
+) -> Result<PwThreadHandle, MediaError> {
+    spawn_playback_stream(playback_cons, target, label, true)
+}
+
+fn spawn_playback_stream(
+    playback_cons: HeapCons<i16>,
+    target: Option<String>,
+    label: String,
+    direct: bool,
+) -> Result<PwThreadHandle, MediaError> {
     ensure_init();
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<PwCommand>();
@@ -597,7 +649,7 @@ pub fn spawn_playback(
     let thread = std::thread::Builder::new()
         .name("pipewire-io-secondary".into())
         .spawn(move || {
-            if let Err(e) = run_playback_only(shutdown_rx, playback_cons, target, &label, &ready_tx) {
+            if let Err(e) = run_playback_only(shutdown_rx, playback_cons, target, &label, direct, &ready_tx) {
                 let _ = ready_tx.send(Err(e.to_string()));
             }
         })
@@ -623,10 +675,11 @@ fn run_playback_only(
     playback_cons: HeapCons<i16>,
     target: Option<String>,
     label: &str,
+    direct: bool,
     ready_tx: &std::sync::mpsc::Sender<Result<(), String>>,
 ) -> Result<(), MediaError> {
     // SAFETY: `pw::init()` has already been called via `ensure_init()` in
-    // `spawn_playback()`, before this function runs.
+    // `spawn_playback_stream()`, before this function runs.
     let thread_loop =
         unsafe { pw::thread_loop::ThreadLoopRc::new(Some("pipewire-io-secondary"), None) }.map_err(pw_err)?;
     let context_props = properties! { *pw::keys::CONFIG_NAME => "client.conf" };
@@ -643,6 +696,7 @@ fn run_playback_only(
     let playback_user_data = SecondaryPlaybackUserData {
         cons: playback_cons,
         state: PlaybackState::default(),
+        direct,
     };
 
     let _playback_listener = playback_stream
@@ -661,6 +715,7 @@ fn run_playback_only(
             }
             let data = &mut datas[0];
             let fill = match data.data() {
+                Some(slice) if user_data.direct => fill_direct(&mut user_data.cons, slice, requested),
                 Some(slice) => fill_playback(&mut user_data.cons, &mut user_data.state, slice, requested),
                 None => PlaybackFill::default(),
             };
@@ -1378,5 +1433,19 @@ mod tests {
         );
         assert_eq!(state.margin, MARGIN_MIN);
         assert_eq!(state.underruns, 0);
+    }
+
+    #[test]
+    fn direct_fill_plays_the_ring_as_is_and_pads_with_silence() {
+        let (mut prod, mut cons, mut out) = setup(100);
+        // No prebuffering: 100 samples play at once, the rest is silence.
+        let fill = fill_direct(&mut cons, &mut out, 171);
+        assert_eq!((fill.frames, fill.peak), (171, 1000));
+        assert_eq!((sample(&out, 99), sample(&out, 100)), (1000, 0));
+        // Empty ring: silence, and the next sound starts on its first sample.
+        assert_eq!(fill_direct(&mut cons, &mut out, 171).peak, 0);
+        push(&mut prod, 10);
+        fill_direct(&mut cons, &mut out, 171);
+        assert_eq!((sample(&out, 0), sample(&out, 10)), (1000, 0));
     }
 }

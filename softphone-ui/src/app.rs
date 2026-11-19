@@ -1113,17 +1113,7 @@ impl App {
             dialpad_flash: None,
         };
 
-        let tone_target = app.audio_devices.output_device.clone();
-        let tone_task = Task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                DtmfTonePlayer::start(tone_target)
-                    .map(Arc::new)
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
-            Message::TonePlayerReady(result)
-        });
+        let tone_task = start_tone_player(app.audio_devices.output_device.clone());
 
         let mut startup = vec![
             open_task.discard(),
@@ -1822,9 +1812,17 @@ impl App {
                 Task::none()
             }
             Message::AudioSettingsSavePressed => {
+                let previous_output = self.audio_devices.output_device.clone();
                 self.handle_audio_settings_save();
                 self.toast_success("Audio settings saved — they apply to the next call");
-                Task::none()
+                // Tones and the ringtone play through their own stream on
+                // the output device: reopen it on the new one. The old
+                // player is dropped when `TonePlayerReady` replaces it.
+                if self.audio_devices.output_device != previous_output && !self.demo {
+                    start_tone_player(self.audio_devices.output_device.clone())
+                } else {
+                    Task::none()
+                }
             }
             Message::AudioSettingsCancelPressed => {
                 self.audio_settings_form = self
@@ -4060,6 +4058,21 @@ fn open_external(target: &str) {
     if let Err(e) = std::process::Command::new("xdg-open").arg(target).spawn() {
         tracing::warn!(%e, target, "xdg-open failed");
     }
+}
+
+/// Opens the tone/ringtone player on `output_device` (`None` = system
+/// default) off the UI thread; the result arrives as `TonePlayerReady`.
+fn start_tone_player(output_device: Option<String>) -> Task<Message> {
+    Task::future(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            DtmfTonePlayer::start(output_device)
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        Message::TonePlayerReady(result)
+    })
 }
 
 /// Slider position (0.0–2.0, shown as 0–200%) to linear gain. Squared, so

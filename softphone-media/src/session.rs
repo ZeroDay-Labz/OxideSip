@@ -805,6 +805,7 @@ async fn recv_loop(
     let mut reorder = ReorderBuffer::new();
     let mut received_count: u64 = 0;
     let mut rejected_count: u64 = 0;
+    let mut latch_candidate: Option<(SocketAddr, u32)> = None;
     let mut receiver_stats = ReceiverStats::default();
     let mut agc = Agc::default();
     let started = std::time::Instant::now();
@@ -818,14 +819,14 @@ async fn recv_loop(
             _ = cancel.cancelled() => break,
             result = socket.recv_from(&mut buf) => {
                 let Ok((n, from)) = result else { continue };
-                // Only the socket itself is bound to our local port — it's
-                // never `connect()`-ed to `remote_addr`, so without this it
-                // would accept and decode/play audio (or forge DTMF events)
-                // from *any* host that can reach this ephemeral UDP port,
-                // not just the peer this call actually negotiated with.
-                // Comparing IP only (not port) tolerates a peer behind a
-                // NAT that rewrites its source port mid-call.
-                if remote.read().map_or(true, |addr| from.ip() != addr.ip()) {
+                // The socket is bound to our port but never `connect()`-ed,
+                // so anyone who can reach that port can send to it. Plain
+                // RTP is therefore only accepted from the negotiated peer's
+                // IP (any port: NATs rewrite source ports). On an SRTP call
+                // the authentication check below is the filter instead, and
+                // a stronger one, so the source IP is free to differ.
+                let known = remote.read().ok().map(|addr| *addr);
+                if srtp.is_none() && known.is_none_or(|addr| addr.ip() != from.ip()) {
                     continue;
                 }
                 // On an SRTP call nothing is looked at, let alone played,
@@ -844,6 +845,26 @@ async fn recv_loop(
                     None => n,
                 };
                 let Ok((header, payload)) = RtpHeader::decode(&buf[..n]) else { continue };
+                // Symmetric RTP: send to wherever the peer's media really
+                // comes from. Behind NAT (theirs or a media relay's) that
+                // is often not the address in its SDP, and audio sent to
+                // the SDP address goes nowhere. Waits for a few packets in
+                // a row so one stray packet can't redirect the call.
+                if known == Some(from) {
+                    latch_candidate = None;
+                } else {
+                    match &mut latch_candidate {
+                        Some((candidate, count)) if *candidate == from => *count += 1,
+                        _ => latch_candidate = Some((from, 1)),
+                    }
+                    if latch_candidate.is_some_and(|(_, count)| count >= LATCH_AFTER_PACKETS)
+                        && let Ok(mut addr) = remote.write()
+                    {
+                        tracing::info!(sdp_addr = %*addr, actual = %from, "sending RTP to where the peer's media comes from");
+                        *addr = from;
+                        latch_candidate = None;
+                    }
+                }
                 if Some(header.payload_type) == telephone_event_pt {
                     if let [event_code, byte1, ..] = *payload {
                         let end = byte1 & 0x80 != 0;
@@ -1039,6 +1060,9 @@ impl DtmfEventState {
         }
     }
 }
+
+/// Consecutive packets from a new source address before RTP is sent there.
+const LATCH_AFTER_PACKETS: u32 = 3;
 
 /// How many lost packets in a row get a concealment packet (a fading replay
 /// of the last good one); the rest of a longer gap is silence.

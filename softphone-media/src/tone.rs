@@ -1,117 +1,36 @@
 //! Local audible feedback for dialpad key presses and other line-status
-//! sounds (dial/busy/reorder/disconnect/ringback/incoming-ring) — standard
-//! DTMF dual-tone generation, played back through `pw-play` (part of
-//! `pipewire-utils`, already present anywhere this app's PipeWire dependency
-//! is) rather than opening our own PipeWire client stream.
+//! sounds (dial/busy/reorder/disconnect/ringback/incoming-ring): standard
+//! DTMF dual-tone generation, played through one PipeWire playback stream
+//! that stays open for the player's whole lifetime.
 //!
-//! This isn't the "proper" approach and normally wouldn't be — but on the
-//! original dev system, this app's own low-level `pw::stream` clients (both
-//! the call audio path in `pipewire_io.rs` and an earlier version of this
-//! module) measurably get serviced by the graph only once every ~1.5s
-//! instead of the normal ~20ms (see `pipewire_io.rs`'s doc comments), while
-//! `pw-play` itself — empirically measured with `time pw-play <file>`, not
-//! assumed — plays back with normal ~100ms startup latency through the
-//! *exact same* WirePlumber loopback route our client lands on
-//! (`input.loopback.sink.role.multimedia`, confirmed via `pw-dump`), even
-//! with an identical sample rate and an identical `node.latency` hint.
-//! Whatever WirePlumber is doing differently for `pw-play` vs. our own
-//! client wasn't fixed by any stream property tried (media.role — several
-//! values and none at all, node.latency, node.always-process), by dropping
-//! the `RT_PROCESS` connect flag, by using a plain `MainLoopRc` instead of
-//! `ThreadLoopRc`, or by dropping the `client.conf` context override —
-//! all tested directly against this exact symptom, all still ~1.5s.
-//! Shelling out to the one client empirically proven fast on this system is
-//! a pragmatic fix for what's otherwise an unresolved WirePlumber scheduling
-//! quirk.
+//! Three properties, each learned the hard way, that the design keeps:
 //!
-//! (Since resolved: it was never WirePlumber. Our playback callbacks filled
-//! the whole stream buffer instead of the `requested` frames — see
-//! `pipewire_io.rs`'s buffering comment. `pw-play` still works
-//! well here, so this module keeps using it.)
+//! - **One stream, never reopened.** Opening a stream per sound made the
+//!   output device click (this app's default output is a wireless USB
+//!   headset that pops when it wakes from idle). The stream plays silence
+//!   between sounds, so the device stays awake and a sound starts cleanly.
+//! - **One sound at a time, through a queue.** Digits pressed faster than a
+//!   tone lasts play back to back rather than on top of each other.
+//! - **The writer is paced by the buffer, not by a clock.** It may only
+//!   queue `LOOKAHEAD_SAMPLES` ahead of what has been played and waits for
+//!   room otherwise. Sleeping for "one chunk's duration" after each write
+//!   instead runs slightly slow, falls a little further behind on every
+//!   chunk, and eventually underruns on a long ringing loop — audible as
+//!   crackle. And letting it queue far ahead makes a new sound wait behind
+//!   everything already queued, and makes `stop_*` slow to take effect.
 //!
-//! Two earlier iterations of this module both had real problems:
-//!
-//! - Spawning a brand-new `pw-play <file>` process per sound was audibly
-//!   clicky: each fresh process is also a fresh PipeWire stream connection,
-//!   which can itself trigger the audio device's own connect/wake transient
-//!   (this app's default output is a wireless USB headset that can pop when
-//!   waking from idle) — harmless for one isolated tone, but audible as a
-//!   click on every keypress while actively dialing, since the device never
-//!   got to stay in a settled "already playing" state between digits.
-//! - The first fix for that (a *second*, separate long-lived silent `pw-play`
-//!   process just to keep the device awake, running alongside the original
-//!   per-tone spawns) traded the click for intermittent *lateness*: two
-//!   concurrent PipeWire clients contending for the same target is exactly
-//!   the kind of multi-client scheduling scenario this system has already
-//!   been shown (above) to handle unpredictably.
-//!
-//! The actual fix is to only ever run *one* `pw-play` process for the whole
-//! player's lifetime: a single persistent stream, opened once with `--raw`
-//! (reading headerless PCM from stdin rather than a file — confirmed
-//! supported via `pw-play --help`'s `[<file>|-]`/`--raw` options), whose
-//! stdin a background writer task keeps fed for as long as the player lives.
-//! When nothing's queued it writes silence (keeping the device continuously
-//! active, so a queued sound never has to wake it from idle); when a sound
-//! is queued, the writer streams its pre-rendered samples into the same
-//! already-open pipe instead of spawning anything. One connection, made
-//! once, never torn down — no reconnect click, and nothing else ever
-//! contends with it for the sink.
-//!
-//! One more thing this single-stream writer had to get right: how it paces
-//! writes to that stdin pipe. An early version of the writer paced itself
-//! with a manual `sleep` between chunks, sized to match the chunk's own
-//! playback duration — that seemed reasonable but is subtly wrong, because
-//! the sleep happens *in addition to* however long the write itself and its
-//! bookkeeping take, so every loop iteration costs a little more than the
-//! chunk's real playback time. For one short DTMF blip that's a few
-//! milliseconds, inaudible; for a ringback/incoming-ring cadence that loops
-//! indefinitely, that small per-chunk deficit compounds cycle after cycle
-//! until it outpaces the pipe's buffered cushion and `pw-play` genuinely
-//! underruns — which is exactly what "crunchy"/crackly playback is. The
-//! writer now does no manual pacing at all: it just writes each chunk and
-//! immediately tries the next, relying entirely on the pipe's own
-//! backpressure (`write` blocks until the kernel has room, which only opens
-//! up once `pw-play` has actually consumed the previous bytes) to throttle
-//! it to real playback speed. There's no clock to drift against, so there's
-//! nothing to accumulate.
-//!
-//! Pure backpressure has its own gotcha, though: the default Linux pipe
-//! buffer is 64KiB, which at this player's 8kHz mono s16 format is about 4
-//! seconds of audio — plenty of room for the writer to race far *ahead* of
-//! real playback rather than being throttled to it, especially while idle
-//! (continuously writing silence as fast as the kernel will accept it, with
-//! nothing to ever slow it down). A sound queued while several seconds of
-//! that silence are already sitting unplayed in the pipe lands at the back
-//! of the (FIFO) queue behind all of it — audible as exactly the multi-
-//! second "tones take a long time to play" lag this caused. `shrink_pipe_
-//! buffer` fixes the worst case by shrinking the pipe to the kernel's
-//! minimum (one page, ~256ms of audio) right after opening it, which caps
-//! how far ahead of real-time *any* write can get no matter what.
-//!
-//! That cap alone still left a smaller version of the same lag, though: with
-//! nothing to slow it down, idle silence still races to fill that whole
-//! ~256ms cushion and keeps it full, so a freshly queued sound typically
-//! still waits out close to the full 256ms rather than playing right away.
-//! The writer now paces *idle silence specifically* with a plain
-//! `sleep(CHUNK_MS)` after each chunk, so in the common case it only stays
-//! a chunk or two ahead of real-time instead of maxing out the cushion —
-//! a queued sound is then usually only that far from actually playing.
-//! This can't reintroduce the drift/crunch bug pacing was removed for
-//! elsewhere: that bug came from a *sustained* deficit compounding over a
-//! long loop of *audible* content; here it's silence, so even if idle
-//! pacing drifts a little behind real-time (letting the pipe run briefly
-//! dry) there's nothing to crunch — worst case is an early transition into
-//! more silence. Real sound content (once dequeued) still streams via pure
-//! backpressure with no pacing of its own, so that half of the fix stands
-//! unchanged; `shrink_pipe_buffer`'s cap remains the backstop against
-//! runaway lookahead if idle pacing ever falls behind for some other reason.
+//! (History: until 0.3.1 this module piped PCM into a `pw-play` child
+//! process, because the app's own streams were being serviced only every
+//! ~1.5s. That turned out to be a bug in how the app filled its stream
+//! buffers — see `pipewire_io.rs` — not anything about PipeWire.)
 
 use crate::error::MediaError;
+use crate::pipewire_io::{self, PwThreadHandle};
+use ringbuf::traits::{Observer, Producer, Split};
+use ringbuf::{HeapProd, HeapRb};
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 /// Standard DTMF dual-tone (row, column) frequency pairs, Hz. `None` for any
@@ -348,64 +267,61 @@ enum SoundKind {
     Other,
 }
 
-/// How much of a sound's samples the writer streams to `pw-play`'s stdin
-/// between interruption checks (and how much silence it writes at a time
-/// while idle) — small enough that `stop_line_tone`/`stop_ringback`/
-/// `stop_incoming_ringtone` feel immediate, large enough not to be a
-/// busy-loop. This is purely a *cancellation-check granularity* now, not a
-/// playback rate: see the writer task's doc comment for why pacing is left
-/// entirely to the pipe's own backpressure instead of a manual sleep.
+/// How much of a sound the writer queues between interruption checks —
+/// small enough that `stop_line_tone`/`stop_ringback`/
+/// `stop_incoming_ringtone` feel immediate. Only a cancellation-check
+/// granularity, not a playback rate (see `RingSink::write`).
 const CHUNK_MS: u64 = 20;
 const CHUNK_SAMPLES: usize = (SAMPLE_RATE as usize * CHUNK_MS as usize) / 1000;
+/// How often the idle writer looks for a newly queued sound.
+const IDLE_POLL_MS: u64 = 5;
 
-/// Shrinks the kernel pipe backing `stdin` down to one page (Linux's
-/// minimum for `F_SETPIPE_SZ`, typically 4096 bytes — about 256ms of this
-/// player's 8kHz mono s16 audio) instead of the default 64KiB (~4s). The
-/// writer task relies entirely on this pipe's backpressure to pace itself
-/// (see the module doc comment's third iteration) — `write_all` blocks once
-/// the kernel has no room left, which only opens back up as `pw-play`
-/// actually consumes bytes. At the default 64KiB size that still lets the
-/// writer race up to ~4 seconds *ahead* of real playback (most visibly
-/// during idle, continuously writing silence as fast as the kernel will
-/// accept it): a sound queued at that moment lands at the back of a FIFO
-/// pipe behind several seconds of already-buffered-but-unplayed silence,
-/// which is exactly the "tones take a long time to play" regression this
-/// fixes. Shrinking the buffer caps how far ahead *any* write — silence or
-/// real audio — can ever get, so a freshly queued sound is always within
-/// one small buffer's worth of real time from actually playing, and
-/// `stop_line_tone`/`stop_ringback`/`stop_incoming_ringtone` can't have
-/// several seconds of already-buffered audio left to drain out before they
-/// take effect either. Best-effort: if this fails (non-Linux, or the kernel
-/// refuses), playback still works, just with the wider default look-ahead.
-fn shrink_pipe_buffer(stdin: &tokio::process::ChildStdin) {
-    use std::os::fd::AsRawFd;
-    // 4096 is Linux's documented minimum for F_SETPIPE_SZ (`man fcntl`) —
-    // the kernel rounds any smaller request up to this, so pass it directly.
-    const MIN_PIPE_BYTES: libc::c_int = 4096;
-    let fd = stdin.as_raw_fd();
-    // SAFETY: `fd` is a valid, open pipe file descriptor for as long as
-    // `stdin` (borrowed for this call) is alive; `fcntl(F_SETPIPE_SZ)` only
-    // resizes the kernel's internal buffer for it and has no other effect
-    // on the process.
-    unsafe {
-        libc::fcntl(fd, libc::F_SETPIPE_SZ, MIN_PIPE_BYTES);
-    }
+/// How far ahead of playback the writer may queue: 40ms. Small enough that
+/// a new sound or a `stop_*` takes effect almost at once, large enough to
+/// ride out the writer task being scheduled a little late.
+const LOOKAHEAD_SAMPLES: usize = (SAMPLE_RATE as usize * 40) / 1000;
+/// Ring size; only `LOOKAHEAD_SAMPLES` of it is ever used.
+const RING_SAMPLES: usize = SAMPLE_RATE as usize / 4;
+/// If the stream takes nothing for this long it is gone (device removed,
+/// PipeWire restarted): drop what is being written rather than wait forever.
+const STALLED_AFTER: Duration = Duration::from_secs(2);
+
+/// The writer's end of the ring the tone stream plays from.
+struct RingSink {
+    prod: HeapProd<i16>,
 }
 
-fn samples_to_bytes(samples: &[i16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(samples.len() * 2);
-    for s in samples {
-        bytes.extend_from_slice(&s.to_le_bytes());
+impl RingSink {
+    /// Queues `chunk`, waiting whenever `LOOKAHEAD_SAMPLES` are already
+    /// queued — so it returns about as fast as the audio is played, which is
+    /// what paces the writer task. Returns `false` if the stream has stopped
+    /// taking audio.
+    async fn write(&mut self, mut chunk: &[i16]) -> bool {
+        let mut waited = Duration::ZERO;
+        while !chunk.is_empty() {
+            let room = LOOKAHEAD_SAMPLES.saturating_sub(self.prod.occupied_len());
+            if room == 0 {
+                if waited >= STALLED_AFTER {
+                    return false;
+                }
+                let nap = Duration::from_millis(5);
+                tokio::time::sleep(nap).await;
+                waited += nap;
+                continue;
+            }
+            waited = Duration::ZERO;
+            let pushed = self.prod.push_slice(&chunk[..room.min(chunk.len())]);
+            chunk = &chunk[pushed..];
+        }
+        true
     }
-    bytes
 }
 
 pub struct DtmfTonePlayer {
     digit_samples: HashMap<char, Vec<i16>>,
     /// Sounds queue through here to a single background writer task, which
-    /// streams them one at a time into the one persistent `pw-play`
-    /// process's stdin (see the module doc comment) — never spawning a new
-    /// process per sound. Serializing through a queue means digits played
+    /// streams them one at a time into the one persistent playback stream
+    /// (see the module doc comment) — never opening a new stream per sound. Serializing through a queue means digits played
     /// faster than one tone's duration play back-to-back instead of exactly
     /// on each keystroke, trading a little latency on very fast typing for
     /// tones that always sound correct (no overlapping/garbled audio).
@@ -421,18 +337,17 @@ pub struct DtmfTonePlayer {
     /// end-of-cycle looping decision and mid-cycle abandonment.
     ringback_epoch: Arc<Mutex<u64>>,
     incoming_ring_epoch: Arc<Mutex<u64>>,
-    /// The single persistent `pw-play` process every sound streams through
-    /// (see the module doc comment). Held only so it lives exactly as long
-    /// as this player — `kill_on_drop` on its `Command` means dropping this
-    /// field tears the process down; nothing else ever reads or writes it
-    /// directly (the writer task owns its stdin handle separately).
-    _stream_child: tokio::process::Child,
+    /// The one playback stream every sound goes through (see the module doc
+    /// comment). Held only so it lives exactly as long as this player:
+    /// dropping it stops the stream.
+    _stream: PwThreadHandle,
 }
 
 impl DtmfTonePlayer {
     /// Pre-renders every digit's tone (and the other line-status sounds)
-    /// once into memory, and opens the one persistent `pw-play` process
-    /// everything streams through for the rest of this player's lifetime.
+    /// once into memory, and opens the one playback stream everything goes
+    /// through for the rest of this player's lifetime. Must be called from
+    /// within a tokio runtime (it spawns the writer task).
     pub fn start(playback_target: Option<String>) -> Result<Self, MediaError> {
         let mut digit_samples = HashMap::new();
         for digit in DIGITS {
@@ -440,38 +355,16 @@ impl DtmfTonePlayer {
                 digit_samples.insert(digit, samples);
             }
         }
-        let dial_tone = samples_to_bytes(&generate_dial_tone());
-        let busy_tone = samples_to_bytes(&generate_busy_tone());
-        let reorder_tone = samples_to_bytes(&generate_reorder_tone());
-        let disconnect_tone = samples_to_bytes(&generate_disconnect_tone());
-        let ringback_cycle = samples_to_bytes(&generate_ringback_cycle());
-        let incoming_ring_cycle = samples_to_bytes(&generate_incoming_ring_cycle());
+        let dial_tone = generate_dial_tone();
+        let busy_tone = generate_busy_tone();
+        let reorder_tone = generate_reorder_tone();
+        let disconnect_tone = generate_disconnect_tone();
+        let ringback_cycle = generate_ringback_cycle();
+        let incoming_ring_cycle = generate_incoming_ring_cycle();
 
-        let mut command = tokio::process::Command::new("pw-play");
-        command
-            .arg("--raw")
-            .arg("--rate")
-            .arg(SAMPLE_RATE.to_string())
-            .arg("--channels")
-            .arg("1")
-            .arg("--format")
-            .arg("s16")
-            .arg("--media-role")
-            .arg("Music")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        if let Some(target) = &playback_target {
-            command.arg("--target").arg(target);
-        }
-        let mut stream_child = command.spawn().map_err(MediaError::Io)?;
-        let stdin = stream_child
-            .stdin
-            .take()
-            .ok_or_else(|| MediaError::PipeWire("pw-play stdin unavailable".into()))?;
-        shrink_pipe_buffer(&stdin);
+        let (prod, cons) = HeapRb::<i16>::new(RING_SAMPLES).split();
+        let stream = pipewire_io::spawn_tone_playback(cons, playback_target, "OxideSip tones".into())?;
+        let mut sink = RingSink { prod };
 
         let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<QueuedSound>();
         let line_tone_epoch: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
@@ -481,59 +374,18 @@ impl DtmfTonePlayer {
         let worker_ringback_epoch = ringback_epoch.clone();
         let worker_incoming_ring_epoch = incoming_ring_epoch.clone();
         let worker_requeue_tx = queue_tx.clone();
-        let worker_digit_samples: HashMap<char, Vec<u8>> = digit_samples
-            .iter()
-            .map(|(&digit, samples)| (digit, samples_to_bytes(samples)))
-            .collect();
+        let worker_digit_samples = digit_samples.clone();
 
-        // No manual `sleep` anywhere in this loop — pacing is left entirely
-        // to the pipe's own backpressure. `write_all` on a pipe blocks until
-        // the kernel has room, which only opens up once `pw-play` has
-        // actually consumed (i.e. played) the previous bytes, so the writer
-        // can never race ahead of or drift behind real playback. An earlier
-        // version paced itself with `sleep(CHUNK_MS)` *after* every write —
-        // but that made each loop iteration cost `write time + CHUNK_MS`,
-        // strictly more than the `CHUNK_MS` a chunk actually takes to play,
-        // so production fell behind consumption a little more on every
-        // single chunk. For a short DTMF blip that's a few chunks and barely
-        // audible; for a looping ringback/incoming-ring cadence (repeating
-        // every several seconds, indefinitely) the deficit compounded cycle
-        // after cycle until it caught up with the pipe's buffered cushion
-        // and `pw-play` underran — audible as crackle/crunch. Backpressure
-        // has no such accumulator: there's nothing to drift.
+        // Paced by `RingSink::write` (see the module doc comment): no sleep
+        // per chunk of sound. While idle nothing is written at all — the
+        // stream plays silence on its own — so a newly queued sound starts
+        // on an empty buffer, and the loop only naps between queue checks.
         tokio::spawn(async move {
-            let mut stdin = stdin;
-            let silence_chunk = vec![0u8; CHUNK_SAMPLES * 2];
             loop {
                 let sound = match queue_rx.try_recv() {
                     Ok(sound) => sound,
                     Err(mpsc::error::TryRecvError::Empty) => {
-                        if stdin.write_all(&silence_chunk).await.is_err() {
-                            break;
-                        }
-                        // Idle silence is the one place this writer still
-                        // paces itself with a `sleep` instead of pure
-                        // backpressure — deliberately. Pure backpressure
-                        // alone lets the writer race as far ahead as the
-                        // (already-shrunk, see `shrink_pipe_buffer`) pipe
-                        // allows, and while idle there's nothing to ever
-                        // slow that race down, so it keeps the pipe
-                        // permanently topped up to its full ~256ms cushion
-                        // of already-buffered-but-unplayed silence. A digit
-                        // queued at that moment still has to wait for all of
-                        // that backlog to drain before it's audible — a
-                        // real, if smaller, version of the multi-second
-                        // lookahead bug `shrink_pipe_buffer` was written to
-                        // fix. Pacing idle writes to roughly real-time
-                        // instead keeps that backlog near-empty in the
-                        // common case, so a freshly queued sound is usually
-                        // only a chunk or two behind, not the full buffer.
-                        // This can't reintroduce the drift/crunch bug pure
-                        // backpressure was adopted to fix (see the module
-                        // doc comment) because silence has no audible
-                        // content to crunch — worst case here is a few ms
-                        // of early underrun into more silence, inaudible.
-                        tokio::time::sleep(Duration::from_millis(CHUNK_MS)).await;
+                        tokio::time::sleep(Duration::from_millis(IDLE_POLL_MS)).await;
                         continue;
                     }
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -545,7 +397,7 @@ impl DtmfTonePlayer {
                     QueuedSound::IncomingRing(_) => SoundKind::IncomingRing,
                     QueuedSound::Digit(_) | QueuedSound::Disconnect => SoundKind::Other,
                 };
-                let bytes: &[u8] = match &sound {
+                let samples: &[i16] = match &sound {
                     QueuedSound::Digit(digit) => match worker_digit_samples.get(digit) {
                         Some(s) => s,
                         None => continue,
@@ -560,7 +412,7 @@ impl DtmfTonePlayer {
                 let started_line_epoch = *worker_line_tone_epoch.lock().unwrap();
 
                 let mut aborted = false;
-                'chunks: for chunk in bytes.chunks(CHUNK_SAMPLES * 2) {
+                'chunks: for chunk in samples.chunks(CHUNK_SAMPLES) {
                     let cancel = match (kind, &sound) {
                         (SoundKind::LineTone, _) => *worker_line_tone_epoch.lock().unwrap() != started_line_epoch,
                         (SoundKind::Ringback, QueuedSound::Ringback(epoch)) => {
@@ -575,8 +427,10 @@ impl DtmfTonePlayer {
                         aborted = true;
                         break 'chunks;
                     }
-                    if stdin.write_all(chunk).await.is_err() {
-                        return;
+                    if !sink.write(chunk).await {
+                        tracing::warn!("tone stream stopped taking audio; dropping this sound");
+                        aborted = true;
+                        break 'chunks;
                     }
                 }
 
@@ -606,7 +460,7 @@ impl DtmfTonePlayer {
             line_tone_epoch,
             ringback_epoch,
             incoming_ring_epoch,
-            _stream_child: stream_child,
+            _stream: stream,
         })
     }
 

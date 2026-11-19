@@ -32,17 +32,23 @@ pub fn registrar_uri(config: &SipAccountConfig) -> Result<Uri> {
 ///   `transport_layer.get_addrs()` (listens+connections) is non-empty
 ///   immediately — no warm-up connection needed before the first REGISTER.
 /// - TLS: outbound-only, no local listener; see `warm_up_registrar_connection`.
+///
+/// Also returns the UDP socket when that is the transport, so the
+/// registration loop can send NAT keepalives from the very port the
+/// registrar knows us by.
 pub async fn build_transport_layer(
     config: &SipAccountConfig,
     cancel_token: CancellationToken,
-) -> Result<TransportLayer> {
+) -> Result<(TransportLayer, Option<UdpConnection>)> {
     let transport_layer = TransportLayer::new(cancel_token.clone());
     let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.local_port);
+    let mut udp_socket = None;
 
     match config.transport {
         SipTransport::Udp => {
             let udp = UdpConnection::create_connection(local_addr, None, Some(cancel_token)).await?;
-            transport_layer.add_transport(udp.into());
+            transport_layer.add_transport(udp.clone().into());
+            udp_socket = Some(udp);
         }
         SipTransport::Tcp => {
             let mut listen_addr = SipAddr::from(local_addr);
@@ -70,12 +76,12 @@ pub async fn build_transport_layer(
         }
     }
 
-    Ok(transport_layer)
+    Ok((transport_layer, udp_socket))
 }
 
 pub fn build_endpoint(transport_layer: TransportLayer, cancel_token: CancellationToken) -> Endpoint {
     EndpointBuilder::new()
-        .with_user_agent("OxideSip/0.1.6")
+        .with_user_agent(concat!("OxideSip/", env!("CARGO_PKG_VERSION")))
         .with_cancel_token(cancel_token)
         .with_transport_layer(transport_layer)
         .build()

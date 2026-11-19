@@ -22,7 +22,7 @@ pub async fn incoming_request_loop(
     dialog_layer: Arc<DialogLayer>,
     mut incoming: TransactionReceiver,
     state_sender: rsipstack::dialog::dialog::DialogStateSender,
-    contact: Uri,
+    contact: tokio::sync::watch::Receiver<Uri>,
 ) {
     while let Some(mut tx) = incoming.recv().await {
         if let Some(mut dialog) = dialog_layer.match_dialog(&tx) {
@@ -36,7 +36,9 @@ pub async fn incoming_request_loop(
 
         match tx.original.method {
             Method::Invite => {
-                match dialog_layer.get_or_create_server_invite(&tx, state_sender.clone(), None, Some(contact.clone())) {
+                // Cloned out first: the watch guard must not be held across an await.
+                let current_contact = contact.borrow().clone();
+                match dialog_layer.get_or_create_server_invite(&tx, state_sender.clone(), None, Some(current_contact)) {
                     Ok(mut invite_dialog) => {
                         tokio::spawn(async move {
                             if let Err(e) = invite_dialog.handle(&mut tx).await {
@@ -145,7 +147,7 @@ pub async fn dialog_state_loop(
     event_tx: mpsc::Sender<CoreEvent>,
     mut command_rx: mpsc::Receiver<CoreCommand>,
     local_media_addr: IpAddr,
-    contact: Uri,
+    contact: tokio::sync::watch::Receiver<Uri>,
     config: SipAccountConfig,
 ) {
     let mut tracker = DialogTracker::default();
@@ -161,6 +163,7 @@ pub async fn dialog_state_loop(
                 if matches!(cmd, CoreCommand::Shutdown) {
                     break;
                 }
+                let contact = contact.borrow().clone();
                 handle_command(&dialog_layer, &mut tracker, &event_tx, &state_tx, &contact, &config, local_media_addr, cmd).await;
             }
         }

@@ -20,7 +20,6 @@ ctr = "0.9"
 hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
-libc = "0.2"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

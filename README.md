@@ -73,7 +73,7 @@ every release asset.
 |---|---|
 | Sound server | **PipeWire** 0.3.44 or newer as the session's audio server (the Fedora / KDE / GNOME default) |
 | Desktop | Wayland or X11. Any GPU; virtual machines fall back to software rendering |
-| Account | A SIP extension on a PBX you can reach — on the LAN or over a VPN (no STUN / ICE yet) |
+| Account | A SIP extension on a PBX you can reach — on the LAN, over a VPN, or from behind a home router to a public PBX |
 
 ## Using it
 
@@ -161,8 +161,11 @@ number clicked in a browser can open here.
   carries Answer / Decline. Make sure *Desktop notifications* is on under **Settings ▸ Calls**.
 - **Blank or very slow window in a VM.** Run with `ICED_BACKEND=tiny-skia oxidesip` (software
   rendering).
-- **One-way audio or no audio behind NAT.** OxideSip has no STUN / ICE yet; use it on the LAN
-  or over a VPN to the PBX.
+- **One-way audio or no audio behind NAT.** OxideSip keeps its NAT mapping open, sends audio
+  back to wherever the PBX's audio comes from, and advertises the address the PBX sees — which
+  works with a PBX set up for NAT clients (on FreePBX: the extension's *Rewrite Contact* and
+  *RTP Symmetric* left at Yes). There is no STUN / ICE, so a PBX that insists on direct media
+  between two phones that are both behind NAT still needs a VPN.
 
 ## Where your stuff is kept
 
@@ -217,7 +220,8 @@ tarball, RPM, deb and Flatpak bundle and attaches them to the GitHub release.
 
 ## Known limitations
 
-- **No STUN / ICE.** Works on a LAN or over a VPN to the PBX; NAT traversal is not handled.
+- **No STUN / ICE.** NAT is handled the way SIP phones usually do it (keepalives, symmetric RTP,
+  the registrar-observed address in Contact), which relies on the PBX relaying media.
 - **Echo cancellation is opt-in** (Settings ▸ Calls). It uses PipeWire's echo-cancel module, so it
   needs that module installed and may be unavailable inside the Flatpak sandbox; a headset needs
   neither.

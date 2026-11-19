@@ -29,8 +29,13 @@ impl SoftphoneCore {
         command_rx: mpsc::Receiver<CoreCommand>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let transport_layer = transport::build_transport_layer(&config, cancel.child_token()).await?;
-        let endpoint = transport::build_endpoint(transport_layer.clone(), cancel.child_token());
+        // The sockets and the SIP endpoint outlive `cancel` by a moment (see
+        // the end of this function): the un-REGISTER sent on shutdown still
+        // needs them. The guard stops them on every way out of here.
+        let transport_cancel = CancellationToken::new();
+        let _stop_transport = transport_cancel.clone().drop_guard();
+        let (transport_layer, udp_socket) = transport::build_transport_layer(&config, transport_cancel.clone()).await?;
+        let endpoint = transport::build_endpoint(transport_layer.clone(), transport_cancel.clone());
 
         let registrar = transport::registrar_uri(&config)?;
         if config.transport == SipTransport::Tls {
@@ -43,17 +48,35 @@ impl SoftphoneCore {
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
         let (state_tx, state_rx) = dialog_layer.new_dialog_state_channel();
         let incoming = endpoint.incoming_transactions()?;
+        // Starts as our local address; the registration loop replaces the
+        // host and port with the ones the registrar actually saw us come
+        // from (see `registration.rs`), so that behind NAT the Contact in
+        // our INVITEs and 200 OKs is one the PBX can reach.
         let contact = dialog_layer.build_local_contact(Some(config.username.clone()), None)?;
+        let (contact_tx, contact_rx) = tokio::sync::watch::channel(contact);
         let dialog_config = config.clone();
+
+        // Where NAT keepalives go: only meaningful for UDP, which has no
+        // connection for the NAT to track otherwise.
+        let keepalive = match udp_socket {
+            Some(socket) => tokio::net::lookup_host((config.sip_server_host.as_str(), config.sip_server_port))
+                .await
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+                .map(|addr| (socket, addr)),
+            None => None,
+        };
 
         let serve_task = tokio::spawn(async move {
             endpoint.serve().await;
         });
 
-        let registration_task = tokio::spawn(registration::run_registration_loop(
+        let mut registration_task = tokio::spawn(registration::run_registration_loop(
             endpoint_inner_for_registration,
             config,
             event_tx.clone(),
+            contact_tx,
+            keepalive,
             cancel.child_token(),
         ));
 
@@ -61,7 +84,7 @@ impl SoftphoneCore {
             dialog_layer.clone(),
             incoming,
             state_tx.clone(),
-            contact.clone(),
+            contact_rx.clone(),
         ));
 
         let dialog_state_task = tokio::spawn(dialog::dialog_state_loop(
@@ -71,11 +94,15 @@ impl SoftphoneCore {
             event_tx,
             command_rx,
             local_media_addr,
-            contact,
+            contact_rx,
             dialog_config,
         ));
 
         cancel.cancelled().await;
+        // The registration loop un-REGISTERs on cancel; give that a moment
+        // (it needs `serve_task` still running to get its reply) so the PBX
+        // stops routing calls to a phone that is gone.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut registration_task).await;
         serve_task.abort();
         registration_task.abort();
         incoming_task.abort();
